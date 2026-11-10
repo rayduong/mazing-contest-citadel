@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: mazing-contest-citadel
+    name: maze-comp
     runtime: node
     plan: free
     buildCommand: npm install && npm run build
