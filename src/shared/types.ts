@@ -26,7 +26,7 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
   SCOUT: {
     type: 'SCOUT',
     name: 'Citadel Scout',
-    icon: '🗡️',
+    icon: 'scout',
     baseSpeed: 3.5,
     slowDurationMult: 1.0,
     slowResist: 0.0,
@@ -36,32 +36,32 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
   OUTRIDER: {
     type: 'OUTRIDER',
     name: 'Royal Outrider',
-    icon: '🏇',
+    icon: 'outrider',
     baseSpeed: 3.85,
     slowDurationMult: 1.25,
     slowResist: 0.0,
     hasMomentum: false,
-    traitSummary: 'Fast sprinting (3.85m/s), but suffers +25% longer Spire slow durations!',
+    traitSummary: 'Fast sprinting (3.85m/s), but suffers +25% longer Spire slow durations',
   },
   JUGGERNAUT: {
     type: 'JUGGERNAUT',
     name: 'Iron Juggernaut',
-    icon: '🛡️',
+    icon: 'juggernaut',
     baseSpeed: 3.25,
     slowDurationMult: 1.0,
     slowResist: 0.2,
     hasMomentum: false,
-    traitSummary: 'Heavy armor (20% slow resist) — Overcharged Spires (linked to Red Keeps) pierce its armor!',
+    traitSummary: 'Heavy armor (20% slow resist) — Overcharged Spires (linked to Crimson Keeps) pierce its armor',
   },
   HERALD: {
     type: 'HERALD',
     name: 'Wind Herald',
-    icon: '⚡',
+    icon: 'herald',
     baseSpeed: 3.55,
     slowDurationMult: 1.05,
     slowResist: 0.0,
     hasMomentum: true,
-    traitSummary: 'Gains +28% Tailwind Haste after 3.2s outside Spire range — space your Spire passes evenly!',
+    traitSummary: 'Gains +28% Tailwind Haste after 3.2s outside Spire range — space your Spire passes evenly',
   },
 };
 
@@ -85,7 +85,7 @@ export interface TowerSpec {
 export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
   BLOCK: {
     type: 'BLOCK',
-    name: 'Castle Pillar',
+    name: 'Stone Pillar',
     hotkey: 'Q',
     goldCost: 5,
     footprint: 2,
@@ -95,7 +95,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowPercent: 0,
     slowDuration: 0,
     description:
-      '2x2 Castle Pillar. Connects in all directions and links Red Keep Pillars to Overcharge nearby Spires.',
+      '2x2 Stone Pillar. Connects in all directions and links Crimson Keeps to Overcharge nearby Spires.',
     accentColor: '#38bdf8',
   },
   THUNDERCLAP: {
@@ -246,6 +246,7 @@ export interface RunnerSimState {
   waygateUsed: boolean;
   finished: boolean;
   finishTimeSeconds: number;
+  elapsedSeconds?: number;
   distanceTraveled: number;
   checkpointsReached: number;
   clapsTaken: number;

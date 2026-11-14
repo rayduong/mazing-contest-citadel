@@ -367,7 +367,7 @@ async function startServer() {
           id: `msg_${Date.now()}`,
           senderName: 'Sanctum Arbiter',
           senderColor: '#38bdf8',
-          text: `Welcome to ${settings.roomName} (${code})! Place 2×2 Castle Pillars on the grassland and link Red Keep Pillars to Overcharge Spires.`,
+          text: `Welcome to ${settings.roomName} (${code})! Place 2×2 Stone Pillars on the meadow and link Crimson Keeps to Overcharge Spires.`,
           timestamp: Date.now(),
           isSystem: true,
         },
@@ -558,7 +558,7 @@ async function startServer() {
     );
     addSystemChat(
       room,
-      `Round ${round.roundNumber}: ${round.title} — ${pillarsCount} Castle Pillars · ${round.preplacedSpires.length} Elemental Spires & ${round.obstacles.length} Red Keeps!`
+      `Round ${round.roundNumber}: ${round.title} — ${pillarsCount} Stone Pillars · ${round.preplacedSpires.length} Elemental Spires · ${round.obstacles.length} Crimson Keeps.`
     );
     broadcastRoomState(room);
   }
@@ -596,7 +596,7 @@ async function startServer() {
 
     addSystemChat(
       room,
-      `Build phase locked! Runners released — longest survival time wins the round!`
+      `Build phase locked — Runners released!`
     );
     broadcastRoomState(room);
   }
@@ -773,7 +773,7 @@ async function startServer() {
         }
         addSystemChat(
           room,
-          `👑 GRAND CITADEL CHAMPION: ${grandChampion.name} wins the ${room.settings.totalRounds}-Round Match with ${grandChampion.totalScore} points!`
+          `Citadel Champion: ${grandChampion.name} wins the ${room.settings.totalRounds}-Round Match with ${grandChampion.totalScore} points!`
         );
       }
     } else {
@@ -784,7 +784,7 @@ async function startServer() {
       if (winner) {
         addSystemChat(
           room,
-          `🏆 ${winner.name} wins Round ${room.roundConfig.roundNumber} with a survival time of ${winner.lastRoundTime.toFixed(2)}s (+${winner.lastRoundPoints} pts)!`
+          `${winner.name} wins Round ${room.roundConfig.roundNumber} with a survival time of ${winner.lastRoundTime.toFixed(2)}s (+${winner.lastRoundPoints} pts).`
         );
       }
     }
@@ -792,7 +792,7 @@ async function startServer() {
     if (newRecordHolders.length > 0) {
       addSystemChat(
         room,
-        `🔥 NEW HALL OF FAME RECORD on Round ${room.roundConfig.roundNumber} by ${newRecordHolders.join(', ')}!`
+        `New Hall of Fame Top-5 Record on Round ${room.roundConfig.roundNumber} by ${newRecordHolders.join(', ')}!`
       );
     }
 
@@ -1056,7 +1056,7 @@ async function startServer() {
             ws.send(
               JSON.stringify({
                 type: 'ERROR_TOAST',
-                message: 'You can only build Walls during the Build Phase!',
+                message: 'Pillars can only be placed during the Build phase.',
               })
             );
             return;
@@ -1067,7 +1067,7 @@ async function startServer() {
             ws.send(
               JSON.stringify({
                 type: 'ERROR_TOAST',
-                message: `No Pillars remaining! Right-click an existing Pillar to reclaim ${wallCost} Gold.`,
+                message: 'All Pillars placed — reclaim an existing Pillar to free one up.',
               })
             );
             return;
@@ -1219,7 +1219,7 @@ async function startServer() {
           }
           addSystemChat(
             currentRoom,
-            `🔄 ${currentPlayer.name} started a fresh ${currentRoom.settings.totalRounds}-Round Citadel Match!`
+            `${currentPlayer.name} started a fresh ${currentRoom.settings.totalRounds}-Round Citadel Match.`
           );
           prepareRoundForRoom(currentRoom, 0);
           break;
@@ -1293,11 +1293,11 @@ async function startServer() {
 
           addSystemChat(
             currentRoom,
-            `⚙️ ${currentPlayer.name} updated match settings (${currentRoom.settings.totalRounds} Rounds · ${
+            `${currentPlayer.name} updated match rules (${currentRoom.settings.totalRounds} Rounds · ${
               currentRoom.settings.buildTimeSeconds === 0
                 ? 'Default Timer'
                 : currentRoom.settings.buildTimeSeconds === 999
-                ? '∞ Sandbox'
+                ? 'Sandbox'
                 : `${currentRoom.settings.buildTimeSeconds}s`
             } · ${Math.round(currentRoom.settings.goldMultiplier * 100)}% Pillars · ${
               currentRoom.settings.botCount

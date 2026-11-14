@@ -99,6 +99,7 @@ export class MazeRunnerSimulator {
       waygateUsed: false,
       finished: !this.pathResult.valid || this.pathResult.segments.length === 0,
       finishTimeSeconds: 0,
+      elapsedSeconds: 0,
       distanceTraveled: 0,
       checkpointsReached: 0,
       clapsTaken: 0,
@@ -111,6 +112,7 @@ export class MazeRunnerSimulator {
     if (this.state.finished) return events;
 
     this.elapsedSeconds += dt;
+    this.state.elapsedSeconds = this.elapsedSeconds;
     const runnerSpec = RUNNER_ARCHETYPES[this.round.runnerType || 'SCOUT'];
 
     // 1. Update Spire cooldowns

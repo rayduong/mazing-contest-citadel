@@ -2,150 +2,240 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MAZING CONTEST // 2026 Arcane Architect Edition</title>
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#cde8f6" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>Citadel · Tactical Mazing Arena</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/src/client/style.css" />
   </head>
-  <body>
-    <!-- 3D WebGL Viewport -->
+  <body data-phase="BUILD">
+    <!-- 3D WebGL Diorama Viewport -->
     <div id="viewport-container"></div>
     <!-- 3D Projected World Labels -->
     <div id="world-labels"></div>
 
-    <!-- Diegetic Floating Cursor Telemetry Pill -->
+    <!-- Tactile Build Preview & Touch Confirm Pill -->
     <div id="cursor-telemetry-pill" class="cursor-telemetry-pill hidden"></div>
 
-    <!-- Zone 2A: Top-Left Hub Trigger, Camera & Compact Contestant Micro-Chips -->
-    <div id="hud-top-left" class="hud-corner-left">
-      <button
-        id="btn-open-hub"
-        class="micro-pill-btn hub-pill-btn"
-        title="Open Citadel Command Hub — Lobbies, Match Settings & Hall of Fame [Hotkey: H]"
-      >
-        <span>🏠</span>
-        <span>Hub</span>
-      </button>
-      <button
-        id="btn-camera-overview"
-        class="micro-pill-btn overview-toggle"
-        title="Toggle Arena Overview / My Sanctum [Tab or 0]"
-      >
-        <span id="overview-icon">🌐</span>
-        <span id="overview-label">Arena</span>
-        <kbd>Tab</kbd>
-      </button>
-      <div id="scoreboard-list" class="micro-scoreboard"></div>
-    </div>
-
-    <!-- Zone 1: Top-Center Telemetry Capsule -->
-    <header class="hud-top-pill glass-pill">
-      <div class="round-selector-wrap">
+    <!-- Non-Overlapping Responsive Top HUD Bar -->
+    <header class="hud-top-bar">
+      <!-- Left Cluster: Hub, Camera View & Collapsible Standings Pill -->
+      <div id="hud-top-left" class="hud-cluster-left">
         <button
-          id="btn-round-picker"
-          class="telemetry-chip interactive"
-          title="Select Round or View Map Modifiers"
+          type="button"
+          id="btn-open-hub"
+          class="top-pill-btn hub-pill-btn"
+          title="Open Citadel Hub — Lobbies, Match Setup & Hall of Fame (H)"
         >
-          <span class="chip-accent" id="round-code-label">R1/8</span>
-          <span class="round-mini-title" id="round-subtitle">Sanctum Foundations</span>
-          <span class="caret">▾</span>
+          <span class="icon-slot" data-icon="hub" data-icon-size="17"></span>
+          <span class="btn-label">Hub</span>
         </button>
-        <!-- On-Demand Round Selector Popover -->
-        <div id="round-dropdown" class="round-dropdown glass-panel hidden">
-          <div class="dropdown-header">
-            <span>SELECT ARENA ROUND</span>
-            <span id="map-features-summary" class="meta-pill">2⚡ · 5 Ruins</span>
+
+        <button
+          type="button"
+          id="btn-camera-overview"
+          class="top-pill-btn overview-toggle"
+          title="Toggle Arena Overview / My Sanctum (Tab)"
+        >
+          <span
+            id="overview-icon"
+            class="icon-slot"
+            data-icon="overview"
+            data-icon-size="17"
+          ></span>
+          <span id="overview-label" class="btn-label">Arena</span>
+        </button>
+
+        <div id="standings-wrap" class="standings-wrap">
+          <button
+            type="button"
+            id="btn-standings-toggle"
+            class="top-pill-btn standings-pill-btn"
+            title="View Contestant Standings & Spectate Islands (1–6)"
+          >
+            <span id="standings-swatch" class="player-swatch"></span>
+            <span id="standings-summary" class="standings-summary">1st · You</span>
+            <span id="standings-score" class="standings-score">0p</span>
+            <span
+              class="icon-slot caret-slot"
+              data-icon="chevronDown"
+              data-icon-size="13"
+            ></span>
+          </button>
+
+          <div
+            id="standings-dropdown"
+            class="standings-dropdown surface-panel hidden"
+          >
+            <div class="dropdown-header">
+              <span>STANDINGS &amp; SPECTATE</span>
+              <span id="standings-count-meta" class="meta-pill">1 Player</span>
+            </div>
+            <div id="scoreboard-list" class="standings-list"></div>
           </div>
-          <div id="round-pills" class="round-pills-grid"></div>
         </div>
       </div>
 
-      <div class="pill-divider"></div>
+      <!-- Center Capsule: Round · Timer · Pillars · Run Time -->
+      <div class="hud-top-pill surface-pill">
+        <div class="round-selector-wrap">
+          <button
+            type="button"
+            id="btn-round-picker"
+            class="telemetry-chip interactive"
+            title="Select Round or Inspect Map Spires"
+          >
+            <span class="chip-accent" id="round-code-label">R1/8</span>
+            <span class="round-mini-title" id="round-subtitle">
+              Sanctum Foundations
+            </span>
+            <span
+              class="icon-slot caret-slot"
+              data-icon="chevronDown"
+              data-icon-size="13"
+            ></span>
+          </button>
 
-      <div class="phase-clock-cluster" title="Current Phase & Remaining Time">
-        <span id="phase-dot" class="phase-dot build"></span>
-        <span id="phase-label" class="phase-label">BUILD</span>
-        <span id="timer-display" class="timer-display">01:20</span>
+          <!-- On-Demand Round Selector Sheet -->
+          <div id="round-dropdown" class="round-dropdown surface-panel hidden">
+            <div class="dropdown-header">
+              <span>SELECT ROUND</span>
+              <span id="map-features-summary" class="meta-pill"></span>
+            </div>
+            <div id="round-pills" class="round-pills-grid"></div>
+          </div>
+        </div>
+
+        <div class="pill-divider divider-after-round"></div>
+
+        <div class="phase-clock-cluster" title="Current Phase & Remaining Time">
+          <span id="phase-dot" class="phase-dot build"></span>
+          <span id="phase-label" class="phase-label">BUILD</span>
+          <span id="timer-display" class="timer-display">01:20</span>
+        </div>
+
+        <div
+          class="speed-controls hidden"
+          id="speed-controls"
+          title="Simulation Playback Speed"
+        >
+          <button type="button" class="speed-btn active" data-speed="1">
+            1×
+          </button>
+          <button type="button" class="speed-btn" data-speed="2">2×</button>
+          <button type="button" class="speed-btn" data-speed="4">4×</button>
+        </div>
+
+        <div class="pill-divider divider-before-walls"></div>
+
+        <div
+          class="telemetry-chip gold-chip"
+          id="walls-chip"
+          title="Remaining 2×2 Stone Pillars (100% Pillar Refund on Reclaim)"
+        >
+          <span class="icon-slot chip-icon" data-icon="pillar" data-icon-size="15"></span>
+          <span id="gold-value" class="chip-num">35</span>
+        </div>
+
+        <div
+          class="telemetry-chip time-chip"
+          id="time-chip"
+          title="Simulated Runner Survival Time vs. Round Par"
+        >
+          <span class="icon-slot chip-icon" data-icon="clock" data-icon-size="15"></span>
+          <span id="est-time-value" class="chip-num">6.2s / 46s</span>
+        </div>
       </div>
 
-      <div
-        class="speed-controls hidden"
-        id="speed-controls"
-        title="Simulation Playback Speed"
-      >
-        <button class="speed-btn active" data-speed="1">1×</button>
-        <button class="speed-btn" data-speed="2">2×</button>
-        <button class="speed-btn" data-speed="4">4×</button>
-      </div>
-
-      <div class="pill-divider"></div>
-
-      <div
-        class="telemetry-chip gold-chip"
-        id="walls-chip"
-        title="Remaining 2×2 Castle Pillars (5 Gold per Pillar, 100% Refund)"
-      >
-        <span class="chip-icon">🏰</span>
-        <span id="gold-value" class="chip-mono">35</span>
-      </div>
-
-      <div
-        class="telemetry-chip time-chip"
-        title="Simulated Runner Survival Time vs. Round Par Time"
-      >
-        <span class="chip-icon">⏱</span>
-        <span id="est-time-value" class="chip-mono">6.2s / 46s</span>
-      </div>
-
-      <div
-        class="telemetry-chip clap-chip"
-        title="Predicted Storm Spire Thunderclap Hits Along Your Path"
-      >
-        <span class="chip-icon">⚡</span>
-        <span id="est-claps-value" class="chip-mono">0</span>
+      <!-- Right Cluster: Hall of Fame, Room & Chat, Audio, Guide -->
+      <div id="hud-top-right" class="hud-cluster-right">
+        <button
+          type="button"
+          id="btn-open-leaderboard"
+          class="icon-circle-btn gold-accent-btn"
+          title="Hall of Fame (L)"
+          aria-label="Hall of Fame"
+        >
+          <span class="icon-slot" data-icon="trophy" data-icon-size="18"></span>
+        </button>
+        <button
+          type="button"
+          id="btn-toggle-lobby"
+          class="icon-circle-btn"
+          title="Room, Audio, AI Bots & Chat"
+          aria-label="Room and Chat"
+        >
+          <span class="icon-slot" data-icon="users" data-icon-size="18"></span>
+          <span id="lobby-count-badge" class="corner-badge">1</span>
+        </button>
+        <button
+          type="button"
+          id="btn-mute"
+          class="icon-circle-btn mute-hud-btn"
+          title="Toggle Audio"
+          aria-label="Toggle Audio"
+        >
+          <span
+            id="mute-icon-slot"
+            class="icon-slot"
+            data-icon="volumeOn"
+            data-icon-size="18"
+          ></span>
+        </button>
+        <button
+          type="button"
+          id="btn-help"
+          class="icon-circle-btn guide-hud-btn"
+          title="How to Play"
+          aria-label="How to Play"
+        >
+          <span class="icon-slot" data-icon="help" data-icon-size="18"></span>
+        </button>
       </div>
     </header>
 
-    <!-- Zone 2B: Top-Right Utility Micro-Cluster -->
-    <div id="hud-top-right" class="hud-corner-right">
-      <button
-        id="btn-open-leaderboard"
-        class="micro-icon-btn gold-accent-btn"
-        title="Grand Citadel Hall of Fame Leaderboard [Hotkey: L]"
-      >
-        🏆
-      </button>
-      <button
-        id="btn-toggle-lobby"
-        class="micro-icon-btn"
-        title="Quick Room Chat, Invite & AI Bots"
-      >
-        <span>👥</span>
-        <span id="lobby-count-badge" class="corner-badge">4</span>
-      </button>
-      <button id="btn-mute" class="micro-icon-btn" title="Toggle Audio">
-        🔊
-      </button>
-      <button id="btn-help" class="micro-icon-btn" title="Tactical Codex & Rules">
-        ?
-      </button>
-    </div>
-
-    <!-- On-Demand Slide-Over Multiplayer & Chat Drawer -->
-    <aside id="lobby-drawer" class="lobby-drawer glass-panel hidden">
+    <!-- Slide-Over Room & Chat Drawer -->
+    <aside id="lobby-drawer" class="lobby-drawer surface-panel hidden">
       <div class="drawer-header">
         <div class="drawer-title-group">
-          <span>ARENA LOBBY</span>
+          <span>ROOM &amp; CHAT</span>
           <span id="room-code-badge" class="room-code-badge">ARENA1</span>
         </div>
-        <button id="btn-close-lobby" class="drawer-close-btn" title="Close Drawer">
-          ✕
-        </button>
+        <div class="drawer-header-actions">
+          <button
+            type="button"
+            id="btn-drawer-mute"
+            class="drawer-close-btn"
+            title="Toggle Audio"
+            aria-label="Toggle Audio"
+          >
+            <span
+              id="drawer-mute-icon-slot"
+              class="icon-slot"
+              data-icon="volumeOn"
+              data-icon-size="16"
+            ></span>
+          </button>
+          <button
+            type="button"
+            id="btn-close-lobby"
+            class="drawer-close-btn"
+            title="Close"
+            aria-label="Close Room Drawer"
+          >
+            <span class="icon-slot" data-icon="close" data-icon-size="16"></span>
+          </button>
+        </div>
       </div>
 
       <div class="room-controls">
@@ -157,26 +247,50 @@
             placeholder="Your Architect Name"
           />
           <button
+            type="button"
             id="btn-copy-invite"
             class="mini-action-btn"
-            title="Copy Shareable Room URL"
+            title="Copy Shareable Room Link"
           >
-            🔗 Invite
+            <span class="icon-slot" data-icon="link" data-icon-size="14"></span>
+            <span>Invite</span>
           </button>
         </div>
         <div class="bot-controls-row">
-          <button id="btn-add-bot" class="mini-action-btn">+ AI Bot</button>
-          <button id="btn-remove-bot" class="mini-action-btn">− Bot</button>
           <button
+            type="button"
+            id="btn-add-bot"
+            class="mini-action-btn"
+            title="Add AI Bot"
+          >
+            <span class="icon-slot" data-icon="plus" data-icon-size="13"></span>
+            <span>Bot</span>
+          </button>
+          <button
+            type="button"
+            id="btn-remove-bot"
+            class="mini-action-btn"
+            title="Remove AI Bot"
+          >
+            <span class="icon-slot" data-icon="minus" data-icon-size="13"></span>
+            <span>Bot</span>
+          </button>
+          <button
+            type="button"
             id="btn-drawer-open-config"
             class="mini-action-btn"
-            title="Configure Match Rules & Browse Lobbies"
+            title="Match Setup & Rooms"
           >
-            ⚙️ Rules
+            <span
+              class="icon-slot"
+              data-icon="sliders"
+              data-icon-size="13"
+            ></span>
+            <span>Setup</span>
           </button>
           <label
             class="fog-toggle"
-            title="Hide opponent islands during Build Phase"
+            title="Hide rival islands during Build Phase"
           >
             <input type="checkbox" id="chk-fog" />
             <span>Fog</span>
@@ -190,233 +304,388 @@
         <input
           id="chat-input"
           type="text"
-          placeholder="Message arena..."
+          placeholder="Send a message..."
           maxlength="160"
         />
-        <button type="submit">Send</button>
+        <button type="submit" title="Send Message" aria-label="Send Message">
+          <span class="icon-slot" data-icon="send" data-icon-size="15"></span>
+        </button>
       </form>
     </aside>
 
-    <!-- Zone 3: Bottom-Center Compact Architect Micro-Dock (Auto-Hides in RUN Phase) -->
-    <footer id="hud-bottom-dock" class="hud-bottom-dock glass-pill">
+    <!-- Ergonomic Bottom Build Bar (Auto-Hides Outside BUILD Phase) -->
+    <footer id="hud-bottom-dock" class="hud-bottom-dock surface-pill">
       <div class="dock-tools" id="tower-buttons">
         <button
+          type="button"
           class="dock-tool-btn active"
           data-tool="BLOCK"
-          title="Place 2×2 Castle Pillar (5 Gold) — Connects in All Directions! [Hotkey: Q]"
+          title="Build 2×2 Stone Pillar — Bridges Automatically (Q)"
         >
-          <span class="tool-emoji">🏰</span>
-          <span class="tool-label">Pillar</span>
-          <kbd>Q</kbd>
+          <span class="icon-slot" data-icon="pillar" data-icon-size="18"></span>
+          <span class="tool-label">Build</span>
+          <span id="dock-pillars-badge" class="dock-count-badge">35</span>
         </button>
 
         <button
+          type="button"
           class="dock-tool-btn sell-btn"
           data-tool="SELL"
-          title="Reclaim Placed Castle Pillar for 100% Gold Refund (or Right-Click any Pillar) [Hotkey: S]"
+          title="Reclaim Stone Pillar (+1 Pillar Refund) — E or Right-Click"
         >
-          <span class="tool-emoji">♻️</span>
-          <span class="tool-label">Sell</span>
-          <kbd>S</kbd>
+          <span class="icon-slot" data-icon="reclaim" data-icon-size="18"></span>
+          <span class="tool-label">Reclaim</span>
         </button>
       </div>
 
-      <div class="pill-divider"></div>
+      <div class="dock-tools-menu-wrap" id="dock-tools-wrap">
+        <button
+          type="button"
+          id="btn-dock-tools"
+          class="dock-more-btn"
+          title="Architect Tools — Auto-Blueprint, Reroll Map & Clear"
+          aria-label="Architect Tools"
+        >
+          <span class="icon-slot" data-icon="more" data-icon-size="18"></span>
+          <span class="more-label">Tools</span>
+        </button>
 
-      <div class="dock-utilities">
-        <button
-          id="btn-reroll-map"
-          class="dock-icon-btn"
-          title="Reroll Map Seed (New Random Storm Spires, Red Keep Pillars & Modifiers)"
+        <!-- Upward Progressive-Disclosure Tools Popover -->
+        <div
+          id="dock-tools-popover"
+          class="dock-tools-popover surface-panel hidden"
         >
-          🎲
-        </button>
-        <button
-          id="btn-demo-layout"
-          class="dock-icon-btn"
-          title="Auto-Maze Blueprint (Build Grandmaster Sample Maze)"
-        >
-          ✨
-        </button>
-        <button
-          id="btn-clear-maze"
-          class="dock-icon-btn danger"
-          title="Clear All Placed Castle Pillars (100% Gold Refund)"
-        >
-          🗑️
-        </button>
+          <button
+            type="button"
+            id="btn-demo-layout"
+            class="popover-action-btn"
+            title="Build a Sample Labyrinth Layout"
+          >
+            <span class="icon-slot" data-icon="wand" data-icon-size="16"></span>
+            <span>Auto-Blueprint</span>
+          </button>
+          <button
+            type="button"
+            id="btn-reroll-map"
+            class="popover-action-btn"
+            title="Generate a Fresh Map Seed with New Spires & Keeps"
+          >
+            <span class="icon-slot" data-icon="dice" data-icon-size="16"></span>
+            <span>Reroll Map</span>
+          </button>
+          <button
+            type="button"
+            id="btn-reset-camera"
+            class="popover-action-btn"
+            title="Center Camera on Your Sanctum"
+          >
+            <span
+              class="icon-slot"
+              data-icon="target"
+              data-icon-size="16"
+            ></span>
+            <span>Center Sanctum</span>
+          </button>
+          <div class="popover-divider"></div>
+          <button
+            type="button"
+            id="btn-clear-maze"
+            class="popover-action-btn danger"
+            title="Reclaim All Placed Pillars (100% Pillar Refund)"
+          >
+            <span class="icon-slot" data-icon="trash" data-icon-size="16"></span>
+            <span>Clear Pillars</span>
+          </button>
+        </div>
       </div>
 
-      <div class="pill-divider"></div>
-
-      <button id="btn-ready-lock" class="dock-ready-btn">
-        <span id="ready-btn-text">LOCK IN</span>
-        <kbd>Space</kbd>
+      <button
+        type="button"
+        id="btn-ready-lock"
+        class="dock-ready-btn"
+        title="Lock In Maze & Ready for Run Phase (Space)"
+      >
+        <span
+          id="ready-btn-icon"
+          class="icon-slot hidden"
+          data-icon="check"
+          data-icon-size="16"
+        ></span>
+        <span id="ready-btn-text">Ready</span>
       </button>
     </footer>
 
-    <!-- Round Results & Grand Championship Podium Modal -->
+    <!-- Round Results & Championship Podium Modal -->
     <div id="results-modal" class="modal-backdrop hidden">
-      <div class="modal-card results-modal-card glass-panel">
+      <div class="modal-card results-modal-card surface-panel">
         <div class="modal-header">
           <div class="results-header-row">
-            <h2 id="results-title">ROUND 1 COMPLETE</h2>
-            <span id="results-match-progress" class="meta-pill">Round 1 of 8</span>
+            <h2 id="results-title">Round 1 Complete</h2>
+            <span id="results-match-progress" class="meta-pill">
+              Round 1 of 8
+            </span>
           </div>
-          <p id="results-subtitle">Longest Runner Survival Time Wins!</p>
+          <p id="results-subtitle">Longest runner survival time wins</p>
         </div>
         <div id="results-podium" class="results-podium hidden"></div>
-        <div id="results-record-callout" class="results-record-callout hidden"></div>
+        <div
+          id="results-record-callout"
+          class="results-record-callout hidden"
+        ></div>
         <div id="results-table" class="results-table"></div>
         <div class="modal-actions results-actions">
-          <button id="btn-results-leaderboard" class="hub-secondary-btn">
-            🏆 Hall of Fame
+          <button
+            type="button"
+            id="btn-results-leaderboard"
+            class="hub-secondary-btn"
+          >
+            <span
+              class="icon-slot"
+              data-icon="trophy"
+              data-icon-size="15"
+            ></span>
+            <span>Hall of Fame</span>
           </button>
-          <button id="btn-next-round" class="dock-ready-btn">
-            Next Round →
+          <button type="button" id="btn-next-round" class="dock-ready-btn">
+            <span id="next-round-label">Next Round</span>
+            <span
+              class="icon-slot"
+              data-icon="arrowRight"
+              data-icon-size="15"
+            ></span>
           </button>
         </div>
       </div>
     </div>
 
-    <!-- CITADEL COMMAND HUB (Home Screen, Lobby Browser, Match Configurator & Hall of Fame) -->
+    <!-- CITADEL HUB (Sunlit Indie Home Screen, Lobby Browser, Match Setup & Hall of Fame) -->
     <div id="home-hub-modal" class="hub-backdrop">
-      <div class="hub-shell glass-panel">
-        <!-- Top Header Bar -->
+      <div class="hub-shell surface-panel">
+        <!-- Header Bar -->
         <header class="hub-header">
           <div class="hub-brand">
-            <span class="hub-emblem">🏰</span>
+            <div class="hub-emblem">
+              <span class="icon-slot" data-icon="hub" data-icon-size="22"></span>
+            </div>
             <div>
-              <h1 class="hub-title">MAZING CONTEST // CITADEL ARENA</h1>
-              <p class="hub-subtitle">
-                2026 Multiplayer Grassland Mazing &amp; Elemental Spire Synergies
-              </p>
+              <h1 class="hub-title">CITADEL</h1>
+              <p class="hub-subtitle hub-brand-sub">Tactical Mazing Arena</p>
             </div>
           </div>
 
-          <nav class="hub-nav-tabs" aria-label="Citadel Hub Navigation">
-            <button class="hub-tab-btn active" data-hub-tab="play">
-              ⚔️ Play &amp; Lobbies
+          <nav class="hub-nav-tabs" aria-label="Citadel Navigation">
+            <button
+              type="button"
+              class="hub-tab-btn active"
+              data-hub-tab="play"
+            >
+              <span
+                class="icon-slot"
+                data-icon="swords"
+                data-icon-size="15"
+              ></span>
+              <span>Play</span>
             </button>
-            <button class="hub-tab-btn" data-hub-tab="leaderboard">
-              🏆 Hall of Fame
+            <button
+              type="button"
+              class="hub-tab-btn"
+              data-hub-tab="leaderboard"
+            >
+              <span
+                class="icon-slot"
+                data-icon="trophy"
+                data-icon-size="15"
+              ></span>
+              <span>Hall of Fame</span>
             </button>
-            <button class="hub-tab-btn" data-hub-tab="codex">
-              📜 Codex &amp; Live Host
+            <button type="button" class="hub-tab-btn" data-hub-tab="codex">
+              <span
+                class="icon-slot"
+                data-icon="book"
+                data-icon-size="15"
+              ></span>
+              <span>How to Play</span>
             </button>
           </nav>
 
           <div class="hub-profile-cluster">
             <div class="hub-name-box" title="Your Architect Display Name">
-              <span class="hub-name-icon">👤</span>
+              <span
+                class="icon-slot hub-name-icon"
+                data-icon="user"
+                data-icon-size="14"
+              ></span>
               <input
                 id="hub-player-name-input"
                 type="text"
                 maxlength="18"
                 placeholder="Architect Name"
+                aria-label="Architect Name"
               />
             </div>
             <span id="hub-active-room-badge" class="room-code-badge">
-              ROOM: ARENA1
+              ARENA1
             </span>
             <button
+              type="button"
               id="btn-close-hub"
               class="dock-ready-btn hub-resume-btn"
-              title="Close Command Hub and Enter 3D Arena [Esc]"
+              title="Enter 3D Arena (Esc)"
             >
-              ▶ Enter Arena
+              <span
+                class="icon-slot"
+                data-icon="play"
+                data-icon-size="13"
+              ></span>
+              <span>Enter Arena</span>
             </button>
           </div>
         </header>
 
-        <!-- Quick-Action Hero Bar -->
+        <!-- Clean Quick Bar -->
         <div class="hub-quick-bar">
-          <div class="quick-join-group">
-            <span class="quick-label">JOIN BY CODE:</span>
-            <input
-              id="join-code-input"
-              type="text"
-              maxlength="8"
-              placeholder="e.g. ARENA1"
-            />
-            <button id="btn-join-code" class="hub-action-pill">
-              Join Room →
+          <div class="quick-actions-left">
+            <button
+              type="button"
+              id="btn-quick-solo"
+              class="hub-action-pill sage"
+              title="Start an Instant Solo Arena with AI Opponents"
+            >
+              <span
+                class="icon-slot"
+                data-icon="play"
+                data-icon-size="13"
+              ></span>
+              <span>Instant Solo</span>
             </button>
+
+            <div class="quick-join-group">
+              <input
+                id="join-code-input"
+                type="text"
+                maxlength="8"
+                placeholder="Room Code"
+                aria-label="Room Code"
+              />
+              <button type="button" id="btn-join-code" class="hub-action-pill">
+                <span>Join</span>
+              </button>
+            </div>
           </div>
 
           <div class="quick-actions-right">
             <button
-              id="btn-quick-solo"
-              class="hub-action-pill emerald"
-              title="Launch an instant Solo Sandbox Arena with AI Opponents"
-            >
-              ⚡ Instant Solo Arena
-            </button>
-            <button
-              id="btn-hub-restart-match"
-              class="hub-action-pill"
-              title="Reset Current Room Match Back to Round 1"
-            >
-              🔄 Restart Match
-            </button>
-            <button
+              type="button"
               id="btn-hub-copy-invite"
               class="hub-action-pill gold"
-              title="Copy Shareable Multiplayer Room URL to Clipboard"
+              title="Copy Shareable Room Link"
             >
-              🔗 Copy Invite Link
+              <span
+                class="icon-slot"
+                data-icon="link"
+                data-icon-size="14"
+              ></span>
+              <span>Copy Invite</span>
+            </button>
+            <button
+              type="button"
+              id="btn-hub-restart-match"
+              class="hub-action-pill"
+              title="Restart Current Room from Round 1"
+            >
+              <span
+                class="icon-slot"
+                data-icon="refresh"
+                data-icon-size="14"
+              ></span>
+              <span>Restart Match</span>
             </button>
           </div>
         </div>
 
-        <!-- TAB 1: PLAY, PUBLIC LOBBY BROWSER & MATCH CONFIGURATOR -->
-        <section id="hub-tab-play" class="hub-tab-body active">
-          <div class="hub-play-grid">
-            <!-- Left Pane: Live Public Lobby Browser -->
-            <div class="lobby-browser-pane">
+        <!-- TAB 1: PLAY — ACTIVE ROOMS & MATCH SETUP -->
+        <section id="hub-tab-play" class="hub-tab-body">
+          <!-- Mobile Sub-Tab Switcher (Progressive Disclosure on <= 860px) -->
+          <div class="hub-play-subtabs" id="hub-play-subtabs">
+            <button
+              type="button"
+              class="subtab-pill active"
+              data-play-pane="rooms"
+            >
+              <span
+                class="icon-slot"
+                data-icon="globe"
+                data-icon-size="14"
+              ></span>
+              <span>Active Rooms</span>
+              <span id="mobile-lobby-count" class="subtab-count">1</span>
+            </button>
+            <button
+              type="button"
+              class="subtab-pill"
+              data-play-pane="setup"
+            >
+              <span
+                class="icon-slot"
+                data-icon="sliders"
+                data-icon-size="14"
+              ></span>
+              <span>Match Setup</span>
+            </button>
+          </div>
+
+          <div class="hub-play-grid" id="hub-play-grid" data-mobile-pane="rooms">
+            <!-- Left Pane: Active Rooms -->
+            <div class="lobby-browser-pane" data-pane-id="rooms">
               <div class="pane-header">
                 <div class="pane-title-wrap">
-                  <h3>🌐 ACTIVE CITADEL LOBBIES</h3>
+                  <h3>Active Rooms</h3>
                   <span id="public-lobby-count" class="meta-pill">1 Active</span>
                 </div>
                 <button
+                  type="button"
                   id="btn-refresh-lobbies"
                   class="mini-action-btn"
-                  title="Refresh Public Lobby List"
+                  title="Refresh Room List"
                 >
-                  🔄 Refresh
+                  <span
+                    class="icon-slot"
+                    data-icon="refresh"
+                    data-icon-size="13"
+                  ></span>
+                  <span>Refresh</span>
                 </button>
               </div>
 
               <div id="lobby-browser-list" class="lobby-browser-list"></div>
 
               <div class="lobby-browser-footer">
-                <span>
-                  💡 Share your room code or invite link (`?room=CODE`) so friends join your exact island ring!
-                </span>
+                Share your invite link or room code so friends join your island ring.
               </div>
             </div>
 
-            <!-- Right Pane: Host Match Configuration Matrix -->
-            <div class="match-config-pane">
+            <!-- Right Pane: Match Setup -->
+            <div class="match-config-pane" data-pane-id="setup">
               <div class="pane-header">
                 <div class="pane-title-wrap">
-                  <h3>⚙️ MATCH CONFIGURATION</h3>
-                  <span id="config-host-badge" class="meta-pill">Host Rules</span>
+                  <h3>Match Setup</h3>
+                  <span id="config-host-badge" class="meta-pill">Custom Rules</span>
                 </div>
               </div>
 
               <div class="config-matrix">
-                <!-- Row 1: Lobby Name & Visibility -->
+                <!-- Row 1: Room Name & Visibility -->
                 <div class="config-row">
-                  <label class="config-label">Lobby Title &amp; Access</label>
+                  <label class="config-label" for="cfg-room-name">
+                    Room Title &amp; Visibility
+                  </label>
                   <div class="config-inline-split">
                     <input
                       id="cfg-room-name"
                       class="cfg-text-input"
                       type="text"
                       maxlength="26"
-                      placeholder="Highland Citadel #1"
+                      placeholder="Sunlit Citadel"
                     />
                     <div
                       class="segmented-control"
@@ -428,10 +697,10 @@
                         class="seg-btn active"
                         data-val="true"
                       >
-                        🌐 Public
+                        Public
                       </button>
                       <button type="button" class="seg-btn" data-val="false">
-                        🔒 Private
+                        Private
                       </button>
                     </div>
                   </div>
@@ -439,80 +708,74 @@
 
                 <!-- Row 2: Total Rounds -->
                 <div class="config-row">
-                  <label class="config-label">
-                    Campaign Length (Total Rounds)
-                  </label>
+                  <label class="config-label">Match Length</label>
                   <div
                     class="segmented-control"
                     id="cfg-rounds-group"
                     data-setting="totalRounds"
                   >
                     <button type="button" class="seg-btn" data-val="3">
-                      ⚡ 3 Rounds (Blitz)
+                      3 Rounds
                     </button>
                     <button type="button" class="seg-btn" data-val="5">
-                      ⚔️ 5 Rounds (Standard)
+                      5 Rounds
                     </button>
                     <button type="button" class="seg-btn active" data-val="8">
-                      👑 8 Rounds (Grand Citadel)
+                      8 Rounds
                     </button>
                   </div>
                 </div>
 
-                <!-- Row 3: Build Phase Duration -->
+                <!-- Row 3: Build Timer -->
                 <div class="config-row">
-                  <label class="config-label">Build Phase Timer</label>
+                  <label class="config-label">Build Timer</label>
                   <div
                     class="segmented-control"
                     id="cfg-buildtime-group"
                     data-setting="buildTimeSeconds"
                   >
                     <button type="button" class="seg-btn" data-val="45">
-                      ⚡ 45s Blitz
+                      45s
                     </button>
                     <button type="button" class="seg-btn" data-val="60">
-                      ⏱ 60s Fast
+                      60s
                     </button>
                     <button type="button" class="seg-btn active" data-val="0">
-                      🏛️ Round Default
+                      Standard
                     </button>
                     <button type="button" class="seg-btn" data-val="120">
-                      📐 120s Master
+                      120s
                     </button>
                     <button type="button" class="seg-btn" data-val="999">
-                      ∞ Sandbox
+                      Relaxed ∞
                     </button>
                   </div>
                 </div>
 
-                <!-- Row 4: Starting Pillar Budget -->
+                <!-- Row 4: Pillar Supply -->
                 <div class="config-row">
-                  <label class="config-label">
-                    Castle Pillar Budget (Starting Gold)
-                  </label>
+                  <label class="config-label">Stone Pillar Supply</label>
                   <div
                     class="segmented-control"
                     id="cfg-gold-group"
                     data-setting="goldMultiplier"
                   >
                     <button type="button" class="seg-btn" data-val="0.8">
-                      🔥 80% Ironman
+                      80% Lean
                     </button>
                     <button type="button" class="seg-btn active" data-val="1">
-                      🏰 100% Standard
+                      100% Standard
                     </button>
                     <button type="button" class="seg-btn" data-val="1.25">
-                      💰 125% Abundant
+                      125% Abundant
                     </button>
                   </div>
                 </div>
 
-                <!-- Row 5: AI Bot Count & Difficulty -->
+                <!-- Row 5: AI Opponents -->
                 <div class="config-row">
-                  <label class="config-label">
-                    AI Architect Opponents &amp; Skill Tier
-                  </label>
-                  <div class="config-inline-split">
+                  <label class="config-label">AI Opponents &amp; Tier</label>
+                  <div class="config-inline-split wrap-on-mobile">
                     <div
                       class="segmented-control"
                       id="cfg-botcount-group"
@@ -560,21 +823,23 @@
                   </div>
                 </div>
 
-                <!-- Row 6: Fog of War -->
+                <!-- Row 6: Scouting Visibility -->
                 <div class="config-row">
-                  <label class="config-label">
-                    Arena Scouting &amp; Fog of War
-                  </label>
+                  <label class="config-label">Rival Island Scouting</label>
                   <div
                     class="segmented-control"
                     id="cfg-fog-group"
                     data-setting="fogOfWar"
                   >
-                    <button type="button" class="seg-btn active" data-val="false">
-                      ☀️ Open Blueprints (Spectate Rivals)
+                    <button
+                      type="button"
+                      class="seg-btn active"
+                      data-val="false"
+                    >
+                      Open Sight
                     </button>
                     <button type="button" class="seg-btn" data-val="true">
-                      🌫️ Blind Maze (Hide Rivals in Build Phase)
+                      Fog of War
                     </button>
                   </div>
                 </div>
@@ -582,25 +847,27 @@
 
               <div class="config-actions-row">
                 <button
+                  type="button"
                   id="btn-apply-room-settings"
                   class="hub-secondary-btn"
-                  title="Update Rules in Your Current Room"
+                  title="Update Rules in Current Room"
                 >
-                  ⚙️ Apply to Current Room
+                  Apply to Room
                 </button>
                 <button
+                  type="button"
                   id="btn-create-custom-room"
                   class="dock-ready-btn"
-                  title="Create a Brand New Multiplayer Lobby with These Settings"
+                  title="Create a New Room with These Rules"
                 >
-                  ✨ Create New Lobby
+                  Create New Room
                 </button>
               </div>
             </div>
           </div>
         </section>
 
-        <!-- TAB 2: GRAND CITADEL HALL OF FAME (LEADERBOARD) -->
+        <!-- TAB 2: HALL OF FAME (LEADERBOARD) -->
         <section id="hub-tab-leaderboard" class="hub-tab-body hidden">
           <div class="leaderboard-header-bar">
             <div class="segmented-control" id="leaderboard-mode-group">
@@ -609,14 +876,14 @@
                 class="seg-btn active"
                 data-lb-mode="rounds"
               >
-                ⏱️ Round Survival Records (R1–R8)
+                Round Records
               </button>
               <button
                 type="button"
                 class="seg-btn"
                 data-lb-mode="champions"
               >
-                👑 Citadel Career Champions
+                Career Champions
               </button>
             </div>
 
@@ -628,76 +895,140 @@
           <div id="leaderboard-table-wrap" class="leaderboard-table-wrap"></div>
         </section>
 
-        <!-- TAB 3: CITADEL CODEX & LIVE MULTIPLAYER DEPLOYMENT GUIDE -->
+        <!-- TAB 3: HOW TO PLAY (PLAYER-FRIENDLY VISUAL GUIDE) -->
         <section id="hub-tab-codex" class="hub-tab-body hidden">
           <div class="codex-grid hub-codex-grid">
             <div class="codex-item">
-              <h4>🏰 1. All-Directional Castle Pillars</h4>
+              <div class="codex-card-head">
+                <span class="codex-icon" data-icon="pillar" data-icon-size="20"></span>
+                <h4>1. Shape the Labyrinth</h4>
+              </div>
               <p>
-                Place <strong>2×2 Castle Pillars (5G, 100% refund)</strong> anywhere on the 20×26 grassland grid. Adjacent pillars connect automatically in <strong>all directions</strong>—90° straight walls, 45° diagonals, and half-tile angled steps.
+                Place <strong>2×2 Stone Pillars</strong> (100% refund when reclaimed) anywhere on the sunlit meadow. Nearby pillars automatically connect into straight and diagonal stone walls to wind runners from the <strong>North Gate</strong> to the <strong>South Shrine</strong>.
               </p>
             </div>
+
             <div class="codex-item">
-              <h4>🔥 2. Citadel Circuitry &amp; Spire Overcharge</h4>
+              <div class="codex-card-head">
+                <span class="codex-icon" data-icon="bolt" data-icon-size="20"></span>
+                <h4>2. Route Past Elemental Spires</h4>
+              </div>
               <p>
-                Link pre-placed <strong>Crimson Keep Pillars (🧱)</strong> into your Castle Pillar wall network and connect them to Elemental Spires to grant <strong>Spire Overcharge (★ to ★★★)</strong>—expanding AoE radius, accelerating cooldowns, and piercing Juggernaut armor!
+                Fold switchbacks and spirals around map spires for repeated hits: <strong>Storm Spires</strong> unleash a 50% shock slow, <strong>Frost Obelisks</strong> chill runners inside a permafrost aura plus glacial pulses, and <strong>Chrono Spires</strong> warp time while recharging other spires.
               </p>
             </div>
+
             <div class="codex-item">
-              <h4>⚡❄️🔮 3. Three Elemental Map Spires</h4>
+              <div class="codex-card-head">
+                <span class="codex-icon" data-icon="keep" data-icon-size="20"></span>
+                <h4>3. Link Keeps for Overcharge</h4>
+              </div>
               <p>
-                Each round allocates <strong>Storm Spires (⚡ 50% Shock)</strong>, <strong>Frost Obelisks (❄️ -22% Permafrost Aura + 45% Glacial Nova)</strong>, and <strong>Chrono Spires (🔮 55% Time-Warp Slow + 1.2s Global Spire Cooldown Reduction)</strong>.
+                Connect pre-placed <strong>Crimson Keeps</strong> into the same wall network as an Elemental Spire to <strong>Overcharge</strong> it (up to 3 stars)—expanding spire radius, shortening cooldowns, and piercing heavy Juggernaut armor.
               </p>
             </div>
+
             <div class="codex-item">
-              <h4>🚀 4. Hosting Live Multiplayer on the Web</h4>
+              <div class="codex-card-head">
+                <span class="codex-icon" data-icon="crown" data-icon-size="20"></span>
+                <h4>4. Outlast Rivals &amp; Beat Par</h4>
+              </div>
               <p>
-                This game runs on a unified <strong>Node.js + Express + WebSocket (`ws`)</strong> real-time server (`server/index.js`) with persistent Hall of Fame records (`server/data/leaderboard.json`) and 1-click cloud configs (`Dockerfile` &amp; `render.yaml`) for Render, Railway, or Fly.io!
+                Longest runner survival time wins each round, with <strong>+2 bonus points</strong> for beating the round’s Par target. Adapt your layout for swift <strong>Outriders</strong>, armored <strong>Juggernauts</strong>, and gale-hasted <strong>Wind Heralds</strong>.
               </p>
+            </div>
+          </div>
+
+          <div class="controls-summary-card">
+            <div class="controls-row">
+              <strong>Touch Controls:</strong>
+              <span>Tap grass to preview &amp; confirm · Tap existing pillar to reclaim · Drag to pan · Pinch to zoom</span>
+            </div>
+            <div class="controls-row desktop-only-hint">
+              <strong>Desktop Controls:</strong>
+              <span>Left-click build · Right-click reclaim · Drag / WASD or Arrows to pan · Q Build · E Reclaim · Space Ready · Tab Overview</span>
             </div>
           </div>
         </section>
       </div>
     </div>
 
-    <!-- Tactical Codex Modal (Quick ? Overlay) -->
+    <!-- Quick How to Play Overlay (? Button in Arena) -->
     <div id="help-modal" class="modal-backdrop hidden">
-      <div class="modal-card glass-panel">
+      <div class="modal-card surface-panel">
         <div class="modal-header">
-          <h2>MAZING CONTEST // CITADEL CODEX</h2>
+          <div class="results-header-row">
+            <h2>How to Play</h2>
+            <button
+              type="button"
+              id="btn-close-help-x"
+              class="drawer-close-btn"
+              aria-label="Close Guide"
+            >
+              <span class="icon-slot" data-icon="close" data-icon-size="16"></span>
+            </button>
+          </div>
           <p>
-            Spacious 20×26 Grassland Citadel: every open grass tile inside the cliff borders is buildable!
+            Every open grass tile inside the limestone border is buildable—craft the longest survival path!
           </p>
         </div>
+
         <div class="codex-grid">
           <div class="codex-item">
-            <h4>🏰 1. All-Directional Castle Pillars</h4>
+            <div class="codex-card-head">
+              <span class="codex-icon" data-icon="pillar" data-icon-size="18"></span>
+              <h4>Stone Pillars</h4>
+            </div>
             <p>
-              Place <strong>2×2 Castle Pillars (5G, 100% refund)</strong> anywhere on the grassland grid. Pillars connect with crenellated stone walls in <strong>all directions</strong>—straight (90°), diagonal (45°), and half-tile angled steps!
+              Place <strong>2×2 Stone Pillars</strong> (100% refund when reclaimed). Adjacent pillars connect automatically in straight, 45° diagonal, and angled steps.
             </p>
           </div>
+
           <div class="codex-item">
-            <h4>🔥 2. Citadel Circuitry &amp; Spire Overcharge</h4>
+            <div class="codex-card-head">
+              <span class="codex-icon" data-icon="bolt" data-icon-size="18"></span>
+              <h4>Elemental Spires</h4>
+            </div>
             <p>
-              Link pre-placed <strong>Crimson Keep Pillars (🧱)</strong> into your Castle Pillar wall network and connect them to Elemental Spires to grant <strong>Spire Overcharge (★ to ★★★)</strong>—expanding AoE radius, accelerating cooldowns, and piercing Juggernaut armor!
+              Weave paths around <strong>Storm</strong> (50% shock), <strong>Frost</strong> (continuous chill + nova), and <strong>Chrono</strong> (time-warp + global spire recharge) spires.
             </p>
           </div>
+
           <div class="codex-item">
-            <h4>⚡❄️🔮 3. Three Elemental Map Spires</h4>
+            <div class="codex-card-head">
+              <span class="codex-icon" data-icon="keep" data-icon-size="18"></span>
+              <h4>Crimson Keep Overcharge</h4>
+            </div>
             <p>
-              Each round allocates <strong>Storm Spires (⚡ 50% Shock)</strong>, <strong>Frost Obelisks (❄️ -22% Permafrost Aura + 45% Glacial Nova)</strong>, and <strong>Chrono Spires (🔮 Time-Warp Slow + 1.2s Global Spire Cooldown Reduction)</strong>.
+              Link <strong>Crimson Keeps</strong> through your walls to nearby spires to grant Overcharge stars—boosting range, haste, and armor pierce.
             </p>
           </div>
+
           <div class="codex-item">
-            <h4>🏃🐎🛡️🦅 4. Runner Archetypes &amp; Border Gates</h4>
+            <div class="codex-card-head">
+              <span class="codex-icon" data-icon="crown" data-icon-size="18"></span>
+              <h4>Runners &amp; Par</h4>
+            </div>
             <p>
-              Runners enter right at the <strong>North Border Gate</strong> and exit at the <strong>South Border Shrine</strong>: <strong>Scout (🗡️)</strong>, <strong>Outrider (🏇 fast)</strong>, <strong>Juggernaut (🛡️ slow-resistant unless Overcharged)</strong>, and <strong>Wind Herald (⚡ accelerates outside Spire range)</strong>.
+              Longest survival from North Gate to South Shrine wins each round. Beat the Par target for <strong>+2 bonus points</strong>.
             </p>
           </div>
         </div>
+
+        <div class="controls-summary-card">
+          <div class="controls-row">
+            <strong>Touch:</strong>
+            <span>Tap grass to preview &amp; confirm · Tap pillar to reclaim · Drag to pan · Pinch to zoom</span>
+          </div>
+          <div class="controls-row desktop-only-hint">
+            <strong>Desktop:</strong>
+            <span>Drag / WASD or Arrows to pan · Q Build · E Reclaim · Space Ready · Tab Overview</span>
+          </div>
+        </div>
+
         <div class="modal-actions">
-          <button id="btn-close-help" class="dock-ready-btn">
-            Resume Building
+          <button type="button" id="btn-close-help" class="dock-ready-btn">
+            Back to Arena
           </button>
         </div>
       </div>
