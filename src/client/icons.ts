@@ -47,47 +47,62 @@ export type IconName =
   | 'scout'
   | 'outrider'
   | 'juggernaut'
-  | 'herald';
+  | 'herald'
+  | 'undo'
+  | 'pan'
+  | 'arrowLeft'
+  | 'arrowUp'
+  | 'arrowDown'
+  | 'diamond'
+  | 'diamondFilled'
+  | 'share';
 
 const SVG_PATHS: Record<IconName, string> = {
-  // Battlemented Citadel Keep Crest
+  // Battlemented Citadel Keep Crest (Menu / Hub)
   hub: `
     <path d="M4 20h16" />
-    <path d="M5 20V8h3v2h2V8h4v2h2V8h3v12" />
+    <path d="M5 20V8h3v2.2h2V8h4v2.2h2V8h3v12" />
     <path d="M10 20v-4a2 2 0 0 1 4 0v4" />
   `,
-  // Compass / Arena Overview
+  // Navigation Compass
   compass: `
     <circle cx="12" cy="12" r="8.5" />
     <polygon points="15.5,8.5 13.4,13.4 8.5,15.5 10.6,10.6" />
   `,
+  // All Islands Overview (2x2 Island Grid — distinct from compass)
   overview: `
-    <circle cx="12" cy="12" r="8.5" />
-    <polygon points="15.5,8.5 13.4,13.4 8.5,15.5 10.6,10.6" />
+    <rect x="3.5" y="3.5" width="7" height="7" rx="1.8" />
+    <rect x="13.5" y="3.5" width="7" height="7" rx="1.8" />
+    <rect x="3.5" y="13.5" width="7" height="7" rx="1.8" />
+    <rect x="13.5" y="13.5" width="7" height="7" rx="1.8" />
   `,
-  // Sanctum Focus Reticle
+  // Reset Camera Focus Reticle
   target: `
     <circle cx="12" cy="12" r="7.5" />
-    <circle cx="12" cy="12" r="2.5" />
+    <circle cx="12" cy="12" r="2.2" />
     <path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5" />
   `,
+  // My Island Plateau & Shrine (distinct from sniper reticle)
   sanctum: `
-    <circle cx="12" cy="12" r="7.5" />
-    <circle cx="12" cy="12" r="2.5" />
-    <path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5" />
+    <path d="M8.5 15V8.5L12 5l3.5 3.5V15" />
+    <path d="M3.5 15.5L12 19.5l8.5-4" />
+    <path d="M6.8 18.8L12 21.2l5.2-2.4" />
   `,
-  // Crenellated 2x2 Turret Pillar
+  // Buildable 2x2 Stone Wall Turret (wide open embrasure for 12-18px clarity)
   pillar: `
-    <path d="M5 20h14" />
-    <path d="M6.5 20v-9.5L5.5 8V5h3v2h2V5h3v2h2V5h3v3l-1 2.5V20" />
-    <path d="M9.5 14h5" />
+    <path d="M4.5 20h15" />
+    <path d="M6.5 20v-9L5.5 8.5V5h4.5v2.5h4V5h4.5v3.5L17.5 11v9" />
+    <path d="M6.5 11h11" />
   `,
-  // Reclaim / Undo Circular Arrow
+  // Remove 2x2 Stone Wall Reticle (distinct from Undo curved arrow)
   reclaim: `
-    <path d="M4.5 9.5h10a4.5 4.5 0 1 1 0 9H9" />
-    <path d="M8 6L4.5 9.5 8 13" />
+    <path d="M4.5 8.5V5.5a1 1 0 0 1 1-1h3" />
+    <path d="M15.5 4.5h3a1 1 0 0 1 1 1v3" />
+    <path d="M19.5 15.5v3a1 1 0 0 1-1 1h-3" />
+    <path d="M8.5 19.5h-3a1 1 0 0 1-1-1v-3" />
+    <path d="M9.5 9.5l5 5M14.5 9.5l-5 5" />
   `,
-  // Stopwatch / Clock
+  // Stopwatch / Run Time
   clock: `
     <circle cx="12" cy="12.5" r="8" />
     <path d="M12 8.5v4.2l2.8 1.8" />
@@ -97,37 +112,40 @@ const SVG_PATHS: Record<IconName, string> = {
   bolt: `
     <polygon points="13,2.5 5.5,13.5 11.5,13.5 10.5,21.5 18.5,10.5 12.5,10.5" />
   `,
-  // Frost Obelisk Crystal / Snowflake
+  // Frost Obelisk Crystal
   frost: `
     <path d="M12 2.5v19M4.5 7.5l15 9M19.5 7.5l-15 9" />
     <path d="M10 4.5L12 6.5l2-2M10 19.5l2-2 2 2" />
   `,
-  // Chrono Spire Hourglass / Temporal Ring
+  // Chrono Spire Hourglass
   chrono: `
     <path d="M6.5 4h11M6.5 20h11" />
     <path d="M8 4c0 4.5 4 5.5 4 8s-4 3.5-4 8" />
     <path d="M16 4c0 4.5-4 5.5-4 8s4 3.5 4 8" />
   `,
-  // Crimson Keep Fortress Bastion
+  // Crimson Keep Bastion with Pitched Roof & Crown Brazier (matches 3D Keep)
   keep: `
-    <rect x="4.5" y="6" width="15" height="14" rx="1.5" />
-    <path d="M4.5 11h15M9.5 6v5M14.5 6v5M12 11v9" />
+    <polygon fill="currentColor" stroke="none" points="12,1.8 14.3,4.3 12,6.8 9.7,4.3" />
+    <path d="M4.8 12L12 7.8 19.2 12" />
+    <path d="M6.5 11.2V20h11v-8.8" />
+    <path d="M4.5 20h15" />
+    <path d="M12 12.5v4" />
   `,
-  // Clean 5-Point Star
+  // Clean 5-Point Star (Round Par outline)
   star: `
     <polygon points="12,3 14.7,8.5 20.8,9.4 16.4,13.7 17.4,19.8 12,16.9 6.6,19.8 7.6,13.7 3.2,9.4 9.3,8.5" />
   `,
-  // Solid Gilded Star (Overcharge & Par)
+  // Solid Gilded Star (Round Par bonus)
   starFilled: `
     <polygon fill="currentColor" points="12,3 14.7,8.5 20.8,9.4 16.4,13.7 17.4,19.8 12,16.9 6.6,19.8 7.6,13.7 3.2,9.4 9.3,8.5" />
   `,
-  // Hall of Fame Trophy Chalice
+  // Leaderboard Trophy Chalice
   trophy: `
     <path d="M7 4h10v5a5 5 0 0 1-10 0V4z" />
     <path d="M7 6H4.5a2 2 0 0 0 0 4H7M17 6h2.5a2 2 0 0 1 0 4H17" />
     <path d="M12 14v4M8.5 20h7" />
   `,
-  // Royal Crown
+  // Champion Crown
   crown: `
     <path d="M3.5 18.5h17L19 7.5l-4.2 3.8L12 5.5 9.2 11.3 5 7.5 3.5 18.5z" />
   `,
@@ -138,7 +156,7 @@ const SVG_PATHS: Record<IconName, string> = {
     <circle cx="16.5" cy="9.5" r="2.5" />
     <path d="M15.5 19a4.5 4.5 0 0 1 5 0" />
   `,
-  // Single Architect Profile
+  // Single Player Profile
   user: `
     <circle cx="12" cy="8.5" r="3.5" />
     <path d="M5.5 19.5a6.5 6.5 0 0 1 13 0" />
@@ -154,33 +172,33 @@ const SVG_PATHS: Record<IconName, string> = {
     <polygon points="4.5,9.5 8.5,9.5 13.5,5.5 13.5,18.5 8.5,14.5 4.5,14.5" />
     <path d="M17 9.5l4.5 5M21.5 9.5l-4.5 5" />
   `,
-  // Open Codex / Guide Book
+  // Open Guide Book
   book: `
     <path d="M3.5 5.5A2.5 2.5 0 0 1 6 3h5.5v16.5H6a2.5 2.5 0 0 0-2.5 2V5.5z" />
     <path d="M20.5 5.5A2.5 2.5 0 0 0 18 3h-5.5v16.5H18a2.5 2.5 0 0 1 2.5 2V5.5z" />
   `,
-  // Clean Question / Guide Emblem
+  // Guide Question Emblem
   help: `
     <circle cx="12" cy="12" r="8.8" />
     <path d="M9.6 9.3a2.5 2.5 0 1 1 3.8 2.1c-.9.5-1.4 1.1-1.4 2.1" />
-    <circle cx="12" cy="17" r="0.6" fill="currentColor" />
+    <circle cx="12" cy="17" r="0.7" fill="currentColor" stroke="none" />
   `,
-  // Reroll Die
+  // New Map Seed Die
   dice: `
     <rect x="4" y="4" width="16" height="16" rx="3.2" />
-    <circle cx="8.5" cy="8.5" r="1" fill="currentColor" />
-    <circle cx="15.5" cy="8.5" r="1" fill="currentColor" />
-    <circle cx="12" cy="12" r="1" fill="currentColor" />
-    <circle cx="8.5" cy="15.5" r="1" fill="currentColor" />
-    <circle cx="15.5" cy="15.5" r="1" fill="currentColor" />
+    <circle cx="8.5" cy="8.5" r="1.05" fill="currentColor" stroke="none" />
+    <circle cx="15.5" cy="8.5" r="1.05" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1.05" fill="currentColor" stroke="none" />
+    <circle cx="8.5" cy="15.5" r="1.05" fill="currentColor" stroke="none" />
+    <circle cx="15.5" cy="15.5" r="1.05" fill="currentColor" stroke="none" />
   `,
-  // Auto-Blueprint Wand
+  // Sample Maze Wand
   wand: `
     <path d="M4.5 19.5L15 9" />
     <path d="M17.5 3.5v3M16 5h3M19.5 9.5v2M18.5 10.5h2M12.5 4.5v2M11.5 5.5h2" />
     <polygon points="16.5,7.5 18,9 15,12 13.5,10.5" />
   `,
-  // Clear Pillars Trash
+  // Clear All Trash
   trash: `
     <path d="M4.5 7h15" />
     <path d="M9.5 7V4.8a1.3 1.3 0 0 1 1.3-1.3h2.4a1.3 1.3 0 0 1 1.3 1.3V7" />
@@ -189,9 +207,9 @@ const SVG_PATHS: Record<IconName, string> = {
   `,
   // More Horizontal Dots (Tools)
   more: `
-    <circle cx="6" cy="12" r="1.4" fill="currentColor" />
-    <circle cx="12" cy="12" r="1.4" fill="currentColor" />
-    <circle cx="18" cy="12" r="1.4" fill="currentColor" />
+    <circle cx="6" cy="12" r="1.45" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1.45" fill="currentColor" stroke="none" />
+    <circle cx="18" cy="12" r="1.45" fill="currentColor" stroke="none" />
   `,
   // Checkmark
   check: `
@@ -224,12 +242,12 @@ const SVG_PATHS: Record<IconName, string> = {
     <rect x="5.5" y="10.5" width="13" height="9.5" rx="2" />
     <path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3" />
   `,
-  // Open Blueprints Eye
+  // Visible Rival Mazes Eye
   eye: `
     <path d="M2.5 12S6 6 12 6s9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" />
     <circle cx="12" cy="12" r="2.6" />
   `,
-  // Fog of War Slashed Eye
+  // Hidden Rival Mazes Slashed Eye
   eyeOff: `
     <path d="M3.5 3.5l17 17" />
     <path d="M9.9 6.3A9.4 9.4 0 0 1 12 6c6 0 9.5 6 9.5 6a16.5 16.5 0 0 1-3.4 4.2" />
@@ -243,22 +261,22 @@ const SVG_PATHS: Record<IconName, string> = {
   chevronDown: `
     <path d="M6.5 9.5L12 15l5.5-5.5" />
   `,
-  // Forward Arrow
+  // East (+X) Nudge / Forward Arrow
   arrowRight: `
     <path d="M5 12h14M13 6l6 6-6 6" />
   `,
-  // Match Rules Sliders
+  // Room Rules Sliders
   sliders: `
     <path d="M4 7h9M17 7h3M15 5v4" />
     <path d="M4 12h3M11 12h9M9 10v4" />
     <path d="M4 17h11M19 17h1M17 15v4" />
   `,
-  // Crossed Swords (Play)
+  // Crossed Swords (Play — broken back-blade gap prevents center knot at 14-16px)
   swords: `
-    <path d="M14.5 17.5L4 7V4h3l10.5 10.5" />
-    <path d="M13 19l6-6M16 16l4 4" />
-    <path d="M9.5 17.5L20 7V4h-3L6.5 14.5" />
-    <path d="M11 19l-6-6M8 16l-4 4" />
+    <path d="M4.5 4.5l15 15" />
+    <path d="M13.5 17.5l4-4" />
+    <path d="M19.5 4.5L14.2 9.8M9.8 14.2L4.5 19.5" />
+    <path d="M6.5 13.5l4 4" />
   `,
   // Finish Flag
   flag: `
@@ -278,33 +296,80 @@ const SVG_PATHS: Record<IconName, string> = {
     <path d="M20.5 3.5L10 14" />
     <polygon points="20.5,3.5 13.8,20.5 10,14 3.5,10.2" />
   `,
-  // Runner Archetype: SCOUT (Swift Ranger Blade)
+  // Runner Archetype: SCOUT (Wayfarer Crook Staff & Glowing Diamond Lantern — matches 3D Scout)
   scout: `
-    <path d="M18.5 4.5l-9.8 9.8" />
-    <path d="M14.5 4.5h4v4" />
-    <path d="M6.5 12.5l5 5M5 19l3.8-3.8" />
+    <path d="M7 20.5V7.5a3.5 3.5 0 0 1 7 0V9" />
+    <polygon points="14,10.2 17.2,14 14,17.8 10.8,14" />
+    <circle cx="14" cy="14" r="1" fill="currentColor" stroke="none" />
   `,
-  // Runner Archetype: OUTRIDER (Plumed Swift Crest)
+  // Runner Archetype: OUTRIDER (Couched Cavalry Spear & Swallowtail Pennant — matches 3D Outrider)
   outrider: `
-    <path d="M4.5 17.5h13.5l2-5.5-5 1.5L12 6.5 9 12.5l-4.5-1z" />
-    <path d="M4 20h16" />
+    <path d="M4.5 19.5l15-15" />
+    <path d="M15 4.5h4.5V9" />
+    <path d="M15.5 8.5l-9-2 2.5 3.5-2.5 3.5 5-1" />
   `,
-  // Runner Archetype: JUGGERNAUT (Heavy Kite Shield)
+  // Runner Archetype: JUGGERNAUT (Heavy Heater Shield — matches 3D Juggernaut)
   juggernaut: `
     <path d="M12 3l7.5 3v5.5c0 4.8-3.2 8.2-7.5 9.8-4.3-1.6-7.5-5-7.5-9.8V6L12 3z" />
     <path d="M12 6.5v11M8.5 10.5h7" />
   `,
-  // Runner Archetype: HERALD (Winged Gale Crest)
+  // Runner Archetype: HERALD (Crisp Twin Gale Curls — readable at 12-14px)
   herald: `
-    <path d="M3.5 12c3.2-4.2 7.5-5.5 12.5-4-2.5 1.8-3.8 3.2-4.5 5 3.5-.8 6.5-.2 9 1.5-3.8 2.8-8.2 3.5-13.5 1.5" />
-    <path d="M3.5 16h6" />
+    <path d="M3.5 9.5h10.8a2.7 2.7 0 1 0-2.7-2.7" />
+    <path d="M3.5 13.5h14a2.8 2.8 0 1 1-2.8 2.8" />
+    <path d="M5.5 17.5h5" />
+  `,
+  // Counter-Clockwise Undo Arrow
+  undo: `
+    <path d="M4.5 9.5h10a4.5 4.5 0 1 1 0 9H9" />
+    <path d="M8.5 5.5l-4 4 4 4" />
+  `,
+  // 4-Direction Camera Pan Cross
+  pan: `
+    <path d="M12 3v18M3 12h18" />
+    <path d="M9.5 5.5L12 3l2.5 2.5" />
+    <path d="M9.5 18.5L12 21l2.5-2.5" />
+    <path d="M5.5 9.5L3 12l2.5 2.5" />
+    <path d="M18.5 9.5L21 12l-2.5 2.5" />
+  `,
+  // West (-X) Nudge / Back Arrow
+  arrowLeft: `
+    <path d="M19 12H5M11 6l-6 6 6 6" />
+  `,
+  // North (-Y) Nudge Arrow
+  arrowUp: `
+    <path d="M12 19V5M6 11l6-6 6 6" />
+  `,
+  // South (+Y) Nudge Arrow
+  arrowDown: `
+    <path d="M12 5v14M6 13l6 6 6-6" />
+  `,
+  // Outline Overcharge Pip (◇)
+  diamond: `
+    <polygon points="12,3.2 20.2,12 12,20.8 3.8,12" />
+  `,
+  // Solid Overcharge Pip (◆ — distinct from ★ Par!)
+  diamondFilled: `
+    <polygon fill="currentColor" points="12,3.2 20.2,12 12,20.8 3.8,12" />
+  `,
+  // Mobile Native Share Sheet Icon
+  share: `
+    <path d="M12 3.5v11" />
+    <path d="M8 7.5l4-4 4 4" />
+    <path d="M5 13.5v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
   `,
 };
 
+/**
+ * Renders an inline SVG icon with size-adaptive optical stroke weight so
+ * 11-13px micro-badges stay razor-sharp while 20-24px emblems stay refined.
+ */
 export function icon(name: IconName, size = 16, extraClass = ''): string {
   const body = SVG_PATHS[name] || SVG_PATHS.pillar;
   const cls = extraClass ? `svg-icon ${extraClass}` : 'svg-icon';
-  return `<svg class="${cls}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+  const strokeWidth =
+    size <= 13 ? '2.15' : size <= 16 ? '1.95' : size <= 19 ? '1.8' : '1.7';
+  return `<svg class="${cls}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
 }
 
 export function getRunnerIcon(
@@ -336,38 +401,45 @@ export function getSpireIcon(spireType: SpireType, size = 14): string {
   }
 }
 
+const MEDAL_RANK_PATHS: Record<1 | 2 | 3, string> = {
+  1: `<path d="M10.7 7.8L12.1 6.7v5.6M10.6 12.3h3" />`,
+  2: `<path d="M10.2 8.1a1.85 1.6 0 0 1 3.65 0.3c0 1.05-.9 1.8-3.65 3.9h3.75" />`,
+  3: `<path d="M10.4 7.35c.4-.45 1-.7 1.7-.7 1.05 0 1.75.55 1.75 1.35 0 .78-.65 1.35-1.75 1.4 1.15.05 1.85.65 1.85 1.5 0 .9-.78 1.5-1.9 1.5-.78 0-1.42-.25-1.82-.72M11.45 9.4h.65" />`,
+};
+
 /**
- * Renders a crisp, gilded tactile SVG medal badge for 1st, 2nd, or 3rd place
- * instead of raw OS medal emojis.
+ * Renders a high-contrast gilded tactile SVG medal badge for 1st, 2nd, or 3rd place
+ * using platform-invariant geometric vector <path> numerals (WCAG AAA contrast, zero <text> font drift).
  */
 export function getMedalBadge(rank: 1 | 2 | 3, size = 22): string {
   const palette =
     rank === 1
       ? {
-          fill: '#f59e0b',
-          rim: '#92400e',
-          ribbon: '#b45309',
-          text: '#ffffff',
+          fill: '#fbbf24',
+          rim: '#b45309',
+          ribbon: '#d97706',
+          numeral: '#451a03',
         }
       : rank === 2
       ? {
-          fill: '#94a3b8',
+          fill: '#e2e8f0',
           rim: '#475569',
           ribbon: '#64748b',
-          text: '#ffffff',
+          numeral: '#1e293b',
         }
       : {
-          fill: '#d97706',
-          rim: '#78350f',
-          ribbon: '#92400e',
-          text: '#ffffff',
+          fill: '#f0a35e',
+          rim: '#9a3412',
+          ribbon: '#b45309',
+          numeral: '#431407',
         };
 
   return `<svg class="svg-icon medal-svg medal-rank-${rank}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <path d="M8.5 14.5L6.5 21.5L10.5 19.5L12 21.5V15" fill="${palette.ribbon}" />
     <path d="M15.5 14.5L17.5 21.5L13.5 19.5L12 21.5V15" fill="${palette.ribbon}" />
     <circle cx="12" cy="9.5" r="6.8" fill="${palette.fill}" stroke="${palette.rim}" stroke-width="1.5" />
-    <text x="12" y="12.6" text-anchor="middle" font-family="Inter, system-ui, sans-serif" font-size="8.8" font-weight="800" fill="${palette.text}">${rank}</text>
+    <circle cx="12" cy="9.5" r="5.3" stroke="rgba(255,255,255,0.48)" stroke-width="0.7" />
+    <g stroke="${palette.numeral}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${MEDAL_RANK_PATHS[rank]}</g>
   </svg>`;
 }
 

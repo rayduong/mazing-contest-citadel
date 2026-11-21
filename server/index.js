@@ -13,22 +13,25 @@ const DATA_DIR = path.join(__dirname, 'data');
 const LEADERBOARD_FILE = path.join(DATA_DIR, 'leaderboard.json');
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const RECONNECT_GRACE_MS = 45_000;
+const POST_FINISH_HOLD_REAL_SEC = 0.95;
 
 const PLAYER_COLORS = [
   '#38bdf8', // Cyan (Player 1)
   '#f59e0b', // Amber Gold (Player 2)
-  '#c084fc', // Arcane Violet (Player 3)
+  '#c084fc', // Violet (Player 3)
   '#34d399', // Emerald (Player 4)
-  '#f43f5e', // Crimson Rose (Player 5)
-  '#fb923c', // Solar Orange (Player 6)
+  '#f43f5e', // Coral Rose (Player 5)
+  '#fb923c', // Warm Orange (Player 6)
 ];
 
+// IP-clean Original Mason Roster (no " [AI]" string suffix; UI renders BOT badge via isBot)
 const BOT_PRESETS = [
-  { name: 'Grandmaster Pender', difficulty: 'GRANDMASTER', style: 'SWITCHBACK' },
-  { name: 'Archmage Vashj', difficulty: 'ARCHITECT', style: 'SPIRAL' },
-  { name: 'Stormlord Kael', difficulty: 'ARCHITECT', style: 'CLAP_CHAIN' },
-  { name: 'Acolyte Kel', difficulty: 'NOVICE', style: 'SWITCHBACK' },
-  { name: 'Warden Maiev', difficulty: 'GRANDMASTER', style: 'SPIRAL' },
+  { name: 'Master Pender', difficulty: 'GRANDMASTER', style: 'SWITCHBACK' },
+  { name: 'Mason Rowan', difficulty: 'ARCHITECT', style: 'SPIRAL' },
+  { name: 'Warden Soren', difficulty: 'ARCHITECT', style: 'CLAP_CHAIN' },
+  { name: 'Apprentice Pip', difficulty: 'NOVICE', style: 'SWITCHBACK' },
+  { name: 'Lady Maren', difficulty: 'GRANDMASTER', style: 'SPIRAL' },
 ];
 
 function createSeededLeaderboard(ROUNDS) {
@@ -36,98 +39,109 @@ function createSeededLeaderboard(ROUNDS) {
   /** @type {Record<number, any[]>} */
   const roundRecords = {};
 
-  const famousArchitects = [
-    { name: 'Grandmaster Pender', color: '#f59e0b', bonus: 1.18, claps: 9, overcharge: 3, keeps: 5 },
-    { name: 'Elvenking', color: '#38bdf8', bonus: 1.11, claps: 8, overcharge: 2, keeps: 4 },
-    { name: 'Archmage Vashj', color: '#c084fc', bonus: 1.05, claps: 7, overcharge: 2, keeps: 4 },
-    { name: 'Warden Maiev', color: '#34d399', bonus: 0.98, claps: 6, overcharge: 1, keeps: 3 },
-    { name: 'Stormlord Kael', color: '#f43f5e', bonus: 0.92, claps: 5, overcharge: 1, keeps: 2 },
+  const seededMasons = [
+    { name: 'Master Pender', color: '#f59e0b', mult: 1.08, claps: 8, overcharge: 3, keeps: 3 },
+    { name: 'Lady Maren', color: '#c084fc', mult: 1.03, claps: 7, overcharge: 2, keeps: 3 },
+    { name: 'Mason Rowan', color: '#38bdf8', mult: 0.99, claps: 6, overcharge: 2, keeps: 2 },
+    { name: 'Warden Soren', color: '#34d399', mult: 0.93, claps: 5, overcharge: 1, keeps: 2 },
+    { name: 'Tovin', color: '#fb923c', mult: 0.88, claps: 4, overcharge: 1, keeps: 1 },
   ];
 
   for (const r of ROUNDS) {
-    roundRecords[r.roundNumber] = famousArchitects.map((arch, idx) => {
+    roundRecords[r.roundNumber] = seededMasons.map((mason, idx) => {
       const survivalTimeSeconds = Number(
-        (r.parTimeSeconds * arch.bonus - idx * 0.65).toFixed(2)
+        (r.parTimeSeconds * mason.mult).toFixed(2)
       );
       const pathDistance = Number(
-        (survivalTimeSeconds * 2.45 + 18).toFixed(1)
+        Math.min(172, Math.max(96, survivalTimeSeconds * 2.55 + 22 - idx * 3)).toFixed(1)
       );
       return {
         id: `seed_r${r.roundNumber}_${idx}`,
         roundNumber: r.roundNumber,
         roundTitle: r.title,
         runnerType: r.runnerType || 'SCOUT',
-        playerName: arch.name,
-        playerColor: arch.color,
+        playerName: mason.name,
+        playerColor: mason.color,
         isBot: false,
         survivalTimeSeconds,
         parTimeSeconds: r.parTimeSeconds,
         beatPar: survivalTimeSeconds >= r.parTimeSeconds,
-        clapsTaken: arch.claps + Math.floor(r.roundNumber / 3),
-        overchargedSpires: Math.min(r.spireCount, arch.overcharge),
-        linkedKeeps: Math.min(r.obstacleCount, arch.keeps),
+        clapsTaken: mason.claps + Math.floor(r.roundNumber / 3),
+        overchargedSpires: Math.min(r.spireCount * 3, mason.overcharge),
+        linkedKeeps: Math.min(r.obstacleCount, mason.keeps),
         pathDistance,
         goldMultiplier: 1.0,
-        roomCode: 'CITADEL',
+        roomCode: 'ARENA1',
         timestamp: now - (idx + 1) * 3600_000 * 4,
       };
     });
   }
 
+  const lastRoundIdx = Math.max(0, ROUNDS.length - 1);
   const champions = [
     {
-      playerName: 'Grandmaster Pender',
+      playerName: 'Master Pender',
       playerColor: '#f59e0b',
-      matchesWon: 14,
-      roundsPlayed: 64,
-      totalCareerPoints: 682,
-      parStarsEarned: 52,
-      bestSurvivalTime: Number((ROUNDS[7].parTimeSeconds * 1.18).toFixed(2)),
-      bestRoundNumber: 8,
+      matchesWon: 12,
+      roundsPlayed: 56,
+      totalCareerPoints: 594,
+      parStarsEarned: 44,
+      bestSurvivalTime: Number(
+        (ROUNDS[lastRoundIdx].parTimeSeconds * 1.08).toFixed(2)
+      ),
+      bestRoundNumber: ROUNDS[lastRoundIdx].roundNumber,
       lastPlayedAt: now - 3600_000 * 2,
     },
     {
-      playerName: 'Elvenking',
-      playerColor: '#38bdf8',
-      matchesWon: 11,
-      roundsPlayed: 56,
-      totalCareerPoints: 540,
-      parStarsEarned: 41,
-      bestSurvivalTime: Number((ROUNDS[7].parTimeSeconds * 1.11).toFixed(2)),
-      bestRoundNumber: 8,
+      playerName: 'Lady Maren',
+      playerColor: '#c084fc',
+      matchesWon: 9,
+      roundsPlayed: 48,
+      totalCareerPoints: 486,
+      parStarsEarned: 35,
+      bestSurvivalTime: Number(
+        (ROUNDS[lastRoundIdx].parTimeSeconds * 1.03).toFixed(2)
+      ),
+      bestRoundNumber: ROUNDS[lastRoundIdx].roundNumber,
       lastPlayedAt: now - 3600_000 * 5,
     },
     {
-      playerName: 'Archmage Vashj',
-      playerColor: '#c084fc',
-      matchesWon: 8,
-      roundsPlayed: 48,
-      totalCareerPoints: 438,
-      parStarsEarned: 33,
-      bestSurvivalTime: Number((ROUNDS[6].parTimeSeconds * 1.09).toFixed(2)),
-      bestRoundNumber: 7,
+      playerName: 'Mason Rowan',
+      playerColor: '#38bdf8',
+      matchesWon: 7,
+      roundsPlayed: 42,
+      totalCareerPoints: 402,
+      parStarsEarned: 28,
+      bestSurvivalTime: Number(
+        (ROUNDS[Math.max(0, lastRoundIdx - 1)].parTimeSeconds * 1.04).toFixed(2)
+      ),
+      bestRoundNumber: ROUNDS[Math.max(0, lastRoundIdx - 1)].roundNumber,
       lastPlayedAt: now - 3600_000 * 9,
     },
     {
-      playerName: 'Warden Maiev',
+      playerName: 'Warden Soren',
       playerColor: '#34d399',
-      matchesWon: 6,
-      roundsPlayed: 40,
-      totalCareerPoints: 355,
-      parStarsEarned: 25,
-      bestSurvivalTime: Number((ROUNDS[5].parTimeSeconds * 1.06).toFixed(2)),
-      bestRoundNumber: 6,
+      matchesWon: 5,
+      roundsPlayed: 36,
+      totalCareerPoints: 328,
+      parStarsEarned: 21,
+      bestSurvivalTime: Number(
+        (ROUNDS[Math.max(0, lastRoundIdx - 2)].parTimeSeconds * 1.02).toFixed(2)
+      ),
+      bestRoundNumber: ROUNDS[Math.max(0, lastRoundIdx - 2)].roundNumber,
       lastPlayedAt: now - 3600_000 * 14,
     },
     {
-      playerName: 'Stormlord Kael',
-      playerColor: '#f43f5e',
-      matchesWon: 4,
-      roundsPlayed: 32,
-      totalCareerPoints: 270,
-      parStarsEarned: 18,
-      bestSurvivalTime: Number((ROUNDS[4].parTimeSeconds * 1.04).toFixed(2)),
-      bestRoundNumber: 5,
+      playerName: 'Tovin',
+      playerColor: '#fb923c',
+      matchesWon: 3,
+      roundsPlayed: 28,
+      totalCareerPoints: 242,
+      parStarsEarned: 14,
+      bestSurvivalTime: Number(
+        (ROUNDS[Math.max(0, lastRoundIdx - 3)].parTimeSeconds * 1.01).toFixed(2)
+      ),
+      bestRoundNumber: ROUNDS[Math.max(0, lastRoundIdx - 3)].roundNumber,
       lastPlayedAt: now - 3600_000 * 20,
     },
   ];
@@ -137,6 +151,36 @@ function createSeededLeaderboard(ROUNDS) {
     champions,
     updatedAt: now,
   };
+}
+
+function fallbackEffectivePar(baseParSeconds, goldMultiplier = 1.0) {
+  const mult = Number(goldMultiplier) || 1.0;
+  const factor = mult <= 0.85 ? 0.86 : mult >= 1.15 ? 1.12 : 1.0;
+  return Number((baseParSeconds * factor).toFixed(1));
+}
+
+function sanitizePlayerName(rawName, fallbackNumber) {
+  const cleaned = String(rawName || '')
+    .replace(/\s*\[AI\]$/i, '')
+    .trim()
+    .slice(0, 20);
+  if (cleaned) return cleaned;
+  const num = fallbackNumber || Math.floor(100 + Math.random() * 899);
+  return `Player ${num}`;
+}
+
+function sanitizeSessionId(rawSessionId) {
+  if (typeof rawSessionId === 'string') {
+    const clean = rawSessionId.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48);
+    if (clean.length >= 6) return clean;
+  }
+  return `ses_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function sanitizeClientId(rawClientId) {
+  if (typeof rawClientId !== 'string') return undefined;
+  const clean = rawClientId.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 36);
+  return clean.length > 0 ? clean : undefined;
 }
 
 async function startServer() {
@@ -150,9 +194,13 @@ async function startServer() {
   });
 
   // Load shared TypeScript game modules via Vite SSR loader
-  const { ROUNDS, generateRandomRoundLayout } = await vite.ssrLoadModule(
-    '/src/shared/rounds.ts'
-  );
+  const roundsMod = await vite.ssrLoadModule('/src/shared/rounds.ts');
+  const { ROUNDS, generateRandomRoundLayout } = roundsMod;
+  const computeEffectivePar =
+    typeof roundsMod.computeEffectivePar === 'function'
+      ? roundsMod.computeEffectivePar
+      : fallbackEffectivePar;
+
   const { TOWER_SPECS } = await vite.ssrLoadModule('/src/shared/types.ts');
   const { computeFullMazePath, validateTowerPlacement } =
     await vite.ssrLoadModule('/src/shared/pathfinding.ts');
@@ -163,7 +211,7 @@ async function startServer() {
     '/src/shared/aiBuilder.ts'
   );
 
-  // Initialize persistent Hall of Fame Leaderboard
+  // Initialize persistent Leaderboard (non-blocking writes after startup)
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
@@ -182,37 +230,84 @@ async function startServer() {
     console.warn('Could not read leaderboard.json, using seeded records:', err);
   }
 
-  function saveLeaderboard() {
-    leaderboard.updatedAt = Date.now();
+  let leaderboardWriteInFlight = false;
+  let leaderboardWriteQueued = false;
+
+  async function flushLeaderboardAsync() {
+    if (leaderboardWriteInFlight) {
+      leaderboardWriteQueued = true;
+      return;
+    }
+    leaderboardWriteInFlight = true;
     try {
-      fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2));
+      do {
+        leaderboardWriteQueued = false;
+        const json = JSON.stringify(leaderboard, null, 2);
+        const tmpPath = `${LEADERBOARD_FILE}.tmp`;
+        try {
+          await fs.promises.writeFile(tmpPath, json, 'utf-8');
+          await fs.promises.rename(tmpPath, LEADERBOARD_FILE);
+        } catch {
+          await fs.promises.writeFile(LEADERBOARD_FILE, json, 'utf-8');
+        }
+      } while (leaderboardWriteQueued);
     } catch (err) {
       console.warn('Failed to persist leaderboard.json:', err);
+    } finally {
+      leaderboardWriteInFlight = false;
     }
+  }
+
+  function saveLeaderboard() {
+    leaderboard.updatedAt = Date.now();
+    void flushLeaderboardAsync();
   }
 
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   /** @type {Map<string, any>} */
   const rooms = new Map();
-  /** @type {Map<any, { roomCode: string; playerId: string }>} */
+  /** @type {Map<any, { roomCode: string; playerId: string; sessionId: string; superseded?: boolean }>} */
   const clientMap = new Map();
 
-  function createBotPlayer(index, usedColors, difficultyOverride) {
+  let lobbyBroadcastTimer = null;
+  let lastLobbyBroadcastPayload = '';
+
+  function getConnectedHumans(room) {
+    return room.players.filter((p) => !p.isBot && p.connected !== false);
+  }
+
+  function getAllHumans(room) {
+    return room.players.filter((p) => !p.isBot);
+  }
+
+  function createBotPlayer(
+    index,
+    usedColors,
+    difficultyOverride,
+    usedNames = new Set()
+  ) {
     const preset = BOT_PRESETS[index % BOT_PRESETS.length];
     const color =
       PLAYER_COLORS.find((c) => !usedColors.has(c)) ||
       PLAYER_COLORS[index % PLAYER_COLORS.length];
     usedColors.add(color);
+
+    const baseName = preset.name;
+    const finalName = usedNames.has(baseName) ? `${baseName} II` : baseName;
+    usedNames.add(finalName);
+
     return {
       id: `bot_${Math.random().toString(36).slice(2, 8)}`,
-      name: `${preset.name} [AI]`,
+      name: finalName,
       color,
       isBot: true,
       botDifficulty: difficultyOverride || preset.difficulty,
       botStyle: preset.style,
       isHost: false,
       ready: true,
+      connected: true,
+      usedSampleMaze: false,
       gold: ROUNDS[0].startingGold,
       towers: [],
       pathDistance: 0,
@@ -244,8 +339,8 @@ async function startServer() {
       ? Number(partial.goldMultiplier)
       : 1.0;
     const validBotCount =
-      partial.botCount !== undefined
-        ? Math.max(0, Math.min(5, Number(partial.botCount)))
+      partial.botCount !== undefined && !Number.isNaN(Number(partial.botCount))
+        ? Math.max(0, Math.min(5, Math.floor(Number(partial.botCount))))
         : 3;
     const validBotDiff = ['NOVICE', 'ARCHITECT', 'GRANDMASTER'].includes(
       partial.botDifficulty
@@ -255,11 +350,12 @@ async function startServer() {
 
     return {
       roomName:
-        (partial.roomName || '').trim().slice(0, 28) ||
+        String(partial.roomName || '').trim().slice(0, 28) ||
         (fallbackCode === 'ARENA1'
-          ? 'Highland Citadel #1'
-          : `Citadel Lobby ${fallbackCode}`),
-      isPublic: partial.isPublic !== undefined ? Boolean(partial.isPublic) : true,
+          ? 'Public Arena #1'
+          : `Room ${fallbackCode}`),
+      isPublic:
+        partial.isPublic !== undefined ? Boolean(partial.isPublic) : true,
       totalRounds: validTotalRounds,
       buildTimeSeconds: validBuildTime,
       goldMultiplier: validGoldMult,
@@ -270,7 +366,7 @@ async function startServer() {
   }
 
   function syncRoomBots(room) {
-    const humans = room.players.filter((p) => !p.isBot);
+    const humans = getAllHumans(room);
     const bots = room.players.filter((p) => p.isBot);
     const maxBotsAllowed = Math.max(0, 6 - humans.length);
     const targetBots = Math.min(maxBotsAllowed, room.settings.botCount);
@@ -282,18 +378,29 @@ async function startServer() {
     }
 
     const usedColors = new Set(room.players.map((p) => p.color));
+    const usedNames = new Set(room.players.map((p) => p.name));
     const basePath = computeFullMazePath(room.roundConfig, []);
     const baseDist = Number(basePath.totalDistance.toFixed(1));
 
+    let presetCursor = 0;
     while (bots.length < targetBots) {
+      while (
+        presetCursor < BOT_PRESETS.length * 2 &&
+        usedNames.has(BOT_PRESETS[presetCursor % BOT_PRESETS.length].name)
+      ) {
+        presetCursor++;
+      }
       const bot = createBotPlayer(
-        bots.length,
+        presetCursor,
         usedColors,
-        room.settings.botDifficulty
+        room.settings.botDifficulty,
+        usedNames
       );
+      presetCursor++;
       bot.gold = room.roundConfig.startingGold;
       bot.pathDistance = baseDist;
       if (room.phase === 'BUILD') {
+        bot.ready = false;
         bot._pendingBotTowers = generateMazeLayout(
           room.roundConfig,
           bot.botDifficulty,
@@ -304,7 +411,6 @@ async function startServer() {
       bots.push(bot);
     }
 
-    // Ensure bot difficulties reflect room setting
     for (const b of bots) {
       if (b.botDifficulty !== room.settings.botDifficulty) {
         b.botDifficulty = room.settings.botDifficulty;
@@ -323,15 +429,21 @@ async function startServer() {
     }
   }
 
-  function getOrCreateRoom(roomCode, customSettings) {
-    const code = (roomCode || 'ARENA1')
-      .toUpperCase()
-      .replace(/[^A-Z0-9-]/g, '')
-      .slice(0, 8) || 'ARENA1';
+  function getOrCreateRoom(roomCode, customSettings, allowOverwriteExisting = false) {
+    const code =
+      String(roomCode || 'ARENA1')
+        .toUpperCase()
+        .replace(/[^A-Z0-9-]/g, '')
+        .slice(0, 8) || 'ARENA1';
 
     if (rooms.has(code)) {
       const existing = rooms.get(code);
-      if (customSettings && Object.keys(customSettings).length > 0) {
+      const hasHumans = getAllHumans(existing).length > 0;
+      if (
+        customSettings &&
+        Object.keys(customSettings).length > 0 &&
+        (allowOverwriteExisting || !hasHumans)
+      ) {
         existing.settings = normalizeRoomSettings(
           { ...existing.settings, ...customSettings },
           code
@@ -344,10 +456,11 @@ async function startServer() {
     const settings = normalizeRoomSettings(customSettings || {}, code);
     const round0 = generateRandomRoundLayout(ROUNDS[0]);
     const usedColors = new Set([PLAYER_COLORS[0]]);
+    const usedNames = new Set();
     const initialBots = [];
     for (let i = 0; i < settings.botCount; i++) {
       initialBots.push(
-        createBotPlayer(i, usedColors, settings.botDifficulty)
+        createBotPlayer(i, usedColors, settings.botDifficulty, usedNames)
       );
     }
 
@@ -365,43 +478,70 @@ async function startServer() {
       chat: [
         {
           id: `msg_${Date.now()}`,
-          senderName: 'Sanctum Arbiter',
+          senderName: '',
           senderColor: '#38bdf8',
-          text: `Welcome to ${settings.roomName} (${code})! Place 2×2 Stone Pillars on the meadow and link Crimson Keeps to Overcharge Spires.`,
+          text: `Room ${code} open. Place 2×2 stone walls and link Crimson Keeps to power up Spires.`,
           timestamp: Date.now(),
           isSystem: true,
         },
       ],
-      _runDurationTarget: 0,
+      _maxRunTime: 0,
       _runElapsed: 0,
+      _postFinishRealRemaining: 0,
+      _botStepAccum: 0,
+      _lastBroadcastSec: -1,
     };
 
     rooms.set(code, room);
-    prepareRoundForRoom(room, 0);
+    prepareRoundForRoom(room, 0, false);
     return room;
   }
 
+  function resetDefaultArenaRoom(room) {
+    room.roundsCompleted = 0;
+    room.simSpeedMultiplier = 1;
+    room.newRecordHolders = [];
+    room.settings = normalizeRoomSettings({}, room.roomCode);
+    room.players = [];
+    syncRoomBots(room);
+    room.chat = [
+      {
+        id: `msg_${Date.now()}`,
+        senderName: '',
+        senderColor: '#38bdf8',
+        text: `Room ${room.roomCode} open. Place 2×2 stone walls and link Crimson Keeps to power up Spires.`,
+        timestamp: Date.now(),
+        isSystem: true,
+      },
+    ];
+    prepareRoundForRoom(room, 0, true);
+  }
+
   function getPublicLobbySummaries() {
-    // Ensure default ARENA1 always exists so lobby browser is never empty
     if (!rooms.has('ARENA1')) {
       getOrCreateRoom('ARENA1');
     }
     const list = [];
     for (const room of rooms.values()) {
       if (!room.settings.isPublic) continue;
-      const humans = room.players.filter((p) => !p.isBot);
+      const connectedHumans = getConnectedHumans(room);
+      const allHumans = getAllHumans(room);
       const bots = room.players.filter((p) => p.isBot);
       const host =
-        humans.find((p) => p.isHost) || humans[0] || room.players[0];
+        connectedHumans.find((p) => p.isHost) ||
+        connectedHumans[0] ||
+        allHumans[0] ||
+        room.players[0];
+
       list.push({
         roomCode: room.roomCode,
-        roomName: room.settings.roomName || `Citadel ${room.roomCode}`,
-        hostName: host ? host.name : 'Citadel Arbiter',
+        roomName: room.settings.roomName || `Room ${room.roomCode}`,
+        hostName: host && !host.isBot ? host.name : 'Open Lobby',
         phase: room.phase,
         currentRound: room.roundConfig.roundNumber,
         totalRounds: room.settings.totalRounds,
         playerCount: room.players.length,
-        humanCount: humans.length,
+        humanCount: connectedHumans.length,
         botCount: bots.length,
         maxPlayers: 6,
         settings: room.settings,
@@ -410,16 +550,27 @@ async function startServer() {
     return list.sort((a, b) => b.humanCount - a.humanCount);
   }
 
-  function broadcastLobbyListToAll() {
+  function broadcastLobbyListNow() {
+    lobbyBroadcastTimer = null;
     const payload = JSON.stringify({
       type: 'LOBBY_LIST',
       rooms: getPublicLobbySummaries(),
     });
-    for (const ws of clientMap.keys()) {
-      if (ws.readyState === 1) {
-        ws.send(payload);
-      }
+    if (payload === lastLobbyBroadcastPayload) return;
+    lastLobbyBroadcastPayload = payload;
+
+    for (const [ws, info] of clientMap.entries()) {
+      if (ws.readyState !== 1) continue;
+      // Avoid interrupting clients actively mid-RUN at 60fps
+      const r = rooms.get(info.roomCode);
+      if (r && r.phase === 'RUN') continue;
+      ws.send(payload);
     }
+  }
+
+  function scheduleLobbyListBroadcast() {
+    if (lobbyBroadcastTimer) return;
+    lobbyBroadcastTimer = setTimeout(broadcastLobbyListNow, 150);
   }
 
   function broadcastLeaderboardToAll() {
@@ -435,7 +586,9 @@ async function startServer() {
   }
 
   function sanitizeRoomStateForClient(room, viewerPlayerId) {
-    const hideOpponents = room.phase === 'BUILD' && room.settings.fogOfWar;
+    const hideOpponents =
+      room.phase === 'BUILD' && Boolean(room.settings.fogOfWar);
+
     return {
       roomCode: room.roomCode,
       phase: room.phase,
@@ -443,10 +596,12 @@ async function startServer() {
       currentRoundIndex: room.currentRoundIndex,
       roundsCompleted: room.roundsCompleted || 0,
       roundConfig: room.roundConfig,
-      phaseTimeRemaining: Math.ceil(room.phaseTimeRemaining),
+      phaseTimeRemaining: Math.max(0, Math.ceil(room.phaseTimeRemaining)),
+      runElapsed:
+        room.phase === 'RUN' ? Number((room._runElapsed || 0).toFixed(2)) : 0,
       simSpeedMultiplier: room.simSpeedMultiplier,
       newRecordHolders: room.newRecordHolders || [],
-      chat: room.chat.slice(-30),
+      chat: room.chat.slice(-25),
       players: room.players.map((p) => {
         const shouldMask = hideOpponents && p.id !== viewerPlayerId;
         return {
@@ -458,9 +613,12 @@ async function startServer() {
           botStyle: p.botStyle,
           isHost: p.isHost,
           ready: p.ready,
-          gold: p.gold,
+          gold: shouldMask ? room.roundConfig.startingGold : p.gold,
           towers: shouldMask ? [] : p.towers,
           pathDistance: shouldMask ? 0 : p.pathDistance,
+          fogMasked: shouldMask,
+          usedSampleMaze: Boolean(p.usedSampleMaze),
+          connected: p.connected !== false,
           totalScore: p.totalScore,
           lastRoundTime: p.lastRoundTime,
           lastRoundPoints: p.lastRoundPoints,
@@ -475,9 +633,14 @@ async function startServer() {
     };
   }
 
-  function broadcastRoomState(room) {
+  function sendRoomStateToPlayer(room, playerId) {
     for (const [ws, info] of clientMap.entries()) {
-      if (info.roomCode === room.roomCode && ws.readyState === 1) {
+      if (
+        info.roomCode === room.roomCode &&
+        info.playerId === playerId &&
+        !info.superseded &&
+        ws.readyState === 1
+      ) {
         ws.send(
           JSON.stringify({
             type: 'ROOM_STATE',
@@ -486,13 +649,36 @@ async function startServer() {
         );
       }
     }
-    broadcastLobbyListToAll();
+  }
+
+  function broadcastRoomState(room, notifyLobbyBrowser = false) {
+    for (const [ws, info] of clientMap.entries()) {
+      if (
+        info.roomCode === room.roomCode &&
+        !info.superseded &&
+        ws.readyState === 1
+      ) {
+        ws.send(
+          JSON.stringify({
+            type: 'ROOM_STATE',
+            state: sanitizeRoomStateForClient(room, info.playerId),
+          })
+        );
+      }
+    }
+    if (notifyLobbyBrowser) {
+      scheduleLobbyListBroadcast();
+    }
   }
 
   function broadcastToRoom(room, payload) {
     const str = JSON.stringify(payload);
     for (const [ws, info] of clientMap.entries()) {
-      if (info.roomCode === room.roomCode && ws.readyState === 1) {
+      if (
+        info.roomCode === room.roomCode &&
+        !info.superseded &&
+        ws.readyState === 1
+      ) {
         ws.send(str);
       }
     }
@@ -501,7 +687,7 @@ async function startServer() {
   function addSystemChat(room, text) {
     const message = {
       id: `sys_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      senderName: 'Sanctum Arbiter',
+      senderName: '',
       senderColor: '#38bdf8',
       text,
       timestamp: Date.now(),
@@ -512,16 +698,22 @@ async function startServer() {
     broadcastToRoom(room, { type: 'CHAT_MESSAGE', message });
   }
 
-  function prepareRoundForRoom(room, roundIndex) {
-    const clampedIdx = Math.max(0, Math.min(ROUNDS.length - 1, roundIndex));
-    const round = generateRandomRoundLayout(ROUNDS[clampedIdx]);
+  function prepareRoundForRoom(room, roundIndex, emitBroadcast = true) {
+    const clampedIdx = Math.max(0, Math.min(ROUNDS.length - 1, Number(roundIndex) || 0));
+    const baseRound = ROUNDS[clampedIdx];
+    const round = generateRandomRoundLayout(baseRound);
 
-    // Apply room configuration overrides (Gold Multiplier & Build Timer)
+    // Apply room configuration overrides (Wall Supply & Par scaling & Build Timer)
     const goldMult = Number(room.settings.goldMultiplier) || 1.0;
     round.startingGold = Math.max(
       25,
-      Math.round((round.startingGold * goldMult) / 5) * 5
+      Math.round((baseRound.startingGold * goldMult) / 5) * 5
     );
+    round.parTimeSeconds = computeEffectivePar(
+      baseRound.parTimeSeconds,
+      goldMult
+    );
+
     const customBuildSecs = Number(room.settings.buildTimeSeconds) || 0;
     if (customBuildSecs > 0) {
       round.buildTimeSeconds = customBuildSecs;
@@ -533,6 +725,11 @@ async function startServer() {
     room.phaseTimeRemaining = round.buildTimeSeconds;
     room.simSpeedMultiplier = 1;
     room.newRecordHolders = [];
+    room._maxRunTime = 0;
+    room._runElapsed = 0;
+    room._postFinishRealRemaining = 0;
+    room._botStepAccum = 0;
+    room._lastBroadcastSec = Math.ceil(round.buildTimeSeconds);
 
     const basePath = computeFullMazePath(round, []);
     const baseDist = Number(basePath.totalDistance.toFixed(1));
@@ -542,6 +739,8 @@ async function startServer() {
       p.towers = [];
       p.pathDistance = baseDist;
       p.ready = false;
+      p.usedSampleMaze = false;
+      p._joinedMidRun = false;
 
       if (p.isBot) {
         const planned = generateMazeLayout(
@@ -553,14 +752,16 @@ async function startServer() {
       }
     }
 
-    const pillarsCount = Math.floor(
-      round.startingGold / TOWER_SPECS.BLOCK.goldCost
-    );
-    addSystemChat(
-      room,
-      `Round ${round.roundNumber}: ${round.title} — ${pillarsCount} Stone Pillars · ${round.preplacedSpires.length} Elemental Spires · ${round.obstacles.length} Crimson Keeps.`
-    );
-    broadcastRoomState(room);
+    if (emitBroadcast) {
+      const wallsCount = Math.floor(
+        round.startingGold / TOWER_SPECS.BLOCK.goldCost
+      );
+      addSystemChat(
+        room,
+        `Round ${round.roundNumber}: ${round.title} · ${wallsCount} walls · Par ${round.parTimeSeconds.toFixed(0)}s`
+      );
+      broadcastRoomState(room, true);
+    }
   }
 
   function startRunPhase(room) {
@@ -572,13 +773,15 @@ async function startServer() {
           const nextTower = p._pendingBotTowers.shift();
           applyBotTower(room, p, nextTower);
         }
+        p.ready = true;
       }
     }
 
     room.phase = 'RUN';
     room._runElapsed = 0;
+    room._postFinishRealRemaining = POST_FINISH_HOLD_REAL_SEC;
 
-    let maxRunTime = 5.0;
+    let maxRunTime = 4.0;
     for (const p of room.players) {
       const evalRes = evaluateMazeRunTime(room.roundConfig, p.towers);
       p._evaluatedFinishTime = evalRes.finishTimeSeconds;
@@ -591,14 +794,14 @@ async function startServer() {
       }
     }
 
-    room._runDurationTarget = maxRunTime + 1.5;
-    room.phaseTimeRemaining = Math.ceil(room._runDurationTarget);
-
-    addSystemChat(
-      room,
-      `Build phase locked — Runners released!`
+    room._maxRunTime = maxRunTime;
+    const speedMult = room.simSpeedMultiplier || 1;
+    room.phaseTimeRemaining = Math.ceil(
+      maxRunTime / speedMult + POST_FINISH_HOLD_REAL_SEC
     );
-    broadcastRoomState(room);
+    room._lastBroadcastSec = room.phaseTimeRemaining;
+
+    broadcastRoomState(room, true);
   }
 
   function recordRoundToLeaderboard(room, rankedPlayers) {
@@ -610,22 +813,25 @@ async function startServer() {
 
     const newRecordHolders = [];
     const now = Date.now();
+    let changed = false;
 
     for (const p of rankedPlayers) {
-      const cleanName = p.name.replace(/\s*\[AI\]$/i, '');
+      // Bots, mid-run joiners, and Sample Maze scaffolds are excluded from Leaderboard records
+      if (p.isBot || p._joinedMidRun || p.usedSampleMaze) continue;
+
+      const cleanName = sanitizePlayerName(p.name);
       const runTime = Number((p.lastRoundTime || 0).toFixed(2));
       const beatPar = runTime >= round.parTimeSeconds;
 
-      // Only record meaningful runs (> 8s)
       if (runTime > 8.0) {
         const entry = {
           id: `rec_${now}_${Math.random().toString(36).slice(2, 7)}`,
           roundNumber: rNum,
           roundTitle: round.title,
           runnerType: round.runnerType || 'SCOUT',
-          playerName: p.name,
+          playerName: cleanName,
           playerColor: p.color,
-          isBot: p.isBot,
+          isBot: false,
           survivalTimeSeconds: runTime,
           parTimeSeconds: round.parTimeSeconds,
           beatPar,
@@ -638,9 +844,8 @@ async function startServer() {
           timestamp: now,
         };
 
-        // Keep each player's personal best on this round so one player doesn't flood all 10 slots
         const existingIdx = leaderboard.roundRecords[rNum].findIndex(
-          (e) => e.playerName === p.name
+          (e) => e.playerName === cleanName
         );
         if (existingIdx !== -1) {
           if (
@@ -648,9 +853,11 @@ async function startServer() {
             leaderboard.roundRecords[rNum][existingIdx].survivalTimeSeconds
           ) {
             leaderboard.roundRecords[rNum][existingIdx] = entry;
+            changed = true;
           }
         } else {
           leaderboard.roundRecords[rNum].push(entry);
+          changed = true;
         }
 
         leaderboard.roundRecords[rNum].sort(
@@ -662,20 +869,17 @@ async function startServer() {
         );
 
         const rankInBoard = leaderboard.roundRecords[rNum].findIndex(
-          (e) => e.playerName === p.name && e.survivalTimeSeconds === runTime
+          (e) => e.playerName === cleanName && e.survivalTimeSeconds === runTime
         );
-        if (rankInBoard !== -1 && rankInBoard < 5 && !p.isBot) {
-          newRecordHolders.push(p.name);
+        if (rankInBoard !== -1 && rankInBoard < 5) {
+          newRecordHolders.push(cleanName);
         }
       }
 
-      // Update Career Champions entry
-      let champ = leaderboard.champions.find(
-        (c) => c.playerName === cleanName || c.playerName === p.name
-      );
+      let champ = leaderboard.champions.find((c) => c.playerName === cleanName);
       if (!champ) {
         champ = {
-          playerName: p.name,
+          playerName: cleanName,
           playerColor: p.color,
           matchesWon: 0,
           roundsPlayed: 0,
@@ -696,18 +900,21 @@ async function startServer() {
         champ.bestRoundNumber = rNum;
       }
       champ.lastPlayedAt = now;
+      changed = true;
     }
 
-    leaderboard.champions.sort(
-      (a, b) =>
-        b.totalCareerPoints - a.totalCareerPoints ||
-        b.matchesWon - a.matchesWon ||
-        b.bestSurvivalTime - a.bestSurvivalTime
-    );
-    leaderboard.champions = leaderboard.champions.slice(0, 20);
+    if (changed) {
+      leaderboard.champions.sort(
+        (a, b) =>
+          b.totalCareerPoints - a.totalCareerPoints ||
+          b.matchesWon - a.matchesWon ||
+          b.bestSurvivalTime - a.bestSurvivalTime
+      );
+      leaderboard.champions = leaderboard.champions.slice(0, 20);
+      saveLeaderboard();
+      broadcastLeaderboardToAll();
+    }
 
-    saveLeaderboard();
-    broadcastLeaderboardToAll();
     return newRecordHolders;
   }
 
@@ -734,6 +941,7 @@ async function startServer() {
       p.lastRoundOvercharge = p._evalOvercharge || 0;
       p.lastRoundKeeps = p._evalKeeps || 0;
       p.totalScore += pts;
+      p.ready = false;
       if (runTime > p.bestMazeTime) {
         p.bestMazeTime = runTime;
       }
@@ -753,38 +961,41 @@ async function startServer() {
     const newRecordHolders = recordRoundToLeaderboard(room, ranked);
     room.newRecordHolders = newRecordHolders;
 
-    // Check if this completed the configured Match Length
     if (room.roundsCompleted >= room.settings.totalRounds) {
       room.phase = 'GAME_OVER';
       room.phaseTimeRemaining = 0;
+      room._lastBroadcastSec = 0;
 
       const matchStandings = [...room.players].sort(
         (a, b) => b.totalScore - a.totalScore || b.bestMazeTime - a.bestMazeTime
       );
       const grandChampion = matchStandings[0];
       if (grandChampion) {
-        const champEntry = leaderboard.champions.find(
-          (c) => c.playerName === grandChampion.name
-        );
-        if (champEntry) {
-          champEntry.matchesWon += 1;
-          saveLeaderboard();
-          broadcastLeaderboardToAll();
+        if (!grandChampion.isBot && !grandChampion.usedSampleMaze) {
+          const champEntry = leaderboard.champions.find(
+            (c) => c.playerName === grandChampion.name
+          );
+          if (champEntry) {
+            champEntry.matchesWon += 1;
+            saveLeaderboard();
+            broadcastLeaderboardToAll();
+          }
         }
         addSystemChat(
           room,
-          `Citadel Champion: ${grandChampion.name} wins the ${room.settings.totalRounds}-Round Match with ${grandChampion.totalScore} points!`
+          `${grandChampion.name} won the ${room.settings.totalRounds}-round match with ${grandChampion.totalScore} pts.`
         );
       }
     } else {
       room.phase = 'ROUND_RESULTS';
       room.phaseTimeRemaining = 15;
+      room._lastBroadcastSec = 15;
 
       const winner = ranked[0];
       if (winner) {
         addSystemChat(
           room,
-          `${winner.name} wins Round ${room.roundConfig.roundNumber} with a survival time of ${winner.lastRoundTime.toFixed(2)}s (+${winner.lastRoundPoints} pts).`
+          `${winner.name} won Round ${room.roundConfig.roundNumber} with ${winner.lastRoundTime.toFixed(2)}s (+${winner.lastRoundPoints} pts).`
         );
       }
     }
@@ -792,14 +1003,21 @@ async function startServer() {
     if (newRecordHolders.length > 0) {
       addSystemChat(
         room,
-        `New Hall of Fame Top-5 Record on Round ${room.roundConfig.roundNumber} by ${newRecordHolders.join(', ')}!`
+        `New Top 5 Leaderboard record on Round ${room.roundConfig.roundNumber}: ${newRecordHolders.join(', ')}.`
       );
     }
 
-    broadcastRoomState(room);
+    broadcastRoomState(room, true);
   }
 
   function applyBotTower(room, bot, plannedTower) {
+    if (
+      !plannedTower ||
+      !Number.isInteger(plannedTower.x) ||
+      !Number.isInteger(plannedTower.y)
+    ) {
+      return;
+    }
     const wallCost = TOWER_SPECS.BLOCK.goldCost;
     if (bot.gold < wallCost) return;
 
@@ -810,38 +1028,193 @@ async function startServer() {
       plannedTower.y
     );
     if (check.valid && check.pathResult) {
-      bot.towers.push(plannedTower);
+      bot.towers.push({
+        id:
+          plannedTower.id ||
+          `bot_twr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        type: 'BLOCK',
+        x: plannedTower.x,
+        y: plannedTower.y,
+        createdAt: plannedTower.createdAt || Date.now(),
+      });
       bot.gold -= wallCost;
       bot.pathDistance = Number(check.pathResult.totalDistance.toFixed(1));
     }
   }
 
-  function removePlayerFromCurrentRoom(ws, currentRoom, currentPlayer) {
-    if (!currentRoom || !currentPlayer) return;
-    const idx = currentRoom.players.findIndex(
-      (p) => p.id === currentPlayer.id
-    );
-    if (idx !== -1) {
-      currentRoom.players.splice(idx, 1);
-    }
-    const remainingHuman = currentRoom.players.find((p) => !p.isBot);
-    if (remainingHuman) {
-      if (!currentRoom.players.some((p) => !p.isBot && p.isHost)) {
-        remainingHuman.isHost = true;
+  function ensureConnectedHost(room) {
+    const connectedHumans = getConnectedHumans(room);
+    if (connectedHumans.length > 0) {
+      if (!connectedHumans.some((p) => p.isHost)) {
+        for (const p of room.players) {
+          if (!p.isBot) p.isHost = false;
+        }
+        connectedHumans[0].isHost = true;
       }
-      addSystemChat(currentRoom, `${currentPlayer.name} left the lobby.`);
-      broadcastRoomState(currentRoom);
-    } else if (currentRoom.roomCode !== 'ARENA1') {
-      rooms.delete(currentRoom.roomCode);
-      broadcastLobbyListToAll();
     }
   }
 
-  function joinPlayerIntoRoom(ws, room, playerName) {
+  function cleanupEmptyRoomIfNeeded(room) {
+    const anyHumanRemaining = getAllHumans(room).length > 0;
+    if (anyHumanRemaining) {
+      ensureConnectedHost(room);
+      broadcastRoomState(room, true);
+      return;
+    }
+
+    if (room.roomCode === 'ARENA1') {
+      resetDefaultArenaRoom(room);
+      scheduleLobbyListBroadcast();
+    } else {
+      rooms.delete(room.roomCode);
+      scheduleLobbyListBroadcast();
+    }
+  }
+
+  function removePlayerImmediately(room, player, announceLeave = true) {
+    if (!room || !player) return;
+    if (player._disconnectTimer) {
+      clearTimeout(player._disconnectTimer);
+      player._disconnectTimer = null;
+    }
+
+    const idx = room.players.findIndex((p) => p.id === player.id);
+    if (idx !== -1) {
+      room.players.splice(idx, 1);
+    }
+
+    const connectedHumans = getConnectedHumans(room);
+    if (announceLeave && connectedHumans.length > 0) {
+      addSystemChat(room, `${player.name} left the room.`);
+    }
+    cleanupEmptyRoomIfNeeded(room);
+  }
+
+  function handleSocketDisconnect(room, player) {
+    if (!room || !player) return;
+    if (!rooms.has(room.roomCode)) return;
+
+    player.connected = false;
+
+    // Migrate host immediately if another connected human is active
+    if (player.isHost) {
+      const nextHost = getConnectedHumans(room)[0];
+      if (nextHost) {
+        player.isHost = false;
+        nextHost.isHost = true;
+      }
+    }
+
+    broadcastRoomState(room, true);
+
+    if (player._disconnectTimer) {
+      clearTimeout(player._disconnectTimer);
+    }
+    player._disconnectTimer = setTimeout(() => {
+      player._disconnectTimer = null;
+      if (player.connected === false) {
+        removePlayerImmediately(room, player, true);
+      }
+    }, RECONNECT_GRACE_MS);
+  }
+
+  function detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer) {
+    const prevInfo = clientMap.get(ws);
+    if (prevInfo) {
+      prevInfo.superseded = true;
+      clientMap.delete(ws);
+    }
+    if (currentRoom && currentPlayer) {
+      removePlayerImmediately(currentRoom, currentPlayer, true);
+    }
+  }
+
+  function joinOrReconnectPlayer(ws, room, rawPlayerName, rawSessionId) {
+    const sessionId = sanitizeSessionId(rawSessionId);
+
+    // 1. Check for existing session in this room (45s reconnect grace or tab refresh)
+    const existingPlayer = room.players.find(
+      (p) => !p.isBot && p._sessionId === sessionId
+    );
+
+    if (existingPlayer) {
+      if (existingPlayer._disconnectTimer) {
+        clearTimeout(existingPlayer._disconnectTimer);
+        existingPlayer._disconnectTimer = null;
+      }
+
+      // Supersede any stale socket still mapped to this player
+      for (const [oldWs, info] of clientMap.entries()) {
+        if (info.playerId === existingPlayer.id && oldWs !== ws) {
+          info.superseded = true;
+          clientMap.delete(oldWs);
+          try {
+            oldWs.close();
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      existingPlayer.connected = true;
+      if (rawPlayerName && String(rawPlayerName).trim()) {
+        existingPlayer.name = sanitizePlayerName(rawPlayerName);
+      }
+      ensureConnectedHost(room);
+
+      clientMap.set(ws, {
+        roomCode: room.roomCode,
+        playerId: existingPlayer.id,
+        sessionId,
+      });
+
+      ws.send(
+        JSON.stringify({
+          type: 'WELCOME',
+          playerId: existingPlayer.id,
+          sessionId,
+          state: sanitizeRoomStateForClient(room, existingPlayer.id),
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'LOBBY_LIST',
+          rooms: getPublicLobbySummaries(),
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'LEADERBOARD_DATA',
+          leaderboard,
+        })
+      );
+
+      broadcastRoomState(room, true);
+      return existingPlayer;
+    }
+
+    // 2. Make room if 6 slots are full (evict a bot or an expired disconnected slot)
     if (room.players.length >= 6) {
       const botIdx = room.players.findIndex((p) => p.isBot);
       if (botIdx !== -1) {
         room.players.splice(botIdx, 1);
+      } else {
+        const offlineIdx = room.players.findIndex(
+          (p) => !p.isBot && p.connected === false
+        );
+        if (offlineIdx !== -1) {
+          const evicted = room.players[offlineIdx];
+          if (evicted._disconnectTimer) clearTimeout(evicted._disconnectTimer);
+          room.players.splice(offlineIdx, 1);
+        } else {
+          ws.send(
+            JSON.stringify({
+              type: 'ERROR_TOAST',
+              message: 'Room is full (max 6 players).',
+            })
+          );
+          return null;
+        }
       }
     }
 
@@ -850,16 +1223,22 @@ async function startServer() {
       PLAYER_COLORS.find((c) => !usedColors.has(c)) ||
       PLAYER_COLORS[room.players.length % PLAYER_COLORS.length];
 
-    const hasHost = room.players.some((p) => !p.isBot && p.isHost);
+    const hasConnectedHost = getConnectedHumans(room).some((p) => p.isHost);
     const basePath = computeFullMazePath(room.roundConfig, []);
+    const joinedMidRun = room.phase === 'RUN';
 
     const player = {
       id: `plr_${Math.random().toString(36).slice(2, 9)}`,
-      name: (playerName || 'Maze Architect').trim().slice(0, 20) || 'Maze Architect',
+      _sessionId: sessionId,
+      _disconnectTimer: null,
+      _joinedMidRun: joinedMidRun,
+      name: sanitizePlayerName(rawPlayerName),
       color,
       isBot: false,
-      isHost: !hasHost,
+      isHost: !hasConnectedHost,
       ready: false,
+      connected: true,
+      usedSampleMaze: false,
       gold: room.roundConfig.startingGold,
       towers: [],
       pathDistance: Number(basePath.totalDistance.toFixed(1)),
@@ -874,6 +1253,14 @@ async function startServer() {
       roundHistory: [],
     };
 
+    if (joinedMidRun) {
+      const baseEval = evaluateMazeRunTime(room.roundConfig, []);
+      player._evaluatedFinishTime = baseEval.finishTimeSeconds;
+      player._evalClaps = baseEval.clapsTaken;
+      player._evalOvercharge = baseEval.overchargedSpires;
+      player._evalKeeps = baseEval.linkedKeeps;
+    }
+
     const firstBotIdx = room.players.findIndex((p) => p.isBot);
     if (firstBotIdx === -1) {
       room.players.push(player);
@@ -881,12 +1268,19 @@ async function startServer() {
       room.players.splice(firstBotIdx, 0, player);
     }
 
-    clientMap.set(ws, { roomCode: room.roomCode, playerId: player.id });
+    ensureConnectedHost(room);
+
+    clientMap.set(ws, {
+      roomCode: room.roomCode,
+      playerId: player.id,
+      sessionId,
+    });
 
     ws.send(
       JSON.stringify({
         type: 'WELCOME',
         playerId: player.id,
+        sessionId,
         state: sanitizeRoomStateForClient(room, player.id),
       })
     );
@@ -903,70 +1297,178 @@ async function startServer() {
       })
     );
 
-    addSystemChat(room, `${player.name} joined ${room.settings.roomName}.`);
-    broadcastRoomState(room);
+    if (getConnectedHumans(room).length > 1) {
+      addSystemChat(room, `${player.name} joined the room.`);
+    }
+    broadcastRoomState(room, true);
     return player;
   }
 
-  // Master 500ms server loop for timers & AI bot incremental building
+  function requireHostIfMultiHuman(ws, room, player, message) {
+    if (getConnectedHumans(room).length > 1 && !player.isHost) {
+      ws.send(
+        JSON.stringify({
+          type: 'ERROR_TOAST',
+          message: message || 'Only the room host can do that.',
+        })
+      );
+      return false;
+    }
+    return true;
+  }
+
+  function syncPlayerBuildMutation(room, player, wasReady) {
+    if (room.phase === 'BUILD' && room.settings.fogOfWar && !wasReady) {
+      sendRoomStateToPlayer(room, player.id);
+    } else {
+      broadcastRoomState(room, false);
+    }
+  }
+
+  function advanceToNextRoundOrResetMatch(room) {
+    if (
+      room.phase === 'GAME_OVER' ||
+      (room.roundsCompleted || 0) >= room.settings.totalRounds
+    ) {
+      room.roundsCompleted = 0;
+      for (const p of room.players) {
+        p.totalScore = 0;
+        p.lastRoundTime = null;
+        p.lastRoundPoints = 0;
+        p.lastRoundClaps = 0;
+        p.lastRoundOvercharge = 0;
+        p.lastRoundKeeps = 0;
+        p.parStarsEarned = 0;
+        p.bestMazeTime = 0;
+        p.roundHistory = [];
+      }
+      prepareRoundForRoom(room, 0, true);
+    } else {
+      const nextIdx = (room.currentRoundIndex + 1) % ROUNDS.length;
+      prepareRoundForRoom(room, nextIdx, true);
+    }
+  }
+
+  // Master 250ms monotonic server loop for BUILD, RUN, and ROUND_RESULTS
+  let lastLoopTickMs = Date.now();
   setInterval(() => {
-    const dt = 0.5;
+    const nowMs = Date.now();
+    const realDt = Math.min(0.5, Math.max(0.05, (nowMs - lastLoopTickMs) / 1000));
+    lastLoopTickMs = nowMs;
+
     for (const room of rooms.values()) {
-      const hasHuman = room.players.some((p) => !p.isBot);
-      if (!hasHuman) continue;
+      const connectedHumans = getConnectedHumans(room);
+      if (connectedHumans.length === 0) continue;
 
       if (room.phase === 'BUILD') {
-        // 999 = Sandbox unlimited build time
         if (room.settings.buildTimeSeconds !== 999) {
-          room.phaseTimeRemaining = Math.max(0, room.phaseTimeRemaining - dt);
+          room.phaseTimeRemaining = Math.max(0, room.phaseTimeRemaining - realDt);
         }
 
-        let botChanged = false;
-        for (const p of room.players) {
-          if (p.isBot && p._pendingBotTowers) {
-            if (p._pendingBotTowers.length > 0) {
-              const nextTower = p._pendingBotTowers.shift();
-              applyBotTower(room, p, nextTower);
-              botChanged = true;
-            } else if (!p.ready) {
-              p.ready = true;
-              botChanged = true;
+        room._botStepAccum = (room._botStepAccum || 0) + realDt;
+        let botTowerPlaced = false;
+        let botReadyChanged = false;
+
+        if (room._botStepAccum >= 0.5) {
+          room._botStepAccum -= 0.5;
+          for (const p of room.players) {
+            if (p.isBot && p._pendingBotTowers) {
+              if (p._pendingBotTowers.length > 0) {
+                const nextTower = p._pendingBotTowers.shift();
+                applyBotTower(room, p, nextTower);
+                botTowerPlaced = true;
+              } else if (!p.ready) {
+                p.ready = true;
+                botReadyChanged = true;
+              }
             }
           }
         }
 
-        if (botChanged && !room.settings.fogOfWar) {
-          broadcastRoomState(room);
-        } else if (Math.abs(room.phaseTimeRemaining % 1) < 0.01) {
-          broadcastToRoom(room, {
-            type: 'TIMER_TICK',
-            phaseTimeRemaining: Math.ceil(room.phaseTimeRemaining),
-          });
+        if (!room.settings.fogOfWar && (botTowerPlaced || botReadyChanged)) {
+          broadcastRoomState(room, false);
+        } else if (room.settings.fogOfWar && botReadyChanged) {
+          broadcastRoomState(room, false);
         }
 
-        const allHumansReady = room.players
-          .filter((p) => !p.isBot)
-          .every((p) => p.ready);
+        if (room.settings.buildTimeSeconds !== 999) {
+          const ceilSec = Math.ceil(room.phaseTimeRemaining);
+          if (ceilSec !== room._lastBroadcastSec) {
+            room._lastBroadcastSec = ceilSec;
+            broadcastToRoom(room, {
+              type: 'TIMER_TICK',
+              phaseTimeRemaining: ceilSec,
+              phase: 'BUILD',
+            });
+          }
+        }
+
+        const allHumansReady =
+          connectedHumans.length > 0 && connectedHumans.every((p) => p.ready);
 
         if (
           (room.settings.buildTimeSeconds !== 999 &&
             room.phaseTimeRemaining <= 0) ||
-          (allHumansReady && room.players.some((p) => !p.isBot))
+          allHumansReady
         ) {
           startRunPhase(room);
         }
       } else if (room.phase === 'RUN') {
-        room._runElapsed += dt * room.simSpeedMultiplier;
-        room.phaseTimeRemaining = Math.max(
-          0,
-          room._runDurationTarget - room._runElapsed
-        );
-        if (room._runElapsed >= room._runDurationTarget) {
+        const speedMult = room.simSpeedMultiplier || 1;
+        if (room._runElapsed < room._maxRunTime) {
+          room._runElapsed = Math.min(
+            room._maxRunTime,
+            room._runElapsed + realDt * speedMult
+          );
+          const simLeft = room._maxRunTime - room._runElapsed;
+          room.phaseTimeRemaining = Math.max(
+            0,
+            simLeft / speedMult + room._postFinishRealRemaining
+          );
+        } else {
+          // Real wall-clock celebration hold (~0.95s) so 2×/4× runs finish cleanly on client
+          room._postFinishRealRemaining = Math.max(
+            0,
+            room._postFinishRealRemaining - realDt
+          );
+          room.phaseTimeRemaining = Math.max(0, room._postFinishRealRemaining);
+        }
+
+        const ceilSec = Math.ceil(room.phaseTimeRemaining);
+        if (ceilSec !== room._lastBroadcastSec) {
+          room._lastBroadcastSec = ceilSec;
+          broadcastToRoom(room, {
+            type: 'TIMER_TICK',
+            phaseTimeRemaining: ceilSec,
+            phase: 'RUN',
+            runElapsed: Number(room._runElapsed.toFixed(2)),
+          });
+        }
+
+        if (
+          room._runElapsed >= room._maxRunTime &&
+          room._postFinishRealRemaining <= 0
+        ) {
           finishRunPhaseAndScore(room);
+        }
+      } else if (room.phase === 'ROUND_RESULTS') {
+        room.phaseTimeRemaining = Math.max(0, room.phaseTimeRemaining - realDt);
+        const ceilSec = Math.ceil(room.phaseTimeRemaining);
+        if (ceilSec !== room._lastBroadcastSec) {
+          room._lastBroadcastSec = ceilSec;
+          broadcastToRoom(room, {
+            type: 'TIMER_TICK',
+            phaseTimeRemaining: ceilSec,
+            phase: 'ROUND_RESULTS',
+          });
+        }
+
+        if (room.phaseTimeRemaining <= 0) {
+          advanceToNextRoundOrResetMatch(room);
         }
       }
     }
-  }, 500);
+  }, 250);
 
   // 25-second WebSocket Keep-Alive Ping for Cloud Proxies (Render, Railway, Fly.io)
   setInterval(() => {
@@ -992,34 +1494,74 @@ async function startServer() {
       } catch {
         return;
       }
+      if (!msg || typeof msg.type !== 'string') return;
 
       if (msg.type === 'JOIN_ROOM') {
-        if (currentRoom && currentPlayer) {
-          removePlayerFromCurrentRoom(ws, currentRoom, currentPlayer);
+        const targetCode =
+          String(msg.roomCode || 'ARENA1')
+            .toUpperCase()
+            .replace(/[^A-Z0-9-]/g, '')
+            .slice(0, 8) || 'ARENA1';
+
+        if (
+          currentRoom &&
+          currentPlayer &&
+          currentRoom.roomCode !== targetCode
+        ) {
+          detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
+          currentRoom = null;
+          currentPlayer = null;
         }
-        const room = getOrCreateRoom(
-          msg.roomCode || 'ARENA1',
-          msg.createSettings
+
+        const room = getOrCreateRoom(targetCode, msg.createSettings, false);
+        const joined = joinOrReconnectPlayer(
+          ws,
+          room,
+          msg.playerName,
+          msg.sessionId
         );
-        currentRoom = room;
-        currentPlayer = joinPlayerIntoRoom(ws, room, msg.playerName);
+        if (joined) {
+          currentRoom = room;
+          currentPlayer = joined;
+        }
         return;
       }
 
       if (msg.type === 'CREATE_ROOM') {
         if (currentRoom && currentPlayer) {
-          removePlayerFromCurrentRoom(ws, currentRoom, currentPlayer);
+          detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
+          currentRoom = null;
+          currentPlayer = null;
         }
-        const generatedCode =
-          (msg.roomCode || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) ||
-          `CIT${Math.floor(100 + Math.random() * 899)}`;
-        // If room exists, reset its settings
-        if (rooms.has(generatedCode)) {
-          rooms.delete(generatedCode);
+
+        const requestedCode = String(msg.roomCode || '')
+          .toUpperCase()
+          .replace(/[^A-Z0-9-]/g, '')
+          .slice(0, 8);
+        let targetCode =
+          requestedCode || `RM${Math.floor(1000 + Math.random() * 8999)}`;
+
+        // Prevent clobbering an active multi-human room on code collision
+        if (rooms.has(targetCode)) {
+          const existing = rooms.get(targetCode);
+          if (getConnectedHumans(existing).length > 0) {
+            targetCode = `RM${Math.floor(1000 + Math.random() * 8999)}`;
+          } else {
+            rooms.delete(targetCode);
+          }
         }
-        const room = getOrCreateRoom(generatedCode, msg.settings || {});
-        currentRoom = room;
-        currentPlayer = joinPlayerIntoRoom(ws, room, msg.playerName);
+
+        const room = getOrCreateRoom(targetCode, msg.settings || {}, true);
+        const joined = joinOrReconnectPlayer(
+          ws,
+          room,
+          msg.playerName,
+          msg.sessionId
+        );
+        if (joined) {
+          currentRoom = room;
+          currentPlayer = joined;
+        }
         return;
       }
 
@@ -1043,10 +1585,10 @@ async function startServer() {
 
       switch (msg.type) {
         case 'SET_NAME': {
-          const cleanName = (msg.playerName || '').trim().slice(0, 20);
-          if (cleanName) {
+          const cleanName = sanitizePlayerName(msg.playerName);
+          if (cleanName && cleanName !== currentPlayer.name) {
             currentPlayer.name = cleanName;
-            broadcastRoomState(currentRoom);
+            broadcastRoomState(currentRoom, currentPlayer.isHost);
           }
           break;
         }
@@ -1056,7 +1598,17 @@ async function startServer() {
             ws.send(
               JSON.stringify({
                 type: 'ERROR_TOAST',
-                message: 'Pillars can only be placed during the Build phase.',
+                message: 'Walls can only be placed during the Build phase.',
+              })
+            );
+            return;
+          }
+
+          if (!Number.isInteger(msg.x) || !Number.isInteger(msg.y)) {
+            ws.send(
+              JSON.stringify({
+                type: 'ERROR_TOAST',
+                message: 'Out of bounds.',
               })
             );
             return;
@@ -1067,7 +1619,7 @@ async function startServer() {
             ws.send(
               JSON.stringify({
                 type: 'ERROR_TOAST',
-                message: 'All Pillars placed — reclaim an existing Pillar to free one up.',
+                message: 'No walls left. Remove a wall first.',
               })
             );
             return;
@@ -1084,38 +1636,54 @@ async function startServer() {
             ws.send(
               JSON.stringify({
                 type: 'ERROR_TOAST',
-                message: validation.reason || 'Invalid placement!',
+                message: validation.reason || 'Cannot place wall there.',
               })
             );
             return;
           }
 
-          currentPlayer.towers.push({
+          const clientId = sanitizeClientId(msg.clientId);
+          const newTower = {
             id: `twr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
             type: 'BLOCK',
             x: msg.x,
             y: msg.y,
             createdAt: Date.now(),
-          });
+            ...(clientId ? { clientId } : {}),
+          };
+
+          const wasReady = currentPlayer.ready;
+          currentPlayer.towers.push(newTower);
           currentPlayer.gold -= wallCost;
           currentPlayer.pathDistance = Number(
             validation.pathResult.totalDistance.toFixed(1)
           );
           currentPlayer.ready = false;
 
-          broadcastRoomState(currentRoom);
+          syncPlayerBuildMutation(currentRoom, currentPlayer, wasReady);
           break;
         }
 
         case 'SELL_TOWER': {
           if (currentRoom.phase !== 'BUILD') return;
           const idx = currentPlayer.towers.findIndex(
-            (t) => t.id === msg.towerId
+            (t) =>
+              (typeof msg.towerId === 'string' &&
+                msg.towerId.length > 0 &&
+                (t.id === msg.towerId || t.clientId === msg.towerId)) ||
+              (Number.isInteger(msg.x) &&
+                Number.isInteger(msg.y) &&
+                t.x === msg.x &&
+                t.y === msg.y)
           );
           if (idx === -1) return;
 
+          const wasReady = currentPlayer.ready;
           currentPlayer.towers.splice(idx, 1);
-          currentPlayer.gold += TOWER_SPECS.BLOCK.goldCost;
+          currentPlayer.gold = Math.min(
+            currentRoom.roundConfig.startingGold,
+            currentPlayer.gold + TOWER_SPECS.BLOCK.goldCost
+          );
           const newPath = computeFullMazePath(
             currentRoom.roundConfig,
             currentPlayer.towers
@@ -1125,60 +1693,186 @@ async function startServer() {
           );
           currentPlayer.ready = false;
 
-          broadcastRoomState(currentRoom);
+          syncPlayerBuildMutation(currentRoom, currentPlayer, wasReady);
+          break;
+        }
+
+        case 'RESTORE_TOWERS': {
+          if (currentRoom.phase !== 'BUILD' || !Array.isArray(msg.towers)) {
+            return;
+          }
+          const wallCost = TOWER_SPECS.BLOCK.goldCost;
+          const maxWalls = Math.floor(
+            currentRoom.roundConfig.startingGold / wallCost
+          );
+          const wasReady = currentPlayer.ready;
+
+          currentPlayer.towers = [];
+          currentPlayer.gold = currentRoom.roundConfig.startingGold;
+          currentPlayer.usedSampleMaze = false;
+          currentPlayer.ready = false;
+
+          const limit = Math.min(maxWalls, msg.towers.length);
+          for (let i = 0; i < limit; i++) {
+            const pt = msg.towers[i];
+            if (
+              !pt ||
+              !Number.isInteger(pt.x) ||
+              !Number.isInteger(pt.y) ||
+              currentPlayer.gold < wallCost
+            ) {
+              continue;
+            }
+            const check = validateTowerPlacement(
+              currentRoom.roundConfig,
+              currentPlayer.towers,
+              pt.x,
+              pt.y
+            );
+            if (check.valid && check.pathResult) {
+              currentPlayer.towers.push({
+                id: `twr_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 5)}`,
+                type: 'BLOCK',
+                x: pt.x,
+                y: pt.y,
+                createdAt: Date.now(),
+              });
+              currentPlayer.gold -= wallCost;
+            }
+          }
+
+          const restoredPath = computeFullMazePath(
+            currentRoom.roundConfig,
+            currentPlayer.towers
+          );
+          currentPlayer.pathDistance = Number(
+            restoredPath.totalDistance.toFixed(1)
+          );
+
+          syncPlayerBuildMutation(currentRoom, currentPlayer, wasReady);
           break;
         }
 
         case 'CLEAR_TOWERS': {
           if (currentRoom.phase !== 'BUILD') return;
+          const wasReady = currentPlayer.ready;
           currentPlayer.towers = [];
           currentPlayer.gold = currentRoom.roundConfig.startingGold;
+          currentPlayer.usedSampleMaze = false;
           const basePath = computeFullMazePath(currentRoom.roundConfig, []);
           currentPlayer.pathDistance = Number(
             basePath.totalDistance.toFixed(1)
           );
           currentPlayer.ready = false;
-          broadcastRoomState(currentRoom);
+
+          syncPlayerBuildMutation(currentRoom, currentPlayer, wasReady);
           break;
         }
 
         case 'LOAD_PRESET_DEMO': {
           if (currentRoom.phase !== 'BUILD') return;
-          const demoTowers = generateMazeLayout(
+          const wallCost = TOWER_SPECS.BLOCK.goldCost;
+          const maxWalls = Math.floor(
+            currentRoom.roundConfig.startingGold / wallCost
+          );
+          // 80% ARCHITECT sample scaffold so the player still places the final ~20% walls
+          const sampleCap = Math.max(1, Math.floor(maxWalls * 0.8));
+          const rawScaffold = generateMazeLayout(
             currentRoom.roundConfig,
-            'GRANDMASTER',
+            'ARCHITECT',
             'SWITCHBACK'
           );
-          const spentGold = demoTowers.length * TOWER_SPECS.BLOCK.goldCost;
-          currentPlayer.towers = demoTowers;
-          currentPlayer.gold =
-            currentRoom.roundConfig.startingGold - spentGold;
+
+          const wasReady = currentPlayer.ready;
+          currentPlayer.towers = [];
+          currentPlayer.gold = currentRoom.roundConfig.startingGold;
+
+          for (const candidate of rawScaffold.slice(0, sampleCap)) {
+            if (
+              !candidate ||
+              !Number.isInteger(candidate.x) ||
+              !Number.isInteger(candidate.y) ||
+              currentPlayer.gold < wallCost
+            ) {
+              continue;
+            }
+            const check = validateTowerPlacement(
+              currentRoom.roundConfig,
+              currentPlayer.towers,
+              candidate.x,
+              candidate.y
+            );
+            if (check.valid && check.pathResult) {
+              currentPlayer.towers.push({
+                id: `twr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                type: 'BLOCK',
+                x: candidate.x,
+                y: candidate.y,
+                createdAt: Date.now(),
+              });
+              currentPlayer.gold -= wallCost;
+            }
+          }
+
           const demoPath = computeFullMazePath(
             currentRoom.roundConfig,
-            demoTowers
+            currentPlayer.towers
           );
           currentPlayer.pathDistance = Number(
             demoPath.totalDistance.toFixed(1)
           );
-          broadcastRoomState(currentRoom);
+          currentPlayer.usedSampleMaze = true;
+          currentPlayer.ready = false;
+
+          syncPlayerBuildMutation(currentRoom, currentPlayer, wasReady);
           break;
         }
 
         case 'REROLL_MAP': {
           if (currentRoom.phase !== 'BUILD') return;
-          prepareRoundForRoom(currentRoom, currentRoom.currentRoundIndex);
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can generate a new map.'
+            )
+          ) {
+            return;
+          }
+          prepareRoundForRoom(currentRoom, currentRoom.currentRoundIndex, true);
           break;
         }
 
         case 'TOGGLE_READY': {
           if (currentRoom.phase !== 'BUILD') return;
           currentPlayer.ready = !currentPlayer.ready;
-          broadcastRoomState(currentRoom);
+          broadcastRoomState(currentRoom, false);
 
-          const allHumansReady = currentRoom.players
-            .filter((p) => !p.isBot)
-            .every((p) => p.ready);
-          if (allHumansReady) {
+          const connectedHumans = getConnectedHumans(currentRoom);
+          if (
+            connectedHumans.length > 0 &&
+            connectedHumans.every((p) => p.ready)
+          ) {
+            startRunPhase(currentRoom);
+          }
+          break;
+        }
+
+        case 'START_GAME': {
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can start the round.'
+            )
+          ) {
+            return;
+          }
+          if (Number.isInteger(msg.roundIndex)) {
+            prepareRoundForRoom(currentRoom, msg.roundIndex, true);
+          } else if (currentRoom.phase === 'BUILD') {
             startRunPhase(currentRoom);
           }
           break;
@@ -1186,59 +1880,114 @@ async function startServer() {
 
         case 'NEXT_ROUND': {
           if (
-            currentRoom.phase === 'GAME_OVER' ||
-            (currentRoom.roundsCompleted || 0) >=
-              currentRoom.settings.totalRounds
+            currentRoom.phase !== 'ROUND_RESULTS' &&
+            currentRoom.phase !== 'GAME_OVER'
           ) {
-            // Reset match from Round 1
-            currentRoom.roundsCompleted = 0;
-            for (const p of currentRoom.players) {
-              p.totalScore = 0;
-              p.lastRoundTime = null;
-              p.lastRoundPoints = 0;
-              p.parStarsEarned = 0;
-              p.roundHistory = [];
-            }
-            prepareRoundForRoom(currentRoom, 0);
+            return;
+          }
+          const connectedHumans = getConnectedHumans(currentRoom);
+          if (connectedHumans.length <= 1 || currentPlayer.isHost) {
+            advanceToNextRoundOrResetMatch(currentRoom);
           } else {
-            const nextIdx =
-              (currentRoom.currentRoundIndex + 1) % ROUNDS.length;
-            prepareRoundForRoom(currentRoom, nextIdx);
+            currentPlayer.ready = true;
+            broadcastRoomState(currentRoom, false);
+            if (connectedHumans.every((p) => p.ready)) {
+              advanceToNextRoundOrResetMatch(currentRoom);
+            }
           }
           break;
         }
 
         case 'RESTART_MATCH': {
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can restart the match.'
+            )
+          ) {
+            return;
+          }
           currentRoom.roundsCompleted = 0;
           for (const p of currentRoom.players) {
             p.totalScore = 0;
             p.lastRoundTime = null;
             p.lastRoundPoints = 0;
+            p.lastRoundClaps = 0;
+            p.lastRoundOvercharge = 0;
+            p.lastRoundKeeps = 0;
             p.parStarsEarned = 0;
+            p.bestMazeTime = 0;
             p.roundHistory = [];
           }
           addSystemChat(
             currentRoom,
-            `${currentPlayer.name} started a fresh ${currentRoom.settings.totalRounds}-Round Citadel Match.`
+            `${currentPlayer.name} restarted the match from Round 1.`
           );
-          prepareRoundForRoom(currentRoom, 0);
+          prepareRoundForRoom(currentRoom, 0, true);
           break;
         }
 
         case 'JUMP_TO_ROUND': {
-          prepareRoundForRoom(currentRoom, msg.roundIndex);
-          break;
-        }
-
-        case 'SET_SIM_SPEED': {
-          if ([1, 2, 4].includes(msg.speed)) {
-            currentRoom.simSpeedMultiplier = msg.speed;
-            broadcastRoomState(currentRoom);
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can switch rounds.'
+            )
+          ) {
+            return;
+          }
+          if (typeof msg.roundIndex === 'number' && !Number.isNaN(msg.roundIndex)) {
+            prepareRoundForRoom(currentRoom, Math.floor(msg.roundIndex), true);
           }
           break;
         }
 
+        case 'SET_SIM_SPEED': {
+          if (![1, 2, 4].includes(msg.speed)) return;
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can change playback speed.'
+            )
+          ) {
+            return;
+          }
+          currentRoom.simSpeedMultiplier = msg.speed;
+          if (currentRoom.phase === 'RUN') {
+            const simLeft = Math.max(
+              0,
+              currentRoom._maxRunTime - currentRoom._runElapsed
+            );
+            currentRoom.phaseTimeRemaining = Math.max(
+              0,
+              simLeft / msg.speed + currentRoom._postFinishRealRemaining
+            );
+            currentRoom._lastBroadcastSec = Math.ceil(
+              currentRoom.phaseTimeRemaining
+            );
+          }
+          broadcastRoomState(currentRoom, false);
+          break;
+        }
+
         case 'UPDATE_SETTINGS': {
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can change room rules.'
+            )
+          ) {
+            return;
+          }
+
           const prevSettings = { ...currentRoom.settings };
           currentRoom.settings = normalizeRoomSettings(
             { ...currentRoom.settings, ...(msg.settings || {}) },
@@ -1247,7 +1996,6 @@ async function startServer() {
 
           syncRoomBots(currentRoom);
 
-          // If in BUILD phase and goldMultiplier or buildTimeSeconds changed, apply live!
           if (currentRoom.phase === 'BUILD') {
             const baseRound = ROUNDS[currentRoom.currentRoundIndex];
             if (
@@ -1263,6 +2011,11 @@ async function startServer() {
                 ) * 5
               );
               currentRoom.roundConfig.startingGold = newGold;
+              currentRoom.roundConfig.parTimeSeconds = computeEffectivePar(
+                baseRound.parTimeSeconds,
+                currentRoom.settings.goldMultiplier
+              );
+
               const wallCost = TOWER_SPECS.BLOCK.goldCost;
               for (const p of currentRoom.players) {
                 const maxTowers = Math.floor(newGold / wallCost);
@@ -1288,77 +2041,121 @@ async function startServer() {
                   : baseRound.buildTimeSeconds;
               currentRoom.roundConfig.buildTimeSeconds = targetSecs;
               currentRoom.phaseTimeRemaining = targetSecs;
+              currentRoom._lastBroadcastSec = Math.ceil(targetSecs);
             }
           }
 
-          addSystemChat(
-            currentRoom,
-            `${currentPlayer.name} updated match rules (${currentRoom.settings.totalRounds} Rounds · ${
-              currentRoom.settings.buildTimeSeconds === 0
-                ? 'Default Timer'
-                : currentRoom.settings.buildTimeSeconds === 999
-                ? 'Sandbox'
-                : `${currentRoom.settings.buildTimeSeconds}s`
-            } · ${Math.round(currentRoom.settings.goldMultiplier * 100)}% Pillars · ${
-              currentRoom.settings.botCount
-            } ${currentRoom.settings.botDifficulty} Bots).`
-          );
-          broadcastRoomState(currentRoom);
+          // Keep minor toggle clicks (like Fog) quiet; post concise notice on major rule edits
+          const majorRuleChanged =
+            prevSettings.totalRounds !== currentRoom.settings.totalRounds ||
+            prevSettings.buildTimeSeconds !==
+              currentRoom.settings.buildTimeSeconds ||
+            prevSettings.goldMultiplier !== currentRoom.settings.goldMultiplier;
+
+          if (majorRuleChanged && getConnectedHumans(currentRoom).length > 1) {
+            addSystemChat(
+              currentRoom,
+              `${currentPlayer.name} updated room rules.`
+            );
+          }
+
+          broadcastRoomState(currentRoom, true);
           break;
         }
 
         case 'ADD_BOT': {
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can manage bots.'
+            )
+          ) {
+            return;
+          }
           if (currentRoom.players.length >= 6) {
             ws.send(
               JSON.stringify({
                 type: 'ERROR_TOAST',
-                message: 'Arena is full (maximum 6 islands).',
+                message: 'Room is full (max 6 islands).',
               })
             );
             return;
           }
           const usedColors = new Set(currentRoom.players.map((p) => p.color));
+          const usedNames = new Set(currentRoom.players.map((p) => p.name));
+          let presetIdx = currentRoom.players.length;
+          for (let i = 0; i < BOT_PRESETS.length; i++) {
+            if (!usedNames.has(BOT_PRESETS[i].name)) {
+              presetIdx = i;
+              break;
+            }
+          }
           const bot = createBotPlayer(
-            currentRoom.players.length,
+            presetIdx,
             usedColors,
-            msg.difficulty || currentRoom.settings.botDifficulty
+            msg.difficulty || currentRoom.settings.botDifficulty,
+            usedNames
           );
           bot.gold = currentRoom.roundConfig.startingGold;
-          bot._pendingBotTowers = generateMazeLayout(
-            currentRoom.roundConfig,
-            bot.botDifficulty,
-            bot.botStyle
-          );
+          if (currentRoom.phase === 'BUILD') {
+            bot.ready = false;
+            bot._pendingBotTowers = generateMazeLayout(
+              currentRoom.roundConfig,
+              bot.botDifficulty,
+              bot.botStyle
+            );
+          } else if (currentRoom.phase === 'RUN') {
+            const baseEval = evaluateMazeRunTime(currentRoom.roundConfig, []);
+            bot._evaluatedFinishTime = baseEval.finishTimeSeconds;
+            bot._evalClaps = baseEval.clapsTaken;
+            bot._evalOvercharge = baseEval.overchargedSpires;
+            bot._evalKeeps = baseEval.linkedKeeps;
+          }
           const basePath = computeFullMazePath(currentRoom.roundConfig, []);
           bot.pathDistance = Number(basePath.totalDistance.toFixed(1));
           currentRoom.players.push(bot);
           currentRoom.settings.botCount = currentRoom.players.filter(
             (p) => p.isBot
           ).length;
-          addSystemChat(currentRoom, `${bot.name} entered the arena.`);
-          broadcastRoomState(currentRoom);
+          broadcastRoomState(currentRoom, true);
           break;
         }
 
         case 'REMOVE_BOT': {
+          if (
+            !requireHostIfMultiHuman(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Only the room host can manage bots.'
+            )
+          ) {
+            return;
+          }
           const botIndex = msg.botId
             ? currentRoom.players.findIndex(
                 (p) => p.isBot && p.id === msg.botId
               )
-            : currentRoom.players.findIndex((p) => p.isBot);
-          if (botIndex !== -1) {
-            const removed = currentRoom.players.splice(botIndex, 1)[0];
+            : -1;
+          const fallbackBotIndex =
+            botIndex !== -1
+              ? botIndex
+              : currentRoom.players.map((p) => p.isBot).lastIndexOf(true);
+
+          if (fallbackBotIndex !== -1) {
+            currentRoom.players.splice(fallbackBotIndex, 1);
             currentRoom.settings.botCount = currentRoom.players.filter(
               (p) => p.isBot
             ).length;
-            addSystemChat(currentRoom, `${removed.name} left the arena.`);
-            broadcastRoomState(currentRoom);
+            broadcastRoomState(currentRoom, true);
           }
           break;
         }
 
         case 'CHAT': {
-          const text = (msg.text || '').trim().slice(0, 180);
+          const text = String(msg.text || '').trim().slice(0, 180);
           if (!text) return;
           const chatMsg = {
             id: `chat_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -1379,8 +2176,10 @@ async function startServer() {
     });
 
     ws.on('close', () => {
+      const info = clientMap.get(ws);
       clientMap.delete(ws);
-      removePlayerFromCurrentRoom(ws, currentRoom, currentPlayer);
+      if (!info || info.superseded) return;
+      handleSocketDisconnect(currentRoom, currentPlayer);
     });
   });
 
@@ -1422,7 +2221,7 @@ async function startServer() {
 
   server.listen(PORT, () => {
     console.log(
-      `\n✨ Mazing Contest 2026 Server running at http://localhost:${PORT}\n`
+      `\nMazing Contest server running at http://localhost:${PORT}\n`
     );
   });
 }

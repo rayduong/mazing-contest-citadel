@@ -1,14 +1,20 @@
 import * as THREE from 'three';
 import {
+  CitadelCircuitryResult,
   computeCitadelCircuitry,
   computeFullMazePath,
   do2x2Overlap,
+  isCellIn2x2,
+  resolveSmart2x2Placement,
+  SpireConduitLink,
   validateTowerPlacement,
 } from '../shared/pathfinding.js';
-import { evaluateMazeRunTime } from '../shared/simulation.js';
+import { evaluateMazeRunTime, OVERCHARGE_CDR } from '../shared/simulation.js';
 import {
+  ActiveBuildTool,
   GridPoint,
   MazeEvalResult,
+  PathResult,
   PlacedTower,
   PlayerState,
   RoomState,
@@ -20,17 +26,119 @@ import {
   TOWER_SPECS,
 } from '../shared/types.js';
 
-const ISLAND_SPACING_X = 36;
-const ISLAND_SPACING_Z = 40;
+export type { ActiveBuildTool };
+
+export type InspectedWorldFeature =
+  | {
+      kind: 'SPIRE';
+      spireIndex: number;
+      spireType: SpireType;
+      x: number;
+      y: number;
+      overchargeTier: number;
+      effectiveRange: number;
+      effectiveCooldown: number;
+      slowPercent: number;
+      slowDuration: number;
+      auraSlowPercent?: number;
+      cdrPulseSeconds?: number;
+      projectedOrLiveHits: number;
+    }
+  | {
+      kind: 'KEEP';
+      keepIndex: number;
+      x: number;
+      y: number;
+      linked: boolean;
+    }
+  | {
+      kind: 'RUNNER';
+      playerId: string;
+      archetype: RunnerArchetype;
+      currentSpeed: number;
+      baseSpeed: number;
+      statusLabel?: string;
+    }
+  | {
+      kind: 'GATE';
+      gateType: 'SPAWN' | 'EXIT';
+      x: number;
+      y: number;
+      parTimeSeconds: number;
+    };
+
+export interface HoverStatusInfo {
+  cell: GridPoint | null;
+  screenX: number;
+  screenY: number;
+  valid: boolean;
+  snapped?: boolean;
+  reason?: string;
+  deltaTime?: number;
+  deltaClaps?: number;
+  deltaKeeps?: number;
+  deltaOvercharge?: number;
+  previewTime?: number;
+  existingTower?: PlacedTower | null;
+  inspectedFeature?: InspectedWorldFeature | null;
+  isTouchPreview?: boolean;
+  isLoupeDragging?: boolean;
+  isGestureMoving?: boolean;
+  placeNearTopEdge?: boolean;
+  offscreen?: boolean;
+}
+
+const ISLAND_SPACING_X = 40;
+const ISLAND_SPACING_Z = 44;
+const SEA_LEVEL_Y = -1.42;
 
 // ============================================================================
-// SOFT PROCEDURAL SPRITE & CONTACT AO TEXTURES (ZERO NOISY BUMP MAPS)
+// STATIC GEOMETRY MERGER & PROCEDURAL SPRITE / CONTACT AO TEXTURES
 // ============================================================================
 
 /**
- * Generates a smooth radial contact-shadow texture for grounding 2x2 Pillars,
- * Keeps, Spires, and Runners on the meadow floor (*Townscaper* / *Thronefall* style).
+ * Merges static sub-geometries (position + normal) into a single draw-call BufferGeometry.
  */
+function mergeSimpleGeometries(geos: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  const nonIndexed: THREE.BufferGeometry[] = [];
+  let totalVerts = 0;
+
+  for (const g of geos) {
+    const ni = g.index ? g.toNonIndexed() : g.clone();
+    if (!ni.getAttribute('normal')) {
+      ni.computeVertexNormals();
+    }
+    totalVerts += ni.getAttribute('position').count;
+    nonIndexed.push(ni);
+  }
+
+  const positions = new Float32Array(totalVerts * 3);
+  const normals = new Float32Array(totalVerts * 3);
+  let offset = 0;
+
+  for (const ni of nonIndexed) {
+    const pos = ni.getAttribute('position');
+    const norm = ni.getAttribute('normal');
+    for (let i = 0; i < pos.count; i++) {
+      const base = (offset + i) * 3;
+      positions[base] = pos.getX(i);
+      positions[base + 1] = pos.getY(i);
+      positions[base + 2] = pos.getZ(i);
+      normals[base] = norm.getX(i);
+      normals[base + 1] = norm.getY(i);
+      normals[base + 2] = norm.getZ(i);
+    }
+    offset += pos.count;
+    ni.dispose();
+  }
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  merged.computeBoundingSphere();
+  return merged;
+}
+
 function createContactShadowTexture(): THREE.CanvasTexture {
   const size = 128;
   const canvas = document.createElement('canvas');
@@ -39,11 +147,11 @@ function createContactShadowTexture(): THREE.CanvasTexture {
   const ctx = canvas.getContext('2d')!;
 
   const half = size * 0.5;
-  const grad = ctx.createRadialGradient(half, half, 2, half, half, half - 2);
-  grad.addColorStop(0.0, 'rgba(24, 42, 20, 0.36)');
-  grad.addColorStop(0.55, 'rgba(24, 42, 20, 0.20)');
-  grad.addColorStop(0.84, 'rgba(24, 42, 20, 0.05)');
-  grad.addColorStop(1.0, 'rgba(24, 42, 20, 0.0)');
+  const grad = ctx.createRadialGradient(half, half, 4, half, half, half - 2);
+  grad.addColorStop(0.0, 'rgba(20, 38, 22, 0.34)');
+  grad.addColorStop(0.58, 'rgba(20, 38, 22, 0.18)');
+  grad.addColorStop(0.86, 'rgba(20, 38, 22, 0.04)');
+  grad.addColorStop(1.0, 'rgba(20, 38, 22, 0.0)');
 
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, size, size);
@@ -54,10 +162,6 @@ function createContactShadowTexture(): THREE.CanvasTexture {
   return tex;
 }
 
-/**
- * Generates a soft circular sprite texture so dust puffs and spire motes
- * render as smooth anti-aliased circles rather than harsh square pixels.
- */
 function createSoftCircleSpriteTexture(): THREE.CanvasTexture {
   const size = 64;
   const canvas = document.createElement('canvas');
@@ -68,8 +172,8 @@ function createSoftCircleSpriteTexture(): THREE.CanvasTexture {
   const half = size * 0.5;
   const grad = ctx.createRadialGradient(half, half, 0, half, half, half - 1);
   grad.addColorStop(0.0, 'rgba(255, 255, 255, 1.0)');
-  grad.addColorStop(0.42, 'rgba(255, 255, 255, 0.78)');
-  grad.addColorStop(0.78, 'rgba(255, 255, 255, 0.20)');
+  grad.addColorStop(0.45, 'rgba(255, 255, 255, 0.8)');
+  grad.addColorStop(0.8, 'rgba(255, 255, 255, 0.18)');
   grad.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
 
   ctx.fillStyle = grad;
@@ -82,14 +186,12 @@ function createSoftCircleSpriteTexture(): THREE.CanvasTexture {
 }
 
 // ============================================================================
-// DIORAMA GLSL SHADERS (TRANQUIL SEA, SHORELINE FOAM, VELVET MEADOW, HAIRLINES)
+// WORLD-CLASS DIORAMA GLSL SHADERS
 // ============================================================================
 
 /**
- * Serene, zero-shimmer Tranquil Cerulean Sea Shader:
- * Coastal aqua (`#64b5d6`) blending gently to deep cerulean (`#438fae`)
- * with broad low-frequency swells (`worldXZ * 0.15`, max 4% luminance shift)
- * and a zero-seam blend into `uHorizonColor` (`#cde8f6`).
+ * Serene Mediterranean Cerulean Sea Shader (`y = -1.42m`):
+ * Smooth depth gradient + ultra-low-frequency swell + zero-seam horizon blend into `#d4ebf7`.
  */
 function createTranquilSeaShader(): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
@@ -98,9 +200,9 @@ function createTranquilSeaShader(): THREE.ShaderMaterial {
     uniforms: {
       uTime: { value: 0 },
       uArenaCenter: { value: new THREE.Vector2(10, 13) },
-      uCoastalAqua: { value: new THREE.Color('#64b5d6') },
-      uDeepCerulean: { value: new THREE.Color('#438fae') },
-      uHorizonColor: { value: new THREE.Color('#cde8f6') },
+      uCoastalAqua: { value: new THREE.Color('#5cb8db') },
+      uDeepCerulean: { value: new THREE.Color('#3b83a8') },
+      uHorizonColor: { value: new THREE.Color('#d4ebf7') },
     },
     vertexShader: `
       varying vec2 vWorldXZ;
@@ -120,22 +222,19 @@ function createTranquilSeaShader(): THREE.ShaderMaterial {
 
       void main() {
         float distFromCenter = length(vWorldXZ - uArenaCenter);
-        float depthFactor = smoothstep(8.0, 92.0, distFromCenter);
-
+        float depthFactor = smoothstep(10.0, 115.0, distFromCenter);
         vec3 baseSea = mix(uCoastalAqua, uDeepCerulean, depthFactor);
 
-        // Broad low-frequency swell (worldXZ * 0.15, max 4% luminance shift, zero moire)
-        vec2 p = vWorldXZ * 0.15;
-        float swell1 = sin(p.x + uTime * 0.28) * cos(p.y - uTime * 0.22);
-        float swell2 = sin((p.x * 0.7 - p.y * 0.8) + uTime * 0.19);
-        float swell = (swell1 * 0.6 + swell2 * 0.4) * 0.04;
+        vec2 p = vWorldXZ * 0.13;
+        float swell1 = sin(p.x + uTime * 0.24) * cos(p.y - uTime * 0.19);
+        float swell2 = sin((p.x * 0.68 - p.y * 0.76) + uTime * 0.16);
+        float swell = (swell1 * 0.6 + swell2 * 0.4) * 0.032;
         vec3 col = baseSea * (1.0 + swell);
 
         gl_FragColor = vec4(col, 1.0);
         #include <tonemapping_fragment>
 
-        // Seamless horizon mist into scene.background (#cde8f6)
-        float horizonMist = smoothstep(95.0, 230.0, distFromCenter);
+        float horizonMist = smoothstep(145.0, 325.0, distFromCenter);
         gl_FragColor.rgb = mix(gl_FragColor.rgb, uHorizonColor, horizonMist);
 
         #include <colorspace_fragment>
@@ -145,12 +244,15 @@ function createTranquilSeaShader(): THREE.ShaderMaterial {
 }
 
 /**
- * Crisp cream-white shoreline contact band (`#f8fafc`, `0.72` alpha)
- * plus one slow, gentle cartoon-clean ripple (`uTime * 0.20`).
+ * Rounded-Corner Shoreline Foam + Coastal Reef Shallows Halo Shader:
+ * - Rounded SDF (`r = 0.95m`) eliminates harsh 90° box corners.
+ * - Renders a luminous turquoise coastal reef halo around each individual island.
+ * - Uses a smooth `sin(phase * PI)` envelope so outward ripples never pop every 5s.
  */
 function createShorelineFoamShader(
   bankWidth: number,
-  bankDepth: number
+  bankDepth: number,
+  phaseOffset = 0
 ): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     transparent: true,
@@ -158,14 +260,16 @@ function createShorelineFoamShader(
     toneMapped: true,
     uniforms: {
       uTime: { value: 0 },
+      uPhaseOffset: { value: phaseOffset },
       uFoamColor: { value: new THREE.Color('#f8fafc') },
+      uShallowsColor: { value: new THREE.Color('#7dd3fc') },
       uHalfBank: {
         value: new THREE.Vector2(bankWidth * 0.5, bankDepth * 0.5),
       },
       uHalfPlane: {
         value: new THREE.Vector2(
-          (bankWidth + 3.4) * 0.5,
-          (bankDepth + 3.4) * 0.5
+          (bankWidth + 4.8) * 0.5,
+          (bankDepth + 4.8) * 0.5
         ),
       },
     },
@@ -178,33 +282,42 @@ function createShorelineFoamShader(
     `,
     fragmentShader: `
       uniform float uTime;
+      uniform float uPhaseOffset;
       uniform vec3 uFoamColor;
+      uniform vec3 uShallowsColor;
       uniform vec2 uHalfBank;
       uniform vec2 uHalfPlane;
       varying vec2 vUv;
 
       void main() {
         vec2 worldPos = abs(vUv) * uHalfPlane;
-        vec2 d = worldPos - uHalfBank;
-        float boxDist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+        float cornerR = 0.95;
+        vec2 d = worldPos - (uHalfBank - vec2(cornerR));
+        float boxDist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - cornerR;
 
-        if (boxDist < -0.12 || boxDist > 1.65) discard;
+        if (boxDist < -0.22 || boxDist > 2.25) discard;
 
-        float gentleWave = sin(vUv.x * 6.0 + uTime * 0.65) * cos(vUv.y * 6.0 - uTime * 0.55) * 0.035;
+        float gentleWave = sin(vUv.x * 5.5 + uTime * 0.58) * cos(vUv.y * 5.5 - uTime * 0.48) * 0.032;
         float dist = max(0.0, boxDist + gentleWave);
 
-        // Crisp shoreline contact band
-        float contactBand = smoothstep(0.28, 0.03, dist) * 0.72;
+        // Coastal turquoise reef halo around every island
+        float shallows = smoothstep(2.15, -0.05, boxDist) * 0.32;
 
-        // Single slow, cartoon-clean outward ripple
-        float phase = fract(uTime * 0.20);
-        float ripplePos = 0.20 + phase * 1.18;
-        float ripple = smoothstep(0.075, 0.0, abs(dist - ripplePos)) * (1.0 - phase) * 0.38;
+        // Crisp cream shoreline contact band
+        float contactBand = smoothstep(0.28, 0.02, dist) * 0.78;
 
-        float alpha = clamp(contactBand + ripple, 0.0, 0.76);
-        if (alpha < 0.005) discard;
+        // Smooth bell-enveloped outward ripple (zero pop-in!)
+        float phase = fract(uTime * 0.17 + uPhaseOffset);
+        float env = sin(phase * 3.14159265) * (1.0 - phase * 0.42);
+        float ripplePos = 0.16 + phase * 1.38;
+        float ripple = smoothstep(0.08, 0.0, abs(dist - ripplePos)) * env * 0.42;
 
-        gl_FragColor = vec4(uFoamColor, alpha);
+        float foamMask = clamp(contactBand + ripple, 0.0, 0.82);
+        float totalAlpha = clamp(shallows + foamMask, 0.0, 0.84);
+        if (totalAlpha < 0.004) discard;
+
+        vec3 col = mix(uShallowsColor, uFoamColor, clamp(foamMask / max(totalAlpha, 0.001), 0.0, 1.0));
+        gl_FragColor = vec4(col, totalAlpha);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
       }
@@ -217,20 +330,22 @@ interface GrasslandFloorUniforms {
   uGridSize: { value: THREE.Vector2 };
   uCursorPos: { value: THREE.Vector2 };
   uBuildAlpha: { value: number };
+  uCoarsePointer: { value: number };
+  uAnchorBox: { value: THREE.Vector4 };
+  uReticleMode: { value: number };
   uSageTurf: { value: THREE.Color };
   uSunlitMeadow: { value: THREE.Color };
-  uOliveGrid: { value: THREE.Color };
   uWarmCream: { value: THREE.Color };
-  uCurbStone: { value: THREE.Color };
 }
 
 /**
- * Shadow-Receiving Serene Velvety Meadow Floor Material (`MeshStandardMaterial` + `onBeforeCompile`):
- * - Receives real directional sunlight & crisp `PCFSoftShadowMap` shadows from Pillars, Bridges, Keeps, Spires & Runners!
- * - Gentle 2x2 mowed lawn bands (`#5ca343` <-> `#66ae4b`, reading as sunlit `#6eb452`–`#7ac05c` under golden-hour sun)
- * - Single smooth cloud-dapple octave, derivative-AA `1x1` whisper grid (`uBuildAlpha`), soft cliff AO & `0.12` warm limestone curb.
+ * Calm Sunlit Velvety Meadow Material (`MeshStandardMaterial` + `onBeforeCompile`):
+ * - Eliminates the aliased 2x2 mowed checkerboard (`mowedBand`).
+ * - Renders a serene diagonal sunlit turf gradient + gentle cloud dapple.
+ * - Crisp derivative-AA `1x1` cream build grid (`0.14` desktop, `0.215` mobile touch in BUILD, `0.0` in RUN).
+ * - `6.0m` orthogonal row/column alignment rails extending cleanly past a mobile player's thumb!
  */
-function createGrasslandFloorMaterial(): {
+function createGrasslandFloorMaterial(coarsePointer: boolean): {
   material: THREE.MeshStandardMaterial;
   uniforms: GrasslandFloorUniforms;
 } {
@@ -239,20 +354,21 @@ function createGrasslandFloorMaterial(): {
     uGridSize: { value: new THREE.Vector2(20, 26) },
     uCursorPos: { value: new THREE.Vector2(-99, -99) },
     uBuildAlpha: { value: 1.0 },
-    uSageTurf: { value: new THREE.Color('#5ca343') },
-    uSunlitMeadow: { value: new THREE.Color('#66ae4b') },
-    uOliveGrid: { value: new THREE.Color('#4d8837') },
-    uWarmCream: { value: new THREE.Color('#ecfccb') },
-    uCurbStone: { value: new THREE.Color('#e6dfd3') },
+    uCoarsePointer: { value: coarsePointer ? 1.0 : 0.0 },
+    uAnchorBox: { value: new THREE.Vector4(-99, -99, -97, -97) },
+    uReticleMode: { value: 0.0 },
+    uSageTurf: { value: new THREE.Color('#53983d') },
+    uSunlitMeadow: { value: new THREE.Color('#66b04d') },
+    uWarmCream: { value: new THREE.Color('#eef7dc') },
   };
 
   const material = new THREE.MeshStandardMaterial({
     color: 0xffffff,
-    roughness: 0.95,
+    roughness: 0.94,
     metalness: 0.0,
   });
   material.userData.uniforms = uniforms;
-  material.customProgramCacheKey = () => 'meadow-floor-standard-v2';
+  material.customProgramCacheKey = () => 'meadow-floor-tabletop-v3';
 
   material.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
@@ -277,11 +393,12 @@ function createGrasslandFloorMaterial(): {
         uniform vec2 uGridSize;
         uniform vec2 uCursorPos;
         uniform float uBuildAlpha;
+        uniform float uCoarsePointer;
+        uniform vec4 uAnchorBox;
+        uniform float uReticleMode;
         uniform vec3 uSageTurf;
         uniform vec3 uSunlitMeadow;
-        uniform vec3 uOliveGrid;
         uniform vec3 uWarmCream;
-        uniform vec3 uCurbStone;
         varying vec2 vFloorUv;
 
         float floorHash(vec2 p) {
@@ -314,44 +431,66 @@ function createGrasslandFloorMaterial(): {
         '#include <color_fragment>',
         `#include <color_fragment>
         {
-          vec2 cellPos = vFloorUv * uGridSize;
-          vec2 blockId = floor(cellPos * 0.5);
+          // PlaneGeometry.rotateX(-PI/2) maps uv.y=1 to North (-Z) and uv.y=0 to South (+Z)
+          vec2 floorUv = vec2(vFloorUv.x, 1.0 - vFloorUv.y);
+          vec2 cellPos = floorUv * uGridSize;
           vec2 f = fract(cellPos);
+          vec2 aa = max(fwidth(cellPos), vec2(0.006));
 
-          // 1. Gentle 2x2 mowed lawn bands (#5ca343 <-> #66ae4b) + single smooth cloud-dapple octave
-          float mowedBand = mod(blockId.x + blockId.y, 2.0);
-          vec3 grassCol = mix(uSageTurf, uSunlitMeadow, mowedBand);
+          // 1. Calm sunlit gradient + smooth cloud dapple (zero 2x2 checkerboard aliasing)
+          float sunGrad = clamp(1.0 - (floorUv.x * 0.42 + floorUv.y * 0.58), 0.0, 1.0);
+          vec3 grassCol = mix(uSageTurf, uSunlitMeadow, sunGrad);
 
-          float cloudDapple = floorFbm(cellPos * 0.12 + vec2(uTime * 0.012, uTime * 0.008));
-          grassCol *= 1.0 + (cloudDapple - 0.5) * 0.11;
+          float cloudDapple = floorFbm(cellPos * 0.11 + vec2(uTime * 0.01, uTime * 0.007));
+          grassCol *= 1.0 + (cloudDapple - 0.5) * 0.082;
 
-          // 2. Phase-aware derivative-antialiased 1x1 whisper grid (0.0 in RUN, soft in BUILD)
+          // 2. Crisp derivative-AA 1x1 tactile build grid + 6.0m thumb-clearing alignment rails
           if (uBuildAlpha > 0.002) {
             vec2 gridDist = min(f, 1.0 - f);
-            vec2 aa = max(fwidth(cellPos), vec2(0.007));
-            float gx = 1.0 - smoothstep(0.0, aa.x * 1.35, gridDist.x);
-            float gy = 1.0 - smoothstep(0.0, aa.y * 1.35, gridDist.y);
+            float gx = 1.0 - smoothstep(0.0, aa.x * 1.32, gridDist.x);
+            float gy = 1.0 - smoothstep(0.0, aa.y * 1.32, gridDist.y);
             float hairline = max(gx, gy);
 
-            float cursorDist = length(cellPos - uCursorPos);
-            float cursorProximity = smoothstep(4.0, 0.35, cursorDist);
+            float vertexDot = (1.0 - smoothstep(0.0, aa.x * 2.1, gridDist.x)) *
+                              (1.0 - smoothstep(0.0, aa.y * 2.1, gridDist.y));
 
-            vec3 lineCol = mix(uOliveGrid, uWarmCream, cursorProximity);
-            float lineAlpha = mix(0.085, 0.28, cursorProximity) * uBuildAlpha;
+            float baseAlpha = mix(0.14, 0.215, uCoarsePointer);
+            float cursorProx = smoothstep(4.2, 0.45, length(cellPos - uCursorPos));
+            float gridAlpha = (hairline * mix(baseAlpha, 0.32, cursorProx) + vertexDot * 0.13) * uBuildAlpha;
+            grassCol = mix(grassCol, uWarmCream, clamp(gridAlpha, 0.0, 0.44));
 
-            grassCol = mix(grassCol, lineCol, hairline * lineAlpha);
-            grassCol = mix(grassCol, uWarmCream, cursorProximity * 0.055 * uBuildAlpha);
+            if (uReticleMode > 0.5) {
+              vec2 boxCenter = 0.5 * (uAnchorBox.xy + uAnchorBox.zw);
+              float outX = max(0.0, abs(cellPos.x - boxCenter.x) - 1.0);
+              float outY = max(0.0, abs(cellPos.y - boxCenter.y) - 1.0);
+              float insideBox = step(outX, 0.001) * step(outY, 0.001);
+
+              float railLineX = max(
+                1.0 - smoothstep(0.0, aa.x * 1.65, abs(cellPos.x - uAnchorBox.x)),
+                1.0 - smoothstep(0.0, aa.x * 1.65, abs(cellPos.x - uAnchorBox.z))
+              ) * smoothstep(6.0, 0.35, outY);
+
+              float railLineY = max(
+                1.0 - smoothstep(0.0, aa.y * 1.65, abs(cellPos.y - uAnchorBox.y)),
+                1.0 - smoothstep(0.0, aa.y * 1.65, abs(cellPos.y - uAnchorBox.w))
+              ) * smoothstep(6.0, 0.35, outX);
+
+              float rails = max(railLineX, railLineY) * (1.0 - insideBox);
+
+              vec3 railCol = uReticleMode < 1.5
+                ? vec3(0.76, 0.99, 0.83)
+                : (uReticleMode < 2.5 ? vec3(1.0, 0.72, 0.76) : vec3(1.0, 0.91, 0.52));
+
+              grassCol = mix(grassCol, railCol, insideBox * 0.11 * uBuildAlpha);
+              grassCol = mix(grassCol, railCol, clamp(rails * 0.46, 0.0, 0.65) * uBuildAlpha);
+            }
           }
 
-          // 3. Soft cliff contact AO & clean 0.12-wide warm limestone curb (#e6dfd3)
+          // 3. Soft perimeter contact framing
           vec2 distToBorder = min(cellPos, uGridSize - cellPos);
           float minBorderDist = min(distToBorder.x, distToBorder.y);
-          float cliffAO = smoothstep(0.0, 0.95, minBorderDist);
-          grassCol *= 0.84 + 0.16 * cliffAO;
-
-          float curbAa = max(min(fwidth(cellPos.x), fwidth(cellPos.y)), 0.008);
-          float curbMask = 1.0 - smoothstep(0.12 - curbAa, 0.12 + curbAa, minBorderDist);
-          grassCol = mix(grassCol, uCurbStone, curbMask);
+          float edgeTone = smoothstep(0.0, 0.65, minBorderDist);
+          grassCol *= 0.91 + 0.09 * edgeTone;
 
           diffuseColor.rgb *= grassCol;
         }`
@@ -362,11 +501,185 @@ function createGrasslandFloorMaterial(): {
 }
 
 /**
- * Low-profile warm cream stepping-stone path ribbon shader (`#fefce8`).
+ * Precision `2x2` Ground Reticle Shader (`2.16 x 2.16m` quad at `y = 0.036`):
+ * - 4 razor-sharp L-shaped corner brackets + internal `1x1` crosshair sub-divider.
+ * - Per-quadrant `uBlockedCells` mask lighting up exact colliding `1x1` sub-cells in coral.
+ * - Diagonal prohibition slash when `uBlocksPath > 0.5`.
+ * - Crisp amber-coral Remove frame when `uMode == 3.0` (with 3D ghost cylinder hidden!).
+ */
+function createReticlePadShader(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    toneMapped: true,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uTime: { value: 0 },
+      uMode: { value: 1.0 }, // 1=valid mint, 2=invalid coral, 3=remove amber, 4=circuit gold
+      uBlockedCells: { value: new THREE.Vector4(0, 0, 0, 0) }, // (0,0), (1,0), (0,1), (1,1)
+      uBlocksPath: { value: 0.0 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform float uMode;
+      uniform vec4 uBlockedCells;
+      uniform float uBlocksPath;
+      varying vec2 vUv;
+
+      void main() {
+        // PlaneGeometry.rotateX(-PI/2) maps uv.y=1 to North (p.y=0) and uv.y=0 to South (p.y=2)
+        vec2 p = vec2(vUv.x, 1.0 - vUv.y) * 2.16 - 0.08;
+        vec2 aa = max(fwidth(p), vec2(0.008));
+        float edgeAa = max(aa.x, aa.y);
+
+        vec2 boxD = abs(p - vec2(1.0)) - vec2(1.0);
+        float sdf = max(boxD.x, boxD.y);
+        if (sdf > 0.07) discard;
+
+        float inside = 1.0 - smoothstep(-edgeAa, edgeAa, sdf);
+
+        // Thin full perimeter frame
+        float thinFrame = (1.0 - smoothstep(0.0, edgeAa * 1.5, abs(sdf))) * 0.42;
+
+        // 4 bold L-shaped corner brackets (0.46m arm length, 0.075m stroke)
+        vec2 cornerDist = min(p, 2.0 - p);
+        float bracketBand = (1.0 - smoothstep(0.0, edgeAa * 1.4, abs(sdf + 0.032) - 0.036)) * inside;
+        float cornerMask = 1.0 - smoothstep(0.44, 0.48, min(
+          cornerDist.x < 0.12 ? cornerDist.y : 9.0,
+          cornerDist.y < 0.12 ? cornerDist.x : 9.0
+        ));
+        float brackets = bracketBand * cornerMask;
+
+        // Internal 1x1 sub-cell crosshair
+        float crossX = 1.0 - smoothstep(0.0, aa.x * 1.35, abs(p.x - 1.0));
+        float crossY = 1.0 - smoothstep(0.0, aa.y * 1.35, abs(p.y - 1.0));
+        float subCross = max(crossX, crossY) * inside * 0.28;
+
+        // Per-cell 1x1 collision highlight
+        float blockedMask = 0.0;
+        if (inside > 0.01) {
+          float qx = step(1.0, p.x);
+          float qy = step(1.0, p.y);
+          float c00 = (1.0 - qx) * (1.0 - qy) * uBlockedCells.x;
+          float c10 = qx * (1.0 - qy) * uBlockedCells.y;
+          float c01 = (1.0 - qx) * qy * uBlockedCells.z;
+          float c11 = qx * qy * uBlockedCells.w;
+          blockedMask = clamp(c00 + c10 + c01 + c11, 0.0, 1.0) * inside;
+        }
+
+        // Blocked-path centered prohibition slash when cells are clear but maze path seals
+        float slashMask = 0.0;
+        if (uBlocksPath > 0.5 && inside > 0.01) {
+          float diagDist = abs((p.x - 1.0) + (p.y - 1.0)) * 0.7071;
+          float inCircle = 1.0 - smoothstep(0.56, 0.62, length(p - vec2(1.0)));
+          float ring = (1.0 - smoothstep(0.0, edgeAa * 1.6, abs(length(p - vec2(1.0)) - 0.56)));
+          float slash = (1.0 - smoothstep(0.032, 0.032 + edgeAa, diagDist)) * inCircle;
+          slashMask = clamp(ring + slash, 0.0, 1.0);
+        }
+
+        vec3 baseCol = uMode < 1.5
+          ? vec3(0.52, 0.94, 0.67)
+          : (uMode < 2.5
+              ? vec3(0.98, 0.35, 0.45)
+              : (uMode < 3.5 ? vec3(0.98, 0.68, 0.22) : vec3(0.99, 0.82, 0.22)));
+
+        float pulse = 0.92 + 0.08 * sin(uTime * 5.0);
+        vec3 col = baseCol;
+        float alpha = clamp(brackets * 0.95 + thinFrame + subCross, 0.0, 0.96) * pulse;
+
+        if (blockedMask > 0.01) {
+          float stripe = 0.78 + 0.22 * step(0.5, fract((p.x + p.y) * 3.0));
+          col = mix(col, vec3(0.96, 0.24, 0.37), 0.75);
+          alpha = max(alpha, blockedMask * 0.42 * stripe);
+        }
+
+        if (slashMask > 0.01) {
+          col = vec3(0.98, 0.32, 0.38);
+          alpha = max(alpha, slashMask * 0.88);
+        }
+
+        if (alpha < 0.005) discard;
+        gl_FragColor = vec4(col, alpha);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
+/**
+ * Flush Ground Inlaid Gold Ley-Line Conduit Shader (`y = 0.024m`):
+ * Connects Keep-powered wall chains (`dx^2 + dy^2 <= 13`) into Overcharged Elemental Spires,
+ * including across 1-tile walkable Spire corridors without blocking Runner movement!
+ */
+function createLeyConduitShader(isPreview = false): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    toneMapped: true,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uTime: { value: 0 },
+      uOpacity: { value: isPreview ? 0.82 : 0.92 },
+      uSlateColor: { value: new THREE.Color('#293544') },
+      uGoldColor: { value: new THREE.Color('#fbbf24') },
+      uHotColor: { value: new THREE.Color('#fef08a') },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform float uOpacity;
+      uniform vec3 uSlateColor;
+      uniform vec3 uGoldColor;
+      uniform vec3 uHotColor;
+      varying vec2 vUv;
+
+      void main() {
+        float across = abs(vUv.y - 0.5) * 2.0; // 0 center .. 1 outer edge
+        float endFade = smoothstep(0.0, 0.12, vUv.x) * smoothstep(1.0, 0.88, vUv.x);
+
+        float bezel = 1.0 - smoothstep(0.76, 0.98, across);
+        float core = 1.0 - smoothstep(0.28, 0.54, across);
+
+        // Gentle energy pulse flowing from Wall/Keep (vUv.x=0) into Spire (vUv.x=1)
+        float flow = fract(vUv.x * 1.6 - uTime * 0.85);
+        float pulse = smoothstep(0.0, 0.35, flow) * (1.0 - smoothstep(0.35, 0.85, flow));
+
+        vec3 gold = mix(uGoldColor, uHotColor, pulse * 0.65);
+        vec3 col = mix(uSlateColor, gold, core);
+        float alpha = uOpacity * endFade * mix(bezel * 0.48, 0.94, core);
+        if (alpha < 0.005) discard;
+
+        gl_FragColor = vec4(col, alpha);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
+/**
+ * Calm Stationary Sandstone Flagstone Path Ribbon Shader:
+ * - Zero constant marching-ants stone scrolling in BUILD!
+ * - Crisp warm-olive outer edge stroke so sunlit cream flagstones pop cleanly on bright turf.
+ * - Single gentle directional travel shimmer every ~4.0s.
  */
 function createPathRibbonShader(
   colorHex = '#fefce8',
-  initialOpacity = 0.58
+  initialOpacity = 0.66
 ): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     transparent: true,
@@ -376,7 +689,8 @@ function createPathRibbonShader(
     uniforms: {
       uTime: { value: 0 },
       uColor: { value: new THREE.Color(colorHex) },
-      uHighlightColor: { value: new THREE.Color('#fffef2') },
+      uHighlightColor: { value: new THREE.Color('#fffef5') },
+      uBorderColor: { value: new THREE.Color('#3b592c') },
       uOpacity: { value: initialOpacity },
     },
     vertexShader: `
@@ -390,21 +704,29 @@ function createPathRibbonShader(
       uniform float uTime;
       uniform vec3 uColor;
       uniform vec3 uHighlightColor;
+      uniform vec3 uBorderColor;
       uniform float uOpacity;
       varying vec2 vUv;
 
       void main() {
-        float edgeMask = smoothstep(0.0, 0.20, vUv.y) * smoothstep(1.0, 0.80, vUv.y);
-        // Subtle stepping-stone paver cadence in world-space meters (vUv.x)
-        float paver = fract(vUv.x * 1.45 - uTime * 0.48);
-        float stone = smoothstep(0.10, 0.24, paver) * smoothstep(0.92, 0.78, paver);
+        float across = abs(vUv.y - 0.5) * 2.0;
+        float outerMask = 1.0 - smoothstep(0.82, 1.0, across);
+        float innerMask = 1.0 - smoothstep(0.56, 0.76, across);
 
-        vec3 baseCream = uColor * 0.92;
-        vec3 brightCream = mix(uColor, uHighlightColor, 0.45);
-        vec3 col = mix(baseCream, brightCream, stone);
+        // Stationary world-anchored flagstones (vUv.x in meters)
+        float paver = fract(vUv.x * 1.35);
+        float stone = smoothstep(0.08, 0.18, paver) * smoothstep(0.94, 0.84, paver);
 
-        float alpha = uOpacity * edgeMask * (0.72 + 0.28 * stone);
+        // Single calm directional shimmer wave every ~4.0s
+        float wave = fract(vUv.x * 0.05 - uTime * 0.25);
+        float shimmer = smoothstep(0.0, 0.14, wave) * (1.0 - smoothstep(0.14, 0.36, wave));
+
+        vec3 stoneCol = mix(uColor * 0.90, mix(uColor, uHighlightColor, 0.5 + shimmer * 0.45), stone);
+        vec3 col = mix(uBorderColor, stoneCol, innerMask);
+
+        float alpha = uOpacity * outerMask * mix(0.42, 0.68 + 0.32 * stone, innerMask);
         if (alpha < 0.004) discard;
+
         gl_FragColor = vec4(col, alpha);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -413,16 +735,12 @@ function createPathRibbonShader(
   });
 }
 
-/**
- * Builds a flat low-profile horizontal ribbon geometry along a Catmull-Rom path curve
- * with arc-length meters stored in `uv.x` for uniform stepping-stone pacing.
- */
 function createFlatPathRibbonGeometry(
   points: GridPoint[],
   offsetX: number,
   offsetZ: number,
   yHeight: number,
-  halfWidth = 0.145
+  halfWidth = 0.155
 ): THREE.BufferGeometry {
   const pts3D = points.map(
     (p) => new THREE.Vector3(offsetX + p.x, yHeight, offsetZ + p.y)
@@ -487,9 +805,81 @@ function createFlatPathRibbonGeometry(
 }
 
 /**
- * Clean single-hairline Spire Range Shader (eliminates concentric ring soup):
- * - Single crisp derivative-AA perimeter hairline (`0.24` in BUILD, `0.58` near hover/ghost, `0.13` in RUN)
- * - Subtle `0.045` frost tint inside `FROST_OBELISK` only
+ * Builds a tapered 3D ribbon strip between `start` and `end` (replaces hardware-clamped 1px THREE.Line!).
+ */
+function createTaperedArcRibbonGeometry(
+  start: THREE.Vector3,
+  end: THREE.Vector3,
+  apexLift: number,
+  jitterAmp: number,
+  segments: number,
+  startHalfWidth: number,
+  endHalfWidth: number
+): THREE.BufferGeometry {
+  const pts: THREE.Vector3[] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const p = new THREE.Vector3().lerpVectors(start, end, t);
+    p.y += Math.sin(t * Math.PI) * apexLift;
+    if (jitterAmp > 0 && i > 0 && i < segments) {
+      p.x += (Math.random() - 0.5) * jitterAmp;
+      p.y += (Math.random() - 0.35) * jitterAmp * 0.85;
+      p.z += (Math.random() - 0.5) * jitterAmp;
+    }
+    pts.push(p);
+  }
+
+  const vertCount = pts.length * 2;
+  const positions = new Float32Array(vertCount * 3);
+  const indices: number[] = [];
+
+  for (let i = 0; i < pts.length; i++) {
+    const t = i / (pts.length - 1);
+    const hw = startHalfWidth + (endHalfWidth - startHalfWidth) * t;
+    const curr = pts[i];
+    const prev = pts[Math.max(0, i - 1)];
+    const next = pts[Math.min(pts.length - 1, i + 1)];
+
+    let dx = next.x - prev.x;
+    let dz = next.z - prev.z;
+    const len = Math.hypot(dx, dz) || 1;
+    dx /= len;
+    dz /= len;
+
+    // Horizontal cross-ribbon + slight vertical cant so it reads from both zenith and angled cameras
+    const nx = -dz * hw;
+    const nz = dx * hw;
+    const ny = hw * 0.35;
+
+    const vBase = i * 6;
+    positions[vBase] = curr.x - nx;
+    positions[vBase + 1] = curr.y - ny;
+    positions[vBase + 2] = curr.z - nz;
+
+    positions[vBase + 3] = curr.x + nx;
+    positions[vBase + 4] = curr.y + ny;
+    positions[vBase + 5] = curr.z + nz;
+
+    if (i < pts.length - 1) {
+      const a = i * 2;
+      const b = a + 1;
+      const c = a + 2;
+      const d = a + 3;
+      indices.push(a, c, b, b, c, d);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+/**
+ * Dual-Contrast Spire Range Perimeter Shader:
+ * Subtle dark-sage backing rim + ivory-lifted elemental hairline so Storm/Frost/Chrono rings
+ * stay razor-legible over sunlit grass at low (`0.26`) alpha without filling the field with neon.
  */
 function createSpireAoEShader(
   range: number,
@@ -499,7 +889,7 @@ function createSpireAoEShader(
     spireType === 'FROST_OBELISK'
       ? new THREE.Color('#38bdf8')
       : spireType === 'CHRONO_SPIRE'
-      ? new THREE.Color('#a855f7')
+      ? new THREE.Color('#c084fc')
       : new THREE.Color('#f59e0b');
 
   return new THREE.ShaderMaterial({
@@ -511,8 +901,9 @@ function createSpireAoEShader(
       uRange: { value: range },
       uBaseColor: { value: baseColor },
       uOverchargeGold: { value: new THREE.Color('#fbbf24') },
-      uRingAlpha: { value: 0.24 },
-      uInnerFillAlpha: { value: spireType === 'FROST_OBELISK' ? 0.045 : 0.0 },
+      uShadowRim: { value: new THREE.Color('#1e3a24') },
+      uRingAlpha: { value: 0.28 },
+      uInnerFillAlpha: { value: spireType === 'FROST_OBELISK' ? 0.05 : 0.0 },
       uOverchargeTier: { value: 0.0 },
     },
     vertexShader: `
@@ -525,6 +916,7 @@ function createSpireAoEShader(
     fragmentShader: `
       uniform vec3 uBaseColor;
       uniform vec3 uOverchargeGold;
+      uniform vec3 uShadowRim;
       uniform float uRingAlpha;
       uniform float uInnerFillAlpha;
       uniform float uOverchargeTier;
@@ -532,18 +924,24 @@ function createSpireAoEShader(
 
       void main() {
         float r = length(vUv);
-        float aa = max(fwidth(r), 0.0035);
-        if (r > 1.0 + aa) discard;
+        float aa = max(fwidth(r), 0.004);
+        if (r > 1.0 + aa * 2.0) discard;
 
-        float ringCenter = 1.0 - aa * 1.4;
-        float hairline = 1.0 - smoothstep(aa * 0.65, aa * 2.1, abs(r - ringCenter));
+        float ringCenter = 1.0 - aa * 1.8;
+        float coreLine = 1.0 - smoothstep(aa * 0.55, aa * 1.85, abs(r - ringCenter));
+        float shadowBand = 1.0 - smoothstep(aa * 0.8, aa * 3.1, abs(r - ringCenter));
         float innerMask = 1.0 - smoothstep(ringCenter - aa, ringCenter + aa, r);
 
-        vec3 col = mix(uBaseColor, uOverchargeGold, clamp(uOverchargeTier * 0.16, 0.0, 0.42));
+        vec3 tint = mix(uBaseColor, uOverchargeGold, clamp(uOverchargeTier * 0.16, 0.0, 0.42));
+        vec3 brightLine = mix(tint, vec3(1.0, 0.99, 0.94), 0.26);
+        vec3 ringCol = mix(uShadowRim, brightLine, clamp(coreLine * 1.15, 0.0, 1.0));
 
-        float alpha = innerMask * uInnerFillAlpha + hairline * uRingAlpha;
+        float rimAlpha = (shadowBand * 0.36 + coreLine * 0.85) * uRingAlpha;
+        float alpha = innerMask * uInnerFillAlpha + rimAlpha;
         if (alpha < 0.003) discard;
-        gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.85));
+
+        vec3 finalCol = mix(tint, ringCol, clamp(rimAlpha / max(alpha, 0.001), 0.0, 1.0));
+        gl_FragColor = vec4(finalCol, clamp(alpha, 0.0, 0.88));
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
       }
@@ -552,7 +950,7 @@ function createSpireAoEShader(
 }
 
 /**
- * Compact radial cooldown ring (`r = 1.08m`) hugging the Spire's stone base plinth during RUN.
+ * Compact Radial Cooldown Ring (`r = 1.08m`) + Chrono CDR Flash Halo + Ground Overcharge Segments.
  */
 function createSpireBaseCooldownShader(
   spireType: SpireType = 'THUNDERCLAP'
@@ -561,7 +959,7 @@ function createSpireBaseCooldownShader(
     spireType === 'FROST_OBELISK'
       ? new THREE.Color('#38bdf8')
       : spireType === 'CHRONO_SPIRE'
-      ? new THREE.Color('#a855f7')
+      ? new THREE.Color('#c084fc')
       : new THREE.Color('#f59e0b');
 
   return new THREE.ShaderMaterial({
@@ -571,9 +969,11 @@ function createSpireBaseCooldownShader(
     side: THREE.DoubleSide,
     uniforms: {
       uChargeProgress: { value: 1.0 },
+      uCdrFlash: { value: 0.0 },
       uAccentColor: { value: accentColor },
-      uTrackColor: { value: new THREE.Color('#28362c') },
-      uReadyTint: { value: new THREE.Color('#fff5cc') },
+      uTrackColor: { value: new THREE.Color('#1e293b') },
+      uReadyTint: { value: new THREE.Color('#fffbeb') },
+      uChronoFlashColor: { value: new THREE.Color('#e9d5ff') },
     },
     vertexShader: `
       varying vec2 vUv;
@@ -584,26 +984,29 @@ function createSpireBaseCooldownShader(
     `,
     fragmentShader: `
       uniform float uChargeProgress;
+      uniform float uCdrFlash;
       uniform vec3 uAccentColor;
       uniform vec3 uTrackColor;
       uniform vec3 uReadyTint;
+      uniform vec3 uChronoFlashColor;
       varying vec2 vUv;
 
       void main() {
         float r = length(vUv);
         float aa = max(fwidth(r), 0.008);
-        float band = smoothstep(0.84 - aa, 0.84 + aa, r) * (1.0 - smoothstep(0.96 - aa, 0.96 + aa, r));
+        float band = smoothstep(0.82 - aa, 0.82 + aa, r) * (1.0 - smoothstep(0.96 - aa, 0.96 + aa, r));
         if (band < 0.005) discard;
 
-        // Clockwise progress starting from North (-Z -> vUv.y < 0)
-        float angle = atan(vUv.x, -vUv.y);
+        // Clockwise progress starting from 12 o'clock North (-Z -> vUv.y > 0)
+        float angle = atan(vUv.x, vUv.y);
         float normAngle = fract((angle + 6.2831853) / 6.2831853);
         float fillMask = 1.0 - smoothstep(uChargeProgress - 0.015, uChargeProgress + 0.015, normAngle);
         if (uChargeProgress >= 0.995) fillMask = 1.0;
 
-        vec3 readyCol = mix(uAccentColor, uReadyTint, uChargeProgress >= 0.98 ? 0.35 : 0.0);
+        vec3 readyCol = mix(uAccentColor, uReadyTint, uChargeProgress >= 0.98 ? 0.38 : 0.0);
         vec3 col = mix(uTrackColor, readyCol, fillMask);
-        float alpha = band * mix(0.24, 0.86, fillMask);
+        col = mix(col, uChronoFlashColor, clamp(uCdrFlash, 0.0, 1.0) * 0.85);
+        float alpha = band * mix(0.32, 0.9, max(fillMask, uCdrFlash));
 
         gl_FragColor = vec4(col, alpha);
         #include <tonemapping_fragment>
@@ -614,9 +1017,101 @@ function createSpireBaseCooldownShader(
 }
 
 /**
- * Piecewise smooth toy-box spring squash-and-stretch curve over `0..1`:
- * `scaleY: 0.20 -> 1.09 -> 0.97 -> 1.00`
+ * 6-Lobed Crystalline Snowflake Wavefront Shader for `FROST_OBELISK` Glacial Nova (zero lightning bolts!).
  */
+function createFrostHexNovaShader(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    toneMapped: true,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uOpacity: { value: 0.85 },
+      uCyan: { value: new THREE.Color('#38bdf8') },
+      uIceWhite: { value: new THREE.Color('#e0f2fe') },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv * 2.0 - 1.0;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uOpacity;
+      uniform vec3 uCyan;
+      uniform vec3 uIceWhite;
+      varying vec2 vUv;
+
+      void main() {
+        float r = length(vUv);
+        float ang = atan(vUv.y, vUv.x);
+        float hexMod = 0.90 + 0.09 * cos(ang * 6.0);
+        float dist = abs(r - hexMod);
+        float ring = 1.0 - smoothstep(0.02, 0.11, dist);
+        float spokes = (1.0 - smoothstep(0.0, 0.06, abs(sin(ang * 3.0)))) * smoothstep(0.35, 0.9, r) * step(r, hexMod);
+        float mask = clamp(ring + spokes * 0.35, 0.0, 1.0);
+        if (mask < 0.01) discard;
+
+        vec3 col = mix(uCyan, uIceWhite, ring * 0.65);
+        gl_FragColor = vec4(col, mask * uOpacity);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
+/**
+ * Dual-Arc Runner Status Ring Shader:
+ * Displays single status cleanly OR splits 50/50 when e.g. Slow + Frost stack simultaneously!
+ */
+function createRunnerStatusRingShader(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    toneMapped: true,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uColorA: { value: new THREE.Color('#f59e0b') },
+      uColorB: { value: new THREE.Color('#38bdf8') },
+      uDual: { value: 0.0 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv * 2.0 - 1.0;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform vec3 uColorA;
+      uniform vec3 uColorB;
+      uniform float uDual;
+      varying vec2 vUv;
+
+      void main() {
+        float r = length(vUv);
+        float aa = max(fwidth(r), 0.02);
+        float band = smoothstep(0.70 - aa, 0.70 + aa, r) * (1.0 - smoothstep(0.98 - aa, 0.98 + aa, r));
+        if (band < 0.01) discard;
+
+        vec3 col = uColorA;
+        if (uDual > 0.5) {
+          float split = smoothstep(-0.06, 0.06, vUv.x);
+          col = mix(uColorA, uColorB, split);
+          float gap = smoothstep(0.0, 0.08, abs(vUv.x));
+          band *= 0.35 + 0.65 * gap;
+        }
+
+        gl_FragColor = vec4(col, band * 0.88);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
 function evalToyBoxSpringScaleY(tNorm: number): number {
   const t = Math.max(0, Math.min(1, tNorm));
   if (t < 0.46) {
@@ -635,34 +1130,23 @@ function evalToyBoxSpringScaleY(tNorm: number): number {
 }
 
 // ============================================================================
-// INTERFACES
+// INTERNAL VISUAL RIG INTERFACES
 // ============================================================================
-
-export interface HoverStatusInfo {
-  cell: GridPoint | null;
-  screenX: number;
-  screenY: number;
-  valid: boolean;
-  reason?: string;
-  deltaTime?: number;
-  deltaClaps?: number;
-  deltaKeeps?: number;
-  deltaOvercharge?: number;
-  previewTime?: number;
-  existingTower?: PlacedTower | null;
-  isTouchPreview?: boolean;
-  isGestureMoving?: boolean;
-  offscreen?: boolean;
-  onConfirmTouchAction?: () => void;
-  onCancelTouchAction?: () => void;
-}
 
 interface ShockwaveEffect {
   mesh: THREE.Mesh;
-  bolt?: THREE.Line;
+  arcMesh?: THREE.Mesh;
   age: number;
   maxAge: number;
+  startRadius: number;
   maxRadius: number;
+  isShaderMat: boolean;
+}
+
+interface RelayArcEffect {
+  mesh: THREE.Mesh;
+  age: number;
+  maxAge: number;
 }
 
 interface ParticleBurst {
@@ -676,6 +1160,7 @@ interface ParticleBurst {
 
 interface SpireVisualRig {
   group: THREE.Group;
+  spireIndex: number;
   spireType: SpireType;
   baseRange: number;
   gridX: number;
@@ -684,17 +1169,21 @@ interface SpireVisualRig {
   baseCoreY: number;
   collarRimMesh: THREE.Mesh;
   overchargePips: THREE.Mesh[];
+  groundTierArcs: THREE.Mesh[];
   cooldownRingMesh: THREE.Mesh;
   cooldownRingMat: THREE.ShaderMaterial;
   aoeMesh: THREE.Mesh;
   aoeMat: THREE.ShaderMaterial;
   targetHoverBoost: number;
   recoil: number;
+  cdrFlash: number;
 }
 
 interface RuinVisualRig {
   group: THREE.Group;
+  keepIndex: number;
   lanternMesh: THREE.Mesh;
+  corniceMesh: THREE.Mesh;
   gridX: number;
   gridY: number;
 }
@@ -706,10 +1195,14 @@ interface RunnerRig {
   headGroup: THREE.Group;
   leftArm: THREE.Group;
   rightArm: THREE.Group;
+  leftWing: THREE.Mesh | null;
+  rightWing: THREE.Mesh | null;
+  pennantMesh: THREE.Mesh | null;
   accentMesh: THREE.Mesh | null;
   leftLeg: THREE.Group;
   rightLeg: THREE.Group;
   statusRing: THREE.Mesh;
+  statusRingMat: THREE.ShaderMaterial;
   walkPhase: number;
   currentYaw: number;
 }
@@ -726,6 +1219,28 @@ interface BridgeVisualEntry {
   born: number;
 }
 
+interface IslandBadgeRefs {
+  root: HTMLDivElement;
+  dot: HTMLSpanElement;
+  name: HTMLElement;
+  meta: HTMLSpanElement;
+  lastColor: string;
+  lastName: string;
+  lastMeta: string;
+  visible: boolean;
+}
+
+interface RunnerBadgeRefs {
+  root: HTMLDivElement;
+  dot: HTMLSpanElement;
+  tag: HTMLSpanElement;
+  time: HTMLSpanElement;
+  lastDotColor: string;
+  lastTag: string;
+  lastTime: string;
+  visible: boolean;
+}
+
 interface IslandVisuals {
   playerId: string;
   playerColor: string;
@@ -735,20 +1250,25 @@ interface IslandVisuals {
   floorMat: THREE.MeshStandardMaterial;
   floorUniforms: GrasslandFloorUniforms;
   foamMat: THREE.ShaderMaterial;
+  conduitMat: THREE.ShaderMaterial;
+  fogVeilMesh: THREE.Mesh;
   trimMesh: THREE.Mesh;
   hitPlane: THREE.Mesh;
   padGroup: THREE.Group;
   towerGroup: THREE.Group;
   bridgeGroup: THREE.Group;
+  conduitGroup: THREE.Group;
   bridgeEntries: BridgeVisualEntry[];
   clapMarkerGroup: THREE.Group;
   towerMeshes: Map<string, WallVisualEntry>;
   spireRigs: SpireVisualRig[];
   ruinRigs: RuinVisualRig[];
   pathMesh: THREE.Mesh | null;
-  pathMat: THREE.ShaderMaterial | null;
+  pathMat: THREE.ShaderMaterial;
   runner: RunnerRig;
-  checkpointRings: THREE.Mesh[];
+  lastTowersSig: string;
+  lastSimStatus: string;
+  lastSimTimeText: string;
 }
 
 interface ActiveTouchPoint {
@@ -758,8 +1278,21 @@ interface ActiveTouchPoint {
   startY: number;
 }
 
+interface CachedHoverPreview {
+  key: string;
+  valid: boolean;
+  snapped: boolean;
+  reason?: string;
+  reasonCode?: string;
+  deltaTime: number;
+  deltaClaps: number;
+  deltaKeeps: number;
+  deltaOvercharge: number;
+  previewTime: number;
+}
+
 // ============================================================================
-// ARENA 3D RENDERER (SUNLIT LIMESTONE & SAGE MEADOW DIORAMA + MULTI-TOUCH)
+// ARENA 3D RENDERER (ELEVATED TABLETOP DIORAMA + SPLIT DESKTOP/TOUCH ENGINE)
 // ============================================================================
 
 export class Arena3DRenderer {
@@ -770,150 +1303,342 @@ export class Arena3DRenderer {
   private renderer: THREE.WebGLRenderer;
   private sunLight!: THREE.DirectionalLight;
   private lastShadowFrustumD = 0;
+  private currentShadowRes = 1024;
   private seaMesh!: THREE.Mesh;
   private voidSeaMat!: THREE.ShaderMaterial;
 
   private islands = new Map<string, IslandVisuals>();
   private shockwaves: ShockwaveEffect[] = [];
+  private relayArcs: RelayArcEffect[] = [];
   private particleBursts: ParticleBurst[] = [];
 
-  // Aspect-adaptive camera rig
-  private camTarget = new THREE.Vector3(10, 0, 14);
-  private camGoalTarget = new THREE.Vector3(10, 0, 14);
-  private camRadius = 42;
-  private camGoalRadius = 42;
-  private camPolar = 0.5;
-  private camGoalPolar = 0.5;
+  // Cached viewport rect & dynamic HUD safe insets (zero getBoundingClientRect in renderFrame!)
+  private viewportLeft = 0;
+  private viewportTop = 0;
+  private viewportW = 1280;
+  private viewportH = 720;
+  private hudSafeTopPx = 56;
+  private hudSafeBottomPx = 84;
+  private hasCustomHudInsets = false;
+
+  // Rolling FPS governor for sustained 60fps on mobile/high-DPI screens
+  private fpsAccumDt = 0;
+  private fpsFrameCount = 0;
+  private dprScaleCap = 1.0;
+
+  // Telephoto camera rig (`35°` FOV)
+  private camTarget = new THREE.Vector3(10, 0, 13);
+  private camGoalTarget = new THREE.Vector3(10, 0, 13);
+  private camRadius = 52;
+  private camGoalRadius = 52;
+  private camPolar = 0.48;
+  private camGoalPolar = 0.48;
+  private camBasePolar = 0.48;
   private camAzimuth = 0;
   private camGoalAzimuth = 0;
   private cameraShake = 0;
 
-  private isDraggingCamera = false;
-  private dragStart = { x: 0, y: 0 };
+  // Reusable scratch vectors (zero per-frame Vector3 allocations)
+  private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  private readonly buildPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.02);
+  private readonly _tmpProj = new THREE.Vector3();
+  private readonly _tmpWorld = new THREE.Vector3();
+  private readonly _tmpPinch = new THREE.Vector3();
+  private keysDown = new Set<string>();
+
+  // Desktop mouse state machine (deferred pointerup <=5px click/right-click + drag pan + Shift paint)
+  private isMiddleOrAltDragging = false;
   private isLeftMouseDown = false;
   private leftMouseStart = { x: 0, y: 0 };
   private leftMousePanned = false;
-  private leftMouseCanPan = false;
-  private mouseOverLocalGrass = false;
-  private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
-  private keysDown = new Set<string>();
+  private isShiftPainting = false;
+  private isSweepSelling = false;
+  private lastPaintedCellKey = '';
+  private isRightMouseDown = false;
+  private rightMouseStart = { x: 0, y: 0 };
+  private rightMousePanned = false;
+  private dragStart = { x: 0, y: 0 };
 
-  // Multi-touch gesture state machine
+  // Mobile multi-touch & `-54px` Loupe Ghost Drag state machine
   private activeTouches = new Map<number, ActiveTouchPoint>();
   private touchGestureMoved = false;
+  private postPinchGuard = false;
+  private isLoupeDragging = false;
+  private canGrabExistingGhost = false;
+  private loupeGrabInitOffset = { x: 0, y: 0 };
+  private loupeCurrentOffset = { x: 0, y: -54 };
+  private loupeHoldStartMs = 0;
+  private loupeSavedBeforeGesture: GridPoint | null = null;
+  private touchHoldTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPinchDist = 0;
   private lastPinchMid = { x: 0, y: 0 };
-  private pendingTouchCell: { x: number; y: number } | null = null;
+  private pendingTouchCell: GridPoint | null = null;
   private pendingTouchTowerId: string | null = null;
   private activeTouchHoverInfo: HoverStatusInfo | null = null;
   private touchWorldAnchor = new THREE.Vector3();
 
-  // Desktop hover & clean miniature limestone ghost state
+  // Desktop hover, precision 2x2 reticle & live synergy preview state
   private raycaster = new THREE.Raycaster();
   private mouseNDC = new THREE.Vector2(-99, -99);
   private lastPointerScreen = { x: 0, y: 0 };
-  private hoveredCell: { x: number; y: number } | null = null;
+  private hoveredCell: GridPoint | null = null;
   private hoveredExistingTower: PlacedTower | null = null;
+  private lastHoverValid = false;
+  private cachedHoverPreview: CachedHoverPreview | null = null;
+
   private ghostGroup: THREE.Group;
+  private ghostTurretGroup: THREE.Group;
   private ghostConnGroup: THREE.Group;
+  private reticlePadMesh: THREE.Mesh;
+  private reticlePadMat: THREE.ShaderMaterial;
   private ghostBodyMat: THREE.MeshStandardMaterial;
   private ghostCapMat: THREE.MeshStandardMaterial;
+  private ghostGoldBodyMat: THREE.MeshStandardMaterial;
+  private ghostGoldCapMat: THREE.MeshStandardMaterial;
   private previewPathMesh: THREE.Mesh | null = null;
-  private previewPathMat: THREE.ShaderMaterial | null = null;
+  private previewPathMat: THREE.ShaderMaterial;
+  private previewConduitGroup: THREE.Group;
+  private previewConduitMat: THREE.ShaderMaterial;
 
-  // Singleton Procedural Sprite & AO Textures
-  private contactShadowTex = createContactShadowTexture();
-  private softCircleSpriteTex = createSoftCircleSpriteTexture();
+  // Protected singleton textures, geometries & materials (never disposed on round rebuilds)
+  private readonly protectedGeos = new Set<THREE.BufferGeometry>();
+  private readonly protectedMats = new Set<THREE.Material>();
+  private readonly contactShadowTex = createContactShadowTexture();
+  private readonly softCircleSpriteTex = createSoftCircleSpriteTexture();
 
-  // Singleton Shared Geometries (Zero per-pillar/per-bridge GPU buffer churn!)
   private readonly sharedGeos = {
     aoQuad: (() => {
-      const g = new THREE.PlaneGeometry(2.04, 2.04);
+      const g = new THREE.PlaneGeometry(2.08, 2.08);
       g.rotateX(-Math.PI / 2);
       return g;
     })(),
+    bridgeAoQuad: (() => {
+      const g = new THREE.PlaneGeometry(1.12, 1.0);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    })(),
+    conduitQuad: (() => {
+      const g = new THREE.PlaneGeometry(1.0, 0.24);
+      g.rotateX(-Math.PI / 2);
+      // Orient UV.x along +Z (0..1 from origin to +1m Z) for easy rotation.y alignment
+      const pos = g.getAttribute('position');
+      const uv = g.getAttribute('uv');
+      for (let i = 0; i < pos.count; i++) {
+        const px = pos.getX(i); // [-0.5..0.5]
+        const pz = pos.getZ(i); // [-0.12..0.12]
+        pos.setXYZ(i, pz, 0, px + 0.5);
+        uv.setXY(i, px + 0.5, pz / 0.24 + 0.5);
+      }
+      g.computeBoundingSphere();
+      return g;
+    })(),
+    reticleQuad: (() => {
+      const g = new THREE.PlaneGeometry(2.16, 2.16);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    })(),
+    // 1. Player Stone Wall (`BLOCK`): Chamfered Square Ivory Turret (`1.66m` plinth, `h = 1.38m`)
     pillarPlinth: (() => {
-      const g = new THREE.CylinderGeometry(0.76, 0.84, 0.22, 8);
-      g.rotateY(Math.PI / 8);
+      const g = new THREE.CylinderGeometry(1.12, 1.18, 0.22, 4);
+      g.rotateY(Math.PI / 4);
       return g;
     })(),
     pillarShaft: (() => {
-      const g = new THREE.CylinderGeometry(0.68, 0.72, 1.02, 8);
-      g.rotateY(Math.PI / 8);
+      const g = new THREE.CylinderGeometry(0.98, 1.03, 0.96, 4);
+      g.rotateY(Math.PI / 4);
       return g;
     })(),
-    pillarCap: (() => {
-      const g = new THREE.CylinderGeometry(0.76, 0.74, 0.2, 8);
-      g.rotateY(Math.PI / 8);
-      return g;
+    pillarCapMerlons: (() => {
+      const baseCap = new THREE.BoxGeometry(1.52, 0.14, 1.52);
+      baseCap.translate(0, 1.25, 0);
+      const parts: THREE.BufferGeometry[] = [baseCap];
+      for (const sx of [-0.54, 0.54]) {
+        for (const sz of [-0.54, 0.54]) {
+          const merlon = new THREE.BoxGeometry(0.38, 0.09, 0.38);
+          merlon.translate(sx, 1.355, sz);
+          parts.push(merlon);
+        }
+      }
+      const merged = mergeSimpleGeometries(parts);
+      parts.forEach((p) => p.dispose());
+      return merged;
     })(),
-    pillarMedallion: (() => {
-      const g = new THREE.CylinderGeometry(0.4, 0.4, 0.04, 8);
-      g.rotateY(Math.PI / 8);
-      return g;
-    })(),
-    bridgeWallUnit: new THREE.BoxGeometry(0.68, 0.98, 1.0),
-    bridgeCapUnit: new THREE.BoxGeometry(0.78, 0.14, 1.0),
-    keystoneBody: new THREE.BoxGeometry(0.74, 1.02, 0.14),
-    keystoneCap: new THREE.BoxGeometry(0.84, 0.16, 0.18),
-    keepPlinth: (() => {
-      const g = new THREE.CylinderGeometry(0.78, 0.86, 0.22, 8);
-      g.rotateY(Math.PI / 8);
-      return g;
+    pillarEmblem: new THREE.BoxGeometry(0.68, 0.06, 0.68),
+    bridgeWallUnit: new THREE.BoxGeometry(0.72, 0.98, 1.0),
+    bridgeCapUnit: new THREE.BoxGeometry(0.82, 0.14, 1.0),
+    keystoneBody: new THREE.BoxGeometry(0.78, 1.02, 0.16),
+    keystoneCap: new THREE.BoxGeometry(0.88, 0.16, 0.2),
+
+    // 2. Pre-Placed Crimson Keep (`obstacle`): Buttressed Cruciform Basalt-Skirted Bastion (`h = 1.82m`)
+    keepBasaltSkirt: (() => {
+      const base = new THREE.CylinderGeometry(0.86, 0.96, 0.28, 8);
+      base.rotateY(Math.PI / 8);
+      base.translate(0, 0.14, 0);
+      const spurX = new THREE.BoxGeometry(1.82, 0.54, 0.52);
+      spurX.translate(0, 0.27, 0);
+      const spurZ = new THREE.BoxGeometry(0.52, 0.54, 1.82);
+      spurZ.translate(0, 0.27, 0);
+      const merged = mergeSimpleGeometries([base, spurX, spurZ]);
+      base.dispose();
+      spurX.dispose();
+      spurZ.dispose();
+      return merged;
     })(),
     keepShaft: (() => {
-      const g = new THREE.CylinderGeometry(0.7, 0.75, 0.96, 8);
+      const g = new THREE.CylinderGeometry(0.72, 0.78, 1.04, 8);
       g.rotateY(Math.PI / 8);
       return g;
     })(),
     keepCornice: (() => {
-      const g = new THREE.CylinderGeometry(0.78, 0.73, 0.16, 8);
+      const g = new THREE.CylinderGeometry(0.82, 0.76, 0.16, 8);
       g.rotateY(Math.PI / 8);
       return g;
     })(),
     keepPitchedCap: (() => {
-      const g = new THREE.CylinderGeometry(0.24, 0.76, 0.18, 8);
+      const g = new THREE.CylinderGeometry(0.32, 0.8, 0.28, 8);
       g.rotateY(Math.PI / 8);
       return g;
     })(),
-    keepLantern: (() => {
-      const g = new THREE.CylinderGeometry(0.16, 0.13, 0.16, 8);
+    keepBrazierBowl: (() => {
+      const g = new THREE.CylinderGeometry(0.32, 0.2, 0.12, 8);
       g.rotateY(Math.PI / 8);
       return g;
     })(),
-    spirePlinth: (() => {
-      const g = new THREE.CylinderGeometry(0.84, 0.92, 0.24, 8);
-      g.rotateY(Math.PI / 8);
-      return g;
-    })(),
-    spirePedestal: (() => {
-      const g = new THREE.CylinderGeometry(0.72, 0.8, 0.76, 8);
-      g.rotateY(Math.PI / 8);
-      return g;
-    })(),
-    spireCollar: (() => {
-      const g = new THREE.CylinderGeometry(0.78, 0.74, 0.16, 8);
-      g.rotateY(Math.PI / 8);
-      return g;
-    })(),
-    spireCollarRim: (() => {
-      const g = new THREE.CylinderGeometry(0.83, 0.85, 0.06, 8);
-      g.rotateY(Math.PI / 8);
-      return g;
-    })(),
-    spirePip: (() => {
-      const g = new THREE.OctahedronGeometry(0.14, 0);
-      g.scale(1, 0.55, 1);
+    keepBrazierFlame: (() => {
+      const g = new THREE.OctahedronGeometry(0.26, 0);
+      g.scale(1.0, 1.15, 1.0);
       g.computeVertexNormals();
       return g;
     })(),
+
+    // 3. Freestanding Dark-Slate Circular Elemental Spires
+    spirePlinth: new THREE.CylinderGeometry(0.86, 0.96, 0.26, 12),
+    spirePedestal: new THREE.CylinderGeometry(0.72, 0.82, 0.72, 12),
+    spireCollar: new THREE.CylinderGeometry(0.8, 0.75, 0.16, 12),
+    spireCollarRim: new THREE.CylinderGeometry(0.85, 0.87, 0.07, 12),
+    spirePipBezel: (() => {
+      const g = new THREE.OctahedronGeometry(0.2, 0);
+      g.scale(1.05, 0.42, 1.05);
+      g.computeVertexNormals();
+      return g;
+    })(),
+    spirePipGem: (() => {
+      const g = new THREE.OctahedronGeometry(0.155, 0);
+      g.scale(1.0, 0.62, 1.0);
+      g.computeVertexNormals();
+      return g;
+    })(),
+    spireGroundArc: (() => {
+      const g = new THREE.RingGeometry(
+        1.02,
+        1.15,
+        10,
+        1,
+        -Math.PI * 0.5 - 0.25,
+        0.5
+      );
+      g.rotateX(-Math.PI / 2);
+      return g;
+    })(),
+    stormObeliskBody: (() => {
+      const g = new THREE.CylinderGeometry(0.28, 0.52, 0.96, 6);
+      return g;
+    })(),
+    stormProng: new THREE.BoxGeometry(0.08, 0.56, 0.1),
+    stormPrism: (() => {
+      const g = new THREE.OctahedronGeometry(0.26, 0);
+      g.scale(0.92, 1.38, 0.92);
+      g.computeVertexNormals();
+      return g;
+    })(),
+    frostCentralShaft: new THREE.CylinderGeometry(0.18, 0.42, 1.28, 6),
+    frostTip: new THREE.ConeGeometry(0.18, 0.36, 6),
+    frostStarBlade: (() => {
+      const g = new THREE.ConeGeometry(0.18, 0.78, 4);
+      g.scale(0.68, 1.0, 1.28);
+      g.computeVertexNormals();
+      return g;
+    })(),
+    chronoHorn: new THREE.CylinderGeometry(0.08, 0.15, 1.12, 8),
+    chronoHalo: (() => {
+      const g = new THREE.TorusGeometry(0.5, 0.036, 8, 24);
+      g.rotateX(Math.PI / 2);
+      return g;
+    })(),
+    chronoOrb: new THREE.SphereGeometry(0.34, 20, 16),
+    spireCooldownPlane: (() => {
+      const g = new THREE.PlaneGeometry(2.28, 2.28);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    })(),
+    unitCirclePlane: (() => {
+      const g = new THREE.PlaneGeometry(2.0, 2.0);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    })(),
+
+    // Plateau Corner Bastion & Miniature Cypress Clusters (2 draw calls per cluster!)
+    plateauCornerBastion: (() => {
+      const g = new THREE.CylinderGeometry(0.88, 1.02, 1.32, 8);
+      g.rotateY(Math.PI / 8);
+      return g;
+    })(),
+    cypressTrunks: (() => {
+      const t1 = new THREE.CylinderGeometry(0.06, 0.09, 0.28, 6);
+      t1.translate(0, 0.14, 0);
+      const t2 = new THREE.CylinderGeometry(0.05, 0.08, 0.24, 6);
+      t2.translate(0.38, 0.12, 0.24);
+      const merged = mergeSimpleGeometries([t1, t2]);
+      t1.dispose();
+      t2.dispose();
+      return merged;
+    })(),
+    cypressCones: (() => {
+      const c1 = new THREE.ConeGeometry(0.34, 1.12, 7);
+      c1.translate(0, 0.8, 0);
+      const c2 = new THREE.ConeGeometry(0.26, 0.84, 7);
+      c2.translate(0.38, 0.64, 0.24);
+      const merged = mergeSimpleGeometries([c1, c2]);
+      c1.dispose();
+      c2.dispose();
+      return merged;
+    })(),
+
+    // Gates, Clap Pips, Runner & Shockwave Shared Geometries
+    gatePier: (() => {
+      const g = new THREE.CylinderGeometry(0.38, 0.44, 1.62, 8);
+      g.rotateY(Math.PI / 8);
+      return g;
+    })(),
+    gatePierCap: (() => {
+      const g = new THREE.CylinderGeometry(0.46, 0.41, 0.16, 8);
+      g.rotateY(Math.PI / 8);
+      return g;
+    })(),
+    gateChevron: (() => {
+      const g = new THREE.ConeGeometry(0.42, 0.56, 3);
+      g.rotateX(Math.PI / 2);
+      g.scale(1.1, 0.12, 0.85);
+      g.computeVertexNormals();
+      return g;
+    })(),
+    goalSealRing: (() => {
+      const g = new THREE.RingGeometry(0.42, 0.68, 24);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    })(),
+    clapPipHalo: (() => {
+      const g = new THREE.RingGeometry(0.16, 0.23, 16);
+      g.rotateX(-Math.PI / 2);
+      return g;
+    })(),
     clapPipOuter: (() => {
-      const g = new THREE.CircleGeometry(0.14, 16);
+      const g = new THREE.CircleGeometry(0.145, 16);
       g.rotateX(-Math.PI / 2);
       return g;
     })(),
     clapPipInner: (() => {
-      const g = new THREE.CircleGeometry(0.085, 16);
+      const g = new THREE.CircleGeometry(0.092, 16);
       g.rotateX(-Math.PI / 2);
       return g;
     })(),
@@ -922,156 +1647,356 @@ export class Arena3DRenderer {
       g.rotateX(-Math.PI / 2);
       return g;
     })(),
+    runnerTorso: new THREE.ConeGeometry(0.35, 0.82, 8),
+    runnerCollar: (() => {
+      const g = new THREE.CylinderGeometry(0.28, 0.34, 0.09, 8);
+      return g;
+    })(),
+    runnerHelm: new THREE.DodecahedronGeometry(0.23, 0),
+    runnerVisor: new THREE.BoxGeometry(0.21, 0.08, 0.1),
+    runnerArm: new THREE.BoxGeometry(0.12, 0.38, 0.12),
+    runnerLeg: new THREE.BoxGeometry(0.13, 0.36, 0.15),
+    runnerPauldron: new THREE.DodecahedronGeometry(0.19, 0),
+    runnerWing: new THREE.BoxGeometry(0.07, 0.54, 0.38),
+    runnerHoodPeak: new THREE.ConeGeometry(0.17, 0.25, 6),
+    runnerFeather: new THREE.ConeGeometry(0.065, 0.34, 5),
+    runnerPlume: new THREE.ConeGeometry(0.12, 0.42, 6),
+    runnerShieldPlate: new THREE.BoxGeometry(0.56, 0.62, 0.09),
+    runnerShieldRim: new THREE.BoxGeometry(0.6, 0.11, 0.11),
+    runnerShieldBoss: (() => {
+      const g = new THREE.CylinderGeometry(0.12, 0.14, 0.08, 8);
+      g.rotateX(Math.PI / 2);
+      return g;
+    })(),
+    runnerWeaponShaft: new THREE.CylinderGeometry(0.032, 0.038, 0.9, 6),
+    runnerSpearTip: new THREE.ConeGeometry(0.07, 0.26, 6),
+    runnerPennantPole: new THREE.CylinderGeometry(0.024, 0.028, 1.18, 6),
+    runnerPennantFlag: new THREE.BoxGeometry(0.03, 0.28, 0.44),
+    runnerMaceHead: new THREE.DodecahedronGeometry(0.18, 0),
+    runnerOrbGem: new THREE.OctahedronGeometry(0.14, 0),
   };
 
-  // Singleton Matte/Satin Stylized Materials (*Townscaper* / *Bad North* palette)
+  // Protected Singleton Materials
   private readonly aoDiscMat = new THREE.MeshBasicMaterial({
     map: this.contactShadowTex,
     transparent: true,
     depthWrite: false,
+    opacity: 0.92,
   });
   private readonly plinthSandstoneMat = new THREE.MeshStandardMaterial({
-    color: '#ddd5c7',
+    color: '#dcd4c5',
     roughness: 0.84,
     metalness: 0.02,
   });
   private readonly ivoryShaftMat = new THREE.MeshStandardMaterial({
-    color: '#f5f0e6',
-    roughness: 0.78,
+    color: '#f6f2e9',
+    roughness: 0.76,
     metalness: 0.02,
   });
   private readonly bridgeWallMat = new THREE.MeshStandardMaterial({
-    color: '#efe9de',
+    color: '#efe9dd',
     roughness: 0.78,
     metalness: 0.02,
   });
   private readonly creamCapMat = new THREE.MeshStandardMaterial({
     color: '#fcfaf5',
-    roughness: 0.72,
+    roughness: 0.7,
     metalness: 0.02,
   });
-  private readonly playerMedallionMats = new Map<
-    string,
-    THREE.MeshStandardMaterial
-  >();
+  private readonly playerMedallionMats = new Map<string, THREE.MeshStandardMaterial>();
+  private readonly playerTrimMats = new Map<string, THREE.MeshStandardMaterial>();
 
-  // Crimson Keep Singleton Materials
-  private readonly crimsonKeepWallMat = new THREE.MeshStandardMaterial({
-    color: '#b84a39',
-    roughness: 0.78,
-    metalness: 0.04,
+  // Crimson Keep Materials (Dark Basalt Skirt + Deep Crimson Masonry + Live Gold Brazier)
+  private readonly darkBasaltMat = new THREE.MeshStandardMaterial({
+    color: '#3f3f46',
+    roughness: 0.82,
+    metalness: 0.08,
   });
-  private readonly crimsonKeepRoofMat = new THREE.MeshStandardMaterial({
-    color: '#9f3a2b',
+  private readonly crimsonKeepWallMat = new THREE.MeshStandardMaterial({
+    color: '#a8382b',
     roughness: 0.76,
     metalness: 0.04,
   });
+  private readonly crimsonKeepRoofMat = new THREE.MeshStandardMaterial({
+    color: '#88291f',
+    roughness: 0.74,
+    metalness: 0.05,
+  });
   private readonly creamStoneTrimMat = new THREE.MeshStandardMaterial({
-    color: '#f5f0e6',
+    color: '#f3ede1',
     roughness: 0.74,
     metalness: 0.03,
   });
   private readonly goldBridgeTrimMat = new THREE.MeshStandardMaterial({
     color: '#fbbf24',
     emissive: '#d97706',
-    emissiveIntensity: 0.26,
-    roughness: 0.46,
+    emissiveIntensity: 0.32,
+    roughness: 0.4,
+    metalness: 0.24,
+  });
+  private readonly keepBrazierDormantMat = new THREE.MeshStandardMaterial({
+    color: '#64748b',
+    emissive: '#7f1d1d',
+    emissiveIntensity: 0.12,
+    roughness: 0.65,
     metalness: 0.18,
   });
-  private readonly keepLanternUnlinkedMat = new THREE.MeshStandardMaterial({
-    color: '#c96a55',
-    emissive: '#7f1d1d',
-    emissiveIntensity: 0.1,
-    roughness: 0.68,
-    metalness: 0.08,
-  });
-  private readonly keepLanternLinkedMat = new THREE.MeshStandardMaterial({
-    color: '#fbbf24',
+  private readonly keepBrazierLinkedMat = new THREE.MeshStandardMaterial({
+    color: '#fde047',
     emissive: '#f59e0b',
-    emissiveIntensity: 0.72,
-    roughness: 0.32,
+    emissiveIntensity: 0.88,
+    roughness: 0.24,
     metalness: 0.22,
   });
 
-  // Spire Collar Rim, Pip & Island Basin Materials
+  // Freestanding Elemental Spire Materials (Zero Ivory Camouflage!)
+  private readonly spireSlatePlinthMat = new THREE.MeshStandardMaterial({
+    color: '#334155',
+    roughness: 0.78,
+    metalness: 0.12,
+  });
+  private readonly spireSlatePedestalMat = new THREE.MeshStandardMaterial({
+    color: '#475569',
+    roughness: 0.72,
+    metalness: 0.14,
+  });
   private readonly collarRimInactiveMat = new THREE.MeshStandardMaterial({
-    color: '#e5dec9',
-    roughness: 0.76,
-    metalness: 0.04,
+    color: '#64748b',
+    roughness: 0.68,
+    metalness: 0.16,
   });
   private readonly collarRimGoldMat = new THREE.MeshStandardMaterial({
     color: '#fbbf24',
     emissive: '#f59e0b',
-    emissiveIntensity: 0.35,
-    roughness: 0.36,
-    metalness: 0.28,
+    emissiveIntensity: 0.42,
+    roughness: 0.32,
+    metalness: 0.3,
+  });
+  private readonly pipBezelDarkMat = new THREE.MeshStandardMaterial({
+    color: '#1e293b',
+    roughness: 0.75,
+    metalness: 0.2,
   });
   private readonly pipInactiveMat = new THREE.MeshStandardMaterial({
-    color: '#cfc7b8',
-    roughness: 0.82,
-    metalness: 0.04,
+    color: '#64748b',
+    roughness: 0.75,
+    metalness: 0.12,
   });
   private readonly pipActiveGoldMat = new THREE.MeshStandardMaterial({
-    color: '#fbbf24',
+    color: '#fde047',
     emissive: '#f59e0b',
-    emissiveIntensity: 0.55,
-    roughness: 0.3,
-    metalness: 0.35,
+    emissiveIntensity: 0.75,
+    roughness: 0.25,
+    metalness: 0.32,
   });
-  private readonly cliffTalusMat = new THREE.MeshStandardMaterial({
-    color: '#cfc6b6',
-    roughness: 0.86,
-    metalness: 0.02,
-  });
-  private readonly cliffLimestoneMat = new THREE.MeshStandardMaterial({
-    color: '#e2dbd0',
-    roughness: 0.82,
-    metalness: 0.02,
-  });
-  private readonly cliffMeadowRimMat = new THREE.MeshStandardMaterial({
-    color: '#76b957',
-    roughness: 0.84,
-    metalness: 0.01,
-  });
-  private readonly cypressTrunkMat = new THREE.MeshStandardMaterial({
-    color: '#7c583c',
-    roughness: 0.86,
-    metalness: 0.02,
-  });
-  private readonly cypressFoliageMats = [
-    new THREE.MeshStandardMaterial({ color: '#4d8c42', roughness: 0.82 }),
-    new THREE.MeshStandardMaterial({ color: '#5b9e4d', roughness: 0.8 }),
-  ];
-  private readonly clapPipCreamMat = new THREE.MeshBasicMaterial({
-    color: '#fefce8',
+  private readonly groundArcInactiveMat = new THREE.MeshBasicMaterial({
+    color: '#334155',
     transparent: true,
-    opacity: 0.85,
+    opacity: 0.32,
     depthWrite: false,
   });
-  private readonly clapPipGoldMat = new THREE.MeshBasicMaterial({
-    color: '#f59e0b',
+  private readonly groundArcGoldMat = new THREE.MeshBasicMaterial({
+    color: '#fbbf24',
     transparent: true,
     opacity: 0.92,
     depthWrite: false,
   });
-  private readonly clapPipGainMat = new THREE.MeshBasicMaterial({
+  private readonly stormBodyMat = new THREE.MeshStandardMaterial({
+    color: '#3b4252',
+    roughness: 0.62,
+    metalness: 0.28,
+  });
+  private readonly stormBrassMat = new THREE.MeshStandardMaterial({
+    color: '#f59e0b',
+    emissive: '#d97706',
+    emissiveIntensity: 0.34,
+    roughness: 0.3,
+    metalness: 0.56,
+  });
+  private readonly stormPrismMat = new THREE.MeshStandardMaterial({
+    color: '#fef08a',
+    emissive: '#f59e0b',
+    emissiveIntensity: 0.68,
+    roughness: 0.2,
+    metalness: 0.2,
+  });
+  private readonly frostMainMat = new THREE.MeshStandardMaterial({
+    color: '#38bdf8',
+    emissive: '#0284c7',
+    emissiveIntensity: 0.34,
+    roughness: 0.22,
+    metalness: 0.16,
+  });
+  private readonly frostBladeMat = new THREE.MeshStandardMaterial({
+    color: '#bae6fd',
+    emissive: '#38bdf8',
+    emissiveIntensity: 0.24,
+    roughness: 0.26,
+    metalness: 0.12,
+  });
+  private readonly chronoHornMat = new THREE.MeshStandardMaterial({
+    color: '#e2d9f3',
+    roughness: 0.58,
+    metalness: 0.14,
+  });
+  private readonly chronoOrbMat = new THREE.MeshStandardMaterial({
+    color: '#d8b4fe',
+    emissive: '#a855f7',
+    emissiveIntensity: 0.58,
+    roughness: 0.2,
+    metalness: 0.18,
+  });
+
+  // Plateau, Gate, Cypress, Fog Veil & Clap Marker Materials
+  private readonly plateauCurbMat = new THREE.MeshStandardMaterial({
+    color: '#e8e0d2',
+    roughness: 0.78,
+    metalness: 0.02,
+  });
+  private readonly plateauShoulderTurfMat = new THREE.MeshStandardMaterial({
+    color: '#61ab49',
+    roughness: 0.88,
+    metalness: 0.01,
+  });
+  private readonly cliffLimestoneMat = new THREE.MeshStandardMaterial({
+    color: '#ded6c7',
+    roughness: 0.82,
+    metalness: 0.02,
+  });
+  private readonly cliffTalusMat = new THREE.MeshStandardMaterial({
+    color: '#cabfa9',
+    roughness: 0.88,
+    metalness: 0.02,
+  });
+  private readonly cypressTrunkMat = new THREE.MeshStandardMaterial({
+    color: '#78553a',
+    roughness: 0.86,
+    metalness: 0.02,
+  });
+  private readonly cypressFoliageMat = new THREE.MeshStandardMaterial({
+    color: '#4e8f42',
+    roughness: 0.82,
+    metalness: 0.01,
+  });
+  private readonly northGateRoofMat = new THREE.MeshStandardMaterial({
+    color: '#1e3a5f',
+    roughness: 0.68,
+    metalness: 0.12,
+  });
+  private readonly spawnAzureMat = new THREE.MeshBasicMaterial({
+    color: '#38bdf8',
+  });
+  private readonly southShrineFlameMat = new THREE.MeshStandardMaterial({
+    color: '#fb7185',
+    emissive: '#f43f5e',
+    emissiveIntensity: 0.52,
+    roughness: 0.3,
+  });
+  private readonly exitCoralMat = new THREE.MeshBasicMaterial({
+    color: '#fb7185',
+  });
+  private readonly fogVeilMat = new THREE.MeshBasicMaterial({
+    color: '#e6eff6',
+    transparent: true,
+    opacity: 0.72,
+    depthWrite: false,
+  });
+  private readonly clapPipRimMat = new THREE.MeshBasicMaterial({
+    color: '#1e293b',
+    transparent: true,
+    opacity: 0.86,
+    depthWrite: false,
+  });
+  private readonly clapPipStormMat = new THREE.MeshBasicMaterial({
+    color: '#f59e0b',
+    transparent: true,
+    opacity: 0.95,
+    depthWrite: false,
+  });
+  private readonly clapPipFrostMat = new THREE.MeshBasicMaterial({
+    color: '#38bdf8',
+    transparent: true,
+    opacity: 0.95,
+    depthWrite: false,
+  });
+  private readonly clapPipChronoMat = new THREE.MeshBasicMaterial({
+    color: '#c084fc',
+    transparent: true,
+    opacity: 0.95,
+    depthWrite: false,
+  });
+  private readonly clapPipGainHaloMat = new THREE.MeshBasicMaterial({
     color: '#22c55e',
     transparent: true,
-    opacity: 0.94,
+    opacity: 0.92,
     depthWrite: false,
   });
 
-  private _activeTool: 'BLOCK' | 'SELL' = 'BLOCK';
-  public get activeTool(): 'BLOCK' | 'SELL' {
+  // Shared Runner Materials (Zero per-reroll leaks)
+  private readonly runnerCollarIvoryMat = new THREE.MeshStandardMaterial({
+    color: '#fefce8',
+    roughness: 0.55,
+    metalness: 0.08,
+  });
+  private readonly runnerSteelBrightMat = new THREE.MeshStandardMaterial({
+    color: '#cbd5e1',
+    roughness: 0.32,
+    metalness: 0.56,
+  });
+  private readonly runnerSteelDarkMat = new THREE.MeshStandardMaterial({
+    color: '#334155',
+    roughness: 0.42,
+    metalness: 0.46,
+  });
+  private readonly runnerLegMat = new THREE.MeshStandardMaterial({
+    color: '#334155',
+    roughness: 0.65,
+  });
+  private readonly runnerGoldAccentMat = new THREE.MeshStandardMaterial({
+    color: '#fbbf24',
+    emissive: '#d97706',
+    emissiveIntensity: 0.32,
+    roughness: 0.38,
+    metalness: 0.32,
+  });
+
+  // ==========================================================================
+  // PUBLIC CONTRACT PROPERTIES & CALLBACKS (`tech_contracts.md §2.1`)
+  // ==========================================================================
+
+  private _activeTool: ActiveBuildTool = 'BLOCK';
+  public get activeTool(): ActiveBuildTool {
     return this._activeTool;
   }
-  public set activeTool(val: 'BLOCK' | 'SELL') {
+  public set activeTool(val: ActiveBuildTool) {
     if (this._activeTool !== val) {
       this._activeTool = val;
-      if (this.pendingTouchCell || this.pendingTouchTowerId) {
-        this.doClearTouchPreview();
+      this.cachedHoverPreview = null;
+      if (val === 'PAN' || this.pendingTouchCell || this.pendingTouchTowerId) {
+        this.cancelTouchGhost();
       } else {
-        this.updateBuildHover();
+        this.updateBuildHover(true);
+      }
+    }
+  }
+
+  private _modalOpen = false;
+  public get modalOpen(): boolean {
+    return this._modalOpen;
+  }
+  public set modalOpen(val: boolean) {
+    if (this._modalOpen !== val) {
+      this._modalOpen = val;
+      if (val) {
+        this.keysDown.clear();
+        this.isLeftMouseDown = false;
+        this.isRightMouseDown = false;
+        this.isMiddleOrAltDragging = false;
+        this.isShiftPainting = false;
+        this.isSweepSelling = false;
+        if (!this.pendingTouchCell && !this.pendingTouchTowerId) {
+          this.hideDesktopHoverVisuals();
+        }
       }
     }
   }
@@ -1079,33 +2004,96 @@ export class Arena3DRenderer {
   public localPlayerId: string | null = null;
   public focusedPlayerId: string | null = null;
   public arenaOverviewMode = false;
-  private currentRoomState: RoomState | null = null;
-  private lastLayoutSignature = '';
-  private cachedBaseEval: MazeEvalResult | null = null;
 
   public onPlaceTower?: (x: number, y: number) => void;
-  public onSellTower?: (towerId: string) => void;
+  public onSellTower?: (towerId: string, x?: number, y?: number) => void;
   public onHoverStatusChange?: (info: HoverStatusInfo) => void;
+  public onTouchSnapChange?: (cell: GridPoint, valid: boolean) => void;
   public dismissTransientUI?: () => boolean;
   public onFocusChange?: () => void;
 
-  private labelElements = new Map<string, HTMLElement>();
-  private runnerLabels = new Map<string, HTMLElement>();
+  private currentRoomState: RoomState | null = null;
+  private lastRoomPhase: string = '';
+  private lastLayoutSignature = '';
+  private lastLocalEvalSig = '';
+  private cachedBaseEval: MazeEvalResult | null = null;
+  private cachedLocalCircuitry: CitadelCircuitryResult | null = null;
+  private latestSimStates = new Map<string, RunnerSimState>();
+
+  private islandBadges = new Map<string, IslandBadgeRefs>();
+  private runnerBadges = new Map<string, RunnerBadgeRefs>();
 
   constructor(container: HTMLElement, labelLayer: HTMLElement) {
     this.container = container;
     this.labelLayer = labelLayer;
 
-    // 1. Sunlit Limestone & Sage Meadow Sky Mist
+    // Register protected geometries & materials so disposeSubtree never touches singletons
+    for (const geo of Object.values(this.sharedGeos)) {
+      this.protectedGeos.add(geo);
+    }
+    this.registerProtectedMaterials([
+      this.aoDiscMat,
+      this.plinthSandstoneMat,
+      this.ivoryShaftMat,
+      this.bridgeWallMat,
+      this.creamCapMat,
+      this.darkBasaltMat,
+      this.crimsonKeepWallMat,
+      this.crimsonKeepRoofMat,
+      this.creamStoneTrimMat,
+      this.goldBridgeTrimMat,
+      this.keepBrazierDormantMat,
+      this.keepBrazierLinkedMat,
+      this.spireSlatePlinthMat,
+      this.spireSlatePedestalMat,
+      this.collarRimInactiveMat,
+      this.collarRimGoldMat,
+      this.pipBezelDarkMat,
+      this.pipInactiveMat,
+      this.pipActiveGoldMat,
+      this.groundArcInactiveMat,
+      this.groundArcGoldMat,
+      this.stormBodyMat,
+      this.stormBrassMat,
+      this.stormPrismMat,
+      this.frostMainMat,
+      this.frostBladeMat,
+      this.chronoHornMat,
+      this.chronoOrbMat,
+      this.plateauCurbMat,
+      this.plateauShoulderTurfMat,
+      this.cliffLimestoneMat,
+      this.cliffTalusMat,
+      this.cypressTrunkMat,
+      this.cypressFoliageMat,
+      this.northGateRoofMat,
+      this.spawnAzureMat,
+      this.southShrineFlameMat,
+      this.exitCoralMat,
+      this.fogVeilMat,
+      this.clapPipRimMat,
+      this.clapPipStormMat,
+      this.clapPipFrostMat,
+      this.clapPipChronoMat,
+      this.clapPipGainHaloMat,
+      this.runnerCollarIvoryMat,
+      this.runnerSteelBrightMat,
+      this.runnerSteelDarkMat,
+      this.runnerLegMat,
+      this.runnerGoldAccentMat,
+    ]);
+
+    // 1. Airy Mediterranean Sky Mist + Distance-Started Linear Horizon Fog (0% haze on islands!)
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color('#cde8f6');
-    this.scene.fog = new THREE.FogExp2('#cde8f6', 0.0018);
+    this.scene.background = new THREE.Color('#d4ebf7');
+    this.scene.fog = new THREE.Fog('#d4ebf7', 150, 340);
 
     const initW = this.container.clientWidth || window.innerWidth;
     const initH = this.container.clientHeight || window.innerHeight;
-    this.camera = new THREE.PerspectiveCamera(46, initW / initH, 0.5, 360);
+    // Telephoto 35° Diorama Lens (cuts edge tower splay & mobile parallax by ~26%!)
+    this.camera = new THREE.PerspectiveCamera(35, initW / initH, 1.0, 440);
 
-    // Hardware MSAA direct WebGL render pipeline + r170 sRGB Color Management
+    // Khronos PBR NeutralToneMapping + Hardware MSAA
     this.renderer = new THREE.WebGLRenderer({
       antialias: true,
       powerPreference: 'high-performance',
@@ -1115,16 +2103,30 @@ export class Arena3DRenderer {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.04;
+    this.renderer.toneMapping = THREE.NeutralToneMapping;
+    this.renderer.toneMappingExposure = 1.02;
     this.renderer.domElement.style.touchAction = 'none';
     this.container.appendChild(this.renderer.domElement);
 
+    this.updateViewportBounds();
     this.setupLightingAndEnvironment();
 
-    // Clean Semi-Transparent Miniature Limestone Pillar + Bridge Ghost (renderOrder = 10)
+    // 2. Precision 2x2 Reticle + Square Ivory Turret Ghost + Persistent Preview Shaders
     this.ghostGroup = new THREE.Group();
     this.ghostGroup.visible = false;
+
+    this.reticlePadMat = createReticlePadShader();
+    this.protectedMats.add(this.reticlePadMat);
+    this.reticlePadMesh = new THREE.Mesh(
+      this.sharedGeos.reticleQuad,
+      this.reticlePadMat
+    );
+    this.reticlePadMesh.position.y = 0.036;
+    this.reticlePadMesh.renderOrder = 9;
+    this.ghostGroup.add(this.reticlePadMesh);
+
+    this.ghostTurretGroup = new THREE.Group();
+    this.ghostGroup.add(this.ghostTurretGroup);
 
     this.ghostConnGroup = new THREE.Group();
     this.ghostGroup.add(this.ghostConnGroup);
@@ -1147,6 +2149,30 @@ export class Arena3DRenderer {
       opacity: 0.64,
       depthWrite: false,
     });
+    this.ghostGoldBodyMat = new THREE.MeshStandardMaterial({
+      color: '#fde047',
+      emissive: '#f59e0b',
+      emissiveIntensity: 0.36,
+      roughness: 0.45,
+      transparent: true,
+      opacity: 0.68,
+      depthWrite: false,
+    });
+    this.ghostGoldCapMat = new THREE.MeshStandardMaterial({
+      color: '#fef9c3',
+      emissive: '#fbbf24',
+      emissiveIntensity: 0.42,
+      roughness: 0.38,
+      transparent: true,
+      opacity: 0.76,
+      depthWrite: false,
+    });
+    this.registerProtectedMaterials([
+      this.ghostBodyMat,
+      this.ghostCapMat,
+      this.ghostGoldBodyMat,
+      this.ghostGoldCapMat,
+    ]);
 
     const ghostPlinth = new THREE.Mesh(
       this.sharedGeos.pillarPlinth,
@@ -1154,31 +2180,39 @@ export class Arena3DRenderer {
     );
     ghostPlinth.position.y = 0.11;
     ghostPlinth.renderOrder = 10;
-    this.ghostGroup.add(ghostPlinth);
+    this.ghostTurretGroup.add(ghostPlinth);
 
     const ghostShaft = new THREE.Mesh(
       this.sharedGeos.pillarShaft,
       this.ghostBodyMat
     );
-    ghostShaft.position.y = 0.73;
+    ghostShaft.position.y = 0.7;
     ghostShaft.renderOrder = 10;
-    this.ghostGroup.add(ghostShaft);
+    this.ghostTurretGroup.add(ghostShaft);
 
     const ghostCap = new THREE.Mesh(
-      this.sharedGeos.pillarCap,
+      this.sharedGeos.pillarCapMerlons,
       this.ghostCapMat
     );
-    ghostCap.position.y = 1.34;
     ghostCap.renderOrder = 10;
-    this.ghostGroup.add(ghostCap);
+    this.ghostTurretGroup.add(ghostCap);
 
     this.scene.add(this.ghostGroup);
 
-    // Apply initial aspect-adaptive camera framing for 20x26 island
-    const initFrame = this.computeIdealFraming(24.8, 32.0);
+    // Persistent Preview Path Shader & Preview Conduit Layer (zero per-hover shader leaks!)
+    this.previewPathMat = createPathRibbonShader('#fef08a', 0.84);
+    this.previewConduitMat = createLeyConduitShader(true);
+    this.registerProtectedMaterials([this.previewPathMat, this.previewConduitMat]);
+
+    this.previewConduitGroup = new THREE.Group();
+    this.scene.add(this.previewConduitGroup);
+
+    // Initial aspect-adaptive telephoto framing (`gw + 2.0, gh + 3.4`)
+    const initFrame = this.computeIdealFraming(22.0, 29.4);
+    this.camBasePolar = initFrame.polar;
     this.camPolar = initFrame.polar;
     this.camGoalPolar = initFrame.polar;
-    this.camRadius = Math.max(14, Math.min(96, initFrame.radius));
+    this.camRadius = this.clampCameraRadius(initFrame.radius);
     this.camGoalRadius = this.camRadius;
     this.camTarget.set(10, 0, 13 + initFrame.zBias);
     this.camGoalTarget.copy(this.camTarget);
@@ -1186,9 +2220,51 @@ export class Arena3DRenderer {
     this.bindEvents();
   }
 
+  private registerProtectedMaterials(mats: THREE.Material[]) {
+    for (const m of mats) this.protectedMats.add(m);
+  }
+
+  private disposeSubtree(root: THREE.Object3D) {
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.geometry && !this.protectedGeos.has(mesh.geometry)) {
+        mesh.geometry.dispose();
+      }
+      if (mesh.material) {
+        if (Array.isArray(mesh.material)) {
+          for (const mat of mesh.material) {
+            if (!this.protectedMats.has(mat)) mat.dispose();
+          }
+        } else if (!this.protectedMats.has(mesh.material)) {
+          mesh.material.dispose();
+        }
+      }
+    });
+  }
+
+  private isCoarseOrCompactDevice(): boolean {
+    const coarse =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches;
+    const minDim = Math.min(
+      window.innerWidth || 1024,
+      window.innerHeight || 768
+    );
+    return coarse || minDim < 620;
+  }
+
   private computeAdaptivePixelRatio(): number {
-    const w = window.innerWidth;
-    return Math.min(window.devicePixelRatio || 1, w < 820 ? 1.75 : 2.0);
+    const baseCap = this.isCoarseOrCompactDevice() ? 1.5 : 2.0;
+    const raw = Math.min(window.devicePixelRatio || 1, baseCap);
+    return Math.max(1.0, raw * this.dprScaleCap);
+  }
+
+  private updateViewportBounds() {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.viewportLeft = rect.left;
+    this.viewportTop = rect.top;
+    this.viewportW = Math.max(280, rect.width || window.innerWidth);
+    this.viewportH = Math.max(240, rect.height || window.innerHeight);
   }
 
   private getPlayerMedallionMaterial(
@@ -1196,58 +2272,70 @@ export class Arena3DRenderer {
   ): THREE.MeshStandardMaterial {
     let mat = this.playerMedallionMats.get(playerColor);
     if (!mat) {
-      const blended = new THREE.Color(playerColor).lerp(
-        new THREE.Color('#c8644b'),
-        0.24
-      );
+      // Un-muddied true player heraldry color (no terracotta lerp!)
       mat = new THREE.MeshStandardMaterial({
-        color: blended,
-        roughness: 0.76,
-        metalness: 0.04,
+        color: new THREE.Color(playerColor),
+        roughness: 0.62,
+        metalness: 0.06,
       });
+      this.protectedMats.add(mat);
       this.playerMedallionMats.set(playerColor, mat);
     }
     return mat;
   }
 
+  private getPlayerTrimMaterial(playerColor: string): THREE.MeshStandardMaterial {
+    let mat = this.playerTrimMats.get(playerColor);
+    if (!mat) {
+      mat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(playerColor),
+        roughness: 0.64,
+        metalness: 0.06,
+      });
+      this.protectedMats.add(mat);
+      this.playerTrimMats.set(playerColor, mat);
+    }
+    return mat;
+  }
+
   private setupLightingAndEnvironment() {
-    // Golden-Hour Sun + Sky/Meadow Hemisphere Bounce + Pastel Shadow Fill
-    const hemiLight = new THREE.HemisphereLight('#f0f9ff', '#68a852', 1.05);
+    // Calibrated r170 Daylight Rig: Warm Limestone Bounce + 58° Cross-Key Sun + Cerulean Shadow Fill
+    const hemiLight = new THREE.HemisphereLight('#eef7ff', '#c8bfa8', 1.45);
     this.scene.add(hemiLight);
 
-    this.sunLight = new THREE.DirectionalLight('#fff5e4', 1.85);
-    this.sunLight.position.set(36, 52, 41);
+    this.sunLight = new THREE.DirectionalLight('#fff7e8', 2.85);
+    this.sunLight.position.set(-28, 48, 18);
     this.sunLight.castShadow = true;
-    const shadowRes = window.innerWidth < 820 ? 1024 : 2048;
-    this.sunLight.shadow.mapSize.set(shadowRes, shadowRes);
+    this.currentShadowRes = this.isCoarseOrCompactDevice() ? 1024 : 2048;
+    this.sunLight.shadow.mapSize.set(
+      this.currentShadowRes,
+      this.currentShadowRes
+    );
     this.sunLight.shadow.camera.near = 4;
-    this.sunLight.shadow.camera.far = 155;
-    this.sunLight.shadow.bias = -0.00035;
-    this.sunLight.shadow.normalBias = 0.02;
+    this.sunLight.shadow.camera.far = 165;
+    this.sunLight.shadow.bias = -0.00025;
+    this.sunLight.shadow.normalBias = 0.018;
     this.scene.add(this.sunLight);
     this.scene.add(this.sunLight.target);
     this.updateSunShadowFrustum(true);
 
-    const fillLight = new THREE.DirectionalLight('#bae6fd', 0.35);
-    fillLight.position.set(-28, 36, -32);
+    const fillLight = new THREE.DirectionalLight('#93c5fd', 0.85);
+    fillLight.position.set(26, 34, -24);
     this.scene.add(fillLight);
 
-    // Tranquil Cerulean Sea surrounding all islands (640x640 seamless horizon)
+    // Tranquil Cerulean Sea at y = -1.42m
     this.voidSeaMat = createTranquilSeaShader();
-    const seaGeo = new THREE.PlaneGeometry(640, 640);
+    this.protectedMats.add(this.voidSeaMat);
+    const seaGeo = new THREE.PlaneGeometry(760, 760);
     seaGeo.rotateX(-Math.PI / 2);
+    this.protectedGeos.add(seaGeo);
     this.seaMesh = new THREE.Mesh(seaGeo, this.voidSeaMat);
-    this.seaMesh.position.set(10, -0.65, 13);
+    this.seaMesh.position.set(10, SEA_LEVEL_Y, 13);
     this.scene.add(this.seaMesh);
   }
 
-  /**
-   * Dynamically focuses the Sun's orthographic shadow frustum on `this.camTarget`
-   * (`d = 21` for focused island, `d = 62` for arena overview) with texel-snapping
-   * so pillar & runner shadows are 3x crisper with zero edge swimming.
-   */
   private updateSunShadowFrustum(forceProjection = false) {
-    const d = this.arenaOverviewMode ? 62 : 21;
+    const d = this.arenaOverviewMode ? 66 : 18;
     if (forceProjection || d !== this.lastShadowFrustumD) {
       this.lastShadowFrustumD = d;
       const cam = this.sunLight.shadow.camera;
@@ -1265,59 +2353,122 @@ export class Arena3DRenderer {
 
     this.sunLight.target.position.set(snapX, 0, snapZ);
     this.sunLight.target.updateMatrixWorld();
-    this.sunLight.position.set(snapX + 26, 52, snapZ + 28);
+    // 58° NW/SW cross-key raking crisp directional shadows across adjacent corridors!
+    this.sunLight.position.set(snapX - 28, 48, snapZ + 18);
   }
 
-  /**
-   * Computes aspect-adaptive camera distance & polar angle using BOTH vertical FOV
-   * and horizontal FOV (`2 * atan(tan(vFov / 2) * aspect)`) plus symmetric HUD insets
-   * (`topHudPx = w <= 980 ? 114 : 62`, `bottomHudPx = isRunPhase ? 16 : 76`) so the full
-   * 20x26 island, gates, and cliffs fit 100% cleanly on `360x800`, `390x844`, and desktop.
-   */
+  // ==========================================================================
+  // CAMERA FRAMING, SAFE HUD APERTURE & PUBLIC CONTROLS
+  // ==========================================================================
+
+  public setHudSafeInsets(topPx: number, bottomPx: number): void {
+    const clampedTop = Math.max(24, Math.min(240, topPx));
+    const clampedBottom = Math.max(8, Math.min(280, bottomPx));
+    const changed =
+      Math.abs(clampedTop - this.hudSafeTopPx) > 2 ||
+      Math.abs(clampedBottom - this.hudSafeBottomPx) > 2;
+    this.hudSafeTopPx = clampedTop;
+    this.hudSafeBottomPx = clampedBottom;
+    this.hasCustomHudInsets = true;
+
+    if (changed && this.currentRoomState && !this.isLoupeDragging) {
+      if (this.arenaOverviewMode) {
+        this.focusArenaOverview(false);
+      } else {
+        const pid = this.focusedPlayerId || this.localPlayerId;
+        if (pid) {
+          const island = this.islands.get(pid);
+          const gw = this.currentRoomState.roundConfig.gridWidth;
+          const gh = this.currentRoomState.roundConfig.gridHeight;
+          if (island) {
+            const distFromCenter = Math.hypot(
+              this.camGoalTarget.x - (island.offsetX + gw * 0.5),
+              this.camGoalTarget.z - (island.offsetZ + gh * 0.5)
+            );
+            // Smoothly recenter if player hasn't manually panned away
+            if (distFromCenter < 4.5) {
+              const frame = this.computeIdealFraming(gw + 2.0, gh + 3.4, 1.6);
+              this.camGoalTarget.z = island.offsetZ + gh * 0.5 + frame.zBias;
+              this.clampCameraTarget();
+            }
+          }
+        }
+      }
+    }
+  }
+
   private computeIdealFraming(
     spanW: number,
     spanH: number,
-    reliefH = 2.0
+    reliefH = 1.6
   ): { radius: number; polar: number; zBias: number } {
-    const w = Math.max(280, this.container.clientWidth || window.innerWidth);
-    const h = Math.max(320, this.container.clientHeight || window.innerHeight);
+    const w = Math.max(280, this.viewportW || window.innerWidth);
+    const h = Math.max(240, this.viewportH || window.innerHeight);
     const aspect = w / h;
     const isPortrait = aspect < 0.95;
-    const polar = isPortrait ? 0.36 : 0.5;
+    const polar = isPortrait ? 0.36 : 0.48;
 
     const vFovRad = THREE.MathUtils.degToRad(this.camera.fov);
     const tanHalfV = Math.tan(vFovRad * 0.5);
     const hFovRad = 2 * Math.atan(tanHalfV * aspect);
     const tanHalfH = Math.tan(hFovRad * 0.5);
 
-    // Account for perspective foreshortening at the near (+Z) edge of the island
-    const usableX = isPortrait ? 0.93 : 0.9;
+    const usableX = isPortrait ? 0.95 : 0.91;
     const nearZDepthOffset = spanH * 0.45 * Math.sin(polar);
     const distForWidth =
       (spanW * 0.5) / (usableX * tanHalfH) + nearZDepthOffset;
 
-    // Symmetric HUD inset accounting for 2-row mobile top bar vs bottom build dock
     const isRunPhase = this.currentRoomState?.phase === 'RUN';
-    const topHudPx = w <= 980 ? 114 : 62;
-    const bottomHudPx = isRunPhase ? 16 : 76;
-    const clearFracY = Math.max(0.54, (h - topHudPx - bottomHudPx - 16) / h);
-    const usableY = Math.min(isPortrait ? 0.72 : 0.82, clearFracY);
+    const topHudPx = this.hasCustomHudInsets
+      ? this.hudSafeTopPx
+      : w <= 768
+      ? 58
+      : 56;
+    const bottomHudPx = this.hasCustomHudInsets
+      ? this.hudSafeBottomPx
+      : isRunPhase
+      ? w <= 768
+        ? 62
+        : 18
+      : 82;
+
+    const clearFracY = Math.max(0.52, (h - topHudPx - bottomHudPx - 14) / h);
+    const usableY = Math.min(isPortrait ? 0.8 : 0.85, clearFracY);
 
     const projectedHalfH =
       spanH * 0.5 * Math.cos(polar) + reliefH * Math.sin(polar);
     const distForHeight = projectedHalfH / (usableY * tanHalfV);
 
     const radius = Math.max(distForWidth, distForHeight);
-    // Camera sits at +Z looking -Z: negative zBias shifts the island gently downward away from the 2-row mobile top HUD!
-    const zBias = w <= 980 ? -0.65 : 0.75;
+    const hudAsymmetryPx = (topHudPx - bottomHudPx) * 0.5;
+    const worldPerPxAtTarget = (2 * radius * tanHalfV) / h;
+    const zBias =
+      -(hudAsymmetryPx * worldPerPxAtTarget) / Math.max(0.6, Math.cos(polar));
+
     return { radius, polar, zBias };
   }
 
   private clampCameraRadius(r: number): number {
     const maxR = this.arenaOverviewMode
-      ? Math.max(96, this.camGoalRadius, 135)
-      : 96;
-    return Math.max(14, Math.min(maxR, r));
+      ? Math.max(135, this.camGoalRadius, 195)
+      : 128;
+    const minR = 16;
+    return Math.max(minR, Math.min(maxR, r));
+  }
+
+  private updateZoomCoupledPolar() {
+    if (this.arenaOverviewMode) {
+      this.camGoalPolar = this.camBasePolar;
+      return;
+    }
+    // Zoom-coupled overhead pitch assist: smoothly flatten toward 0.26 rad when zooming close (<40m)
+    const zoomFactor = THREE.MathUtils.clamp(
+      (this.camGoalRadius - 18) / 24,
+      0,
+      1
+    );
+    const closePolar = Math.min(0.26, this.camBasePolar);
+    this.camGoalPolar = closePolar + (this.camBasePolar - closePolar) * zoomFactor;
   }
 
   private clampCameraTarget() {
@@ -1342,20 +2493,17 @@ export class Arena3DRenderer {
     const oz = island ? island.offsetZ : 0;
 
     this.camGoalTarget.x = Math.max(
-      ox - 3.5,
-      Math.min(ox + gw + 3.5, this.camGoalTarget.x)
+      ox - 3.0,
+      Math.min(ox + gw + 3.0, this.camGoalTarget.x)
     );
     this.camGoalTarget.z = Math.max(
-      oz - 3.5,
-      Math.min(oz + gh + 4.5, this.camGoalTarget.z)
+      oz - 3.0,
+      Math.min(oz + gh + 4.0, this.camGoalTarget.z)
     );
   }
 
   private panCameraByScreenDelta(dxPx: number, dyPx: number) {
-    const h = Math.max(
-      320,
-      this.renderer.domElement.clientHeight || window.innerHeight
-    );
+    const h = Math.max(240, this.viewportH);
     const vFovRad = THREE.MathUtils.degToRad(this.camera.fov);
     const worldPerPx = (2 * this.camRadius * Math.tan(vFovRad * 0.5)) / h;
 
@@ -1371,54 +2519,218 @@ export class Arena3DRenderer {
     this.clampCameraTarget();
   }
 
-  /**
-   * Raycasts screen coordinates against all islands in Arena Overview mode,
-   * matching either `hitPlane` or the island's sculpted rim footprint.
-   */
+  public focusOnPlayerIsland(playerId: string, snapImmediate = false): void {
+    this.arenaOverviewMode = false;
+    this.focusedPlayerId = playerId;
+    if (
+      playerId !== this.localPlayerId &&
+      (this.pendingTouchCell || this.pendingTouchTowerId)
+    ) {
+      this.cancelTouchGhost();
+    }
+    const island = this.islands.get(playerId);
+    if (!island || !this.currentRoomState) return;
+
+    const gw = this.currentRoomState.roundConfig.gridWidth;
+    const gh = this.currentRoomState.roundConfig.gridHeight;
+    const frame = this.computeIdealFraming(gw + 2.0, gh + 3.4, 1.6);
+
+    this.camBasePolar = frame.polar;
+    this.camGoalTarget.set(
+      island.offsetX + gw / 2,
+      0,
+      island.offsetZ + gh / 2 + frame.zBias
+    );
+    this.camGoalRadius = this.clampCameraRadius(frame.radius);
+    this.camGoalPolar = frame.polar;
+    this.camGoalAzimuth = 0;
+
+    if (snapImmediate) {
+      this.camTarget.copy(this.camGoalTarget);
+      this.camPolar = this.camGoalPolar;
+      this.camRadius = this.camGoalRadius;
+      this.camAzimuth = 0;
+    }
+    this.updateSunShadowFrustum();
+  }
+
+  public focusArenaOverview(snapImmediate = false): void {
+    this.arenaOverviewMode = true;
+    if (this.pendingTouchCell || this.pendingTouchTowerId) {
+      this.cancelTouchGhost();
+    } else {
+      this.hideDesktopHoverVisuals();
+    }
+    if (!this.currentRoomState) return;
+
+    const count = Math.max(1, this.currentRoomState.players.length);
+    const cols = Math.min(3, count);
+    const rows = Math.ceil(count / 3);
+    const gw = this.currentRoomState.roundConfig.gridWidth;
+    const gh = this.currentRoomState.roundConfig.gridHeight;
+
+    const centerX = ((cols - 1) * ISLAND_SPACING_X + gw) / 2;
+    const centerZ = ((rows - 1) * ISLAND_SPACING_Z + gh) / 2;
+    const totalW = (cols - 1) * ISLAND_SPACING_X + gw + 4.4;
+    const totalH = (rows - 1) * ISLAND_SPACING_Z + gh + 5.6;
+
+    const frame = this.computeIdealFraming(totalW, totalH, 2.2);
+    this.camBasePolar = frame.polar;
+    this.camGoalTarget.set(centerX, 0, centerZ + frame.zBias * 0.55);
+    this.camGoalPolar = frame.polar;
+    this.camGoalRadius = Math.max(30, Math.min(195, frame.radius));
+    this.camGoalAzimuth = 0;
+
+    if (snapImmediate) {
+      this.camTarget.copy(this.camGoalTarget);
+      this.camPolar = this.camGoalPolar;
+      this.camRadius = this.camGoalRadius;
+      this.camAzimuth = 0;
+    }
+    this.updateSunShadowFrustum();
+  }
+
+  public resetCameraView(): void {
+    if (this.arenaOverviewMode) {
+      this.focusArenaOverview();
+    } else if (this.focusedPlayerId || this.localPlayerId) {
+      this.focusOnPlayerIsland((this.focusedPlayerId || this.localPlayerId)!);
+    }
+  }
+
+  public getLocalMazeEval(): MazeEvalResult | null {
+    return this.cachedBaseEval;
+  }
+
+  // ==========================================================================
+  // RAYCAST HELPERS & SPLIT INPUT ENGINE (TOUCH LOUPE + DESKTOP MOUSE)
+  // ==========================================================================
+
+  private screenToNDC(clientX: number, clientY: number, out: THREE.Vector2) {
+    out.set(
+      ((clientX - this.viewportLeft) / this.viewportW) * 2 - 1,
+      -((clientY - this.viewportTop) / this.viewportH) * 2 + 1
+    );
+  }
+
   private raycastAnyIsland(
     clientX: number,
     clientY: number
   ): IslandVisuals | null {
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const ndc = new THREE.Vector2(
-      ((clientX - rect.left) / rect.width) * 2 - 1,
-      -((clientY - rect.top) / rect.height) * 2 + 1
-    );
+    const ndc = new THREE.Vector2();
+    this.screenToNDC(clientX, clientY, ndc);
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera(ndc, this.camera);
 
     for (const isl of this.islands.values()) {
+      if (!isl.root.visible) continue;
       if (this.raycaster.intersectObject(isl.hitPlane).length > 0) {
         return isl;
       }
     }
 
-    const groundPt = new THREE.Vector3();
-    if (this.raycaster.ray.intersectPlane(this.groundPlane, groundPt)) {
+    if (this.raycaster.ray.intersectPlane(this.groundPlane, this._tmpWorld)) {
       const gw = this.currentRoomState?.roundConfig.gridWidth || 20;
       const gh = this.currentRoomState?.roundConfig.gridHeight || 26;
       for (const isl of this.islands.values()) {
-        const rx = groundPt.x - isl.offsetX;
-        const rz = groundPt.z - isl.offsetZ;
-        if (rx >= -2.6 && rx <= gw + 2.6 && rz >= -2.6 && rz <= gh + 2.6) {
+        if (!isl.root.visible) continue;
+        const rx = this._tmpWorld.x - isl.offsetX;
+        const rz = this._tmpWorld.z - isl.offsetZ;
+        if (rx >= -2.4 && rx <= gw + 2.4 && rz >= -2.4 && rz <= gh + 2.4) {
           return isl;
         }
       }
     }
-
     return null;
+  }
+
+  /**
+   * 3D Mesh-First Raycast against existing player Stone Walls (`towerGroup.children`)
+   * so clicking or tapping a `1.38m` wall cap never suffers perspective ground parallax!
+   */
+  private raycastExistingWallMesh(
+    island: IslandVisuals,
+    player: PlayerState
+  ): PlacedTower | null {
+    if (island.towerGroup.children.length === 0) return null;
+    const hits = this.raycaster.intersectObjects(
+      island.towerGroup.children,
+      true
+    );
+    for (const hit of hits) {
+      let curr: THREE.Object3D | null = hit.object;
+      while (curr && curr !== island.towerGroup) {
+        const tid = curr.userData?.towerId as string | undefined;
+        if (tid) {
+          const found = player.towers.find((t) => t.id === tid);
+          if (found) return found;
+        }
+        curr = curr.parent;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Intersects mathematical `y = 0.02` build plane with a `+1.6m` apron around `[0..gw]x[0..gh]`
+   * and clamps cleanly so border cells (`x = 0/18`, `y = 0/24`) never drop out!
+   */
+  private intersectClampedBuildPlane(
+    island: IslandVisuals,
+    round: RoundConfig,
+    margin = 1.6
+  ): { relX: number; relZ: number; rawRelX: number; rawRelZ: number } | null {
+    if (!this.raycaster.ray.intersectPlane(this.buildPlane, this._tmpWorld)) {
+      return null;
+    }
+    const rawRelX = this._tmpWorld.x - island.offsetX;
+    const rawRelZ = this._tmpWorld.z - island.offsetZ;
+    if (
+      rawRelX < -margin ||
+      rawRelX > round.gridWidth + margin ||
+      rawRelZ < -margin ||
+      rawRelZ > round.gridHeight + margin
+    ) {
+      return null;
+    }
+    const relX = Math.max(0, Math.min(round.gridWidth - 0.001, rawRelX));
+    const relZ = Math.max(0, Math.min(round.gridHeight - 0.001, rawRelZ));
+    return { relX, relZ, rawRelX, rawRelZ };
   }
 
   private bindEvents() {
     const dom = this.renderer.domElement;
 
-    window.addEventListener('resize', () => {
+    const handleResize = () => {
+      const prevW = this.viewportW;
       const w = this.container.clientWidth || window.innerWidth;
       const h = this.container.clientHeight || window.innerHeight;
       this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
       this.renderer.setPixelRatio(this.computeAdaptivePixelRatio());
       this.renderer.setSize(w, h);
+      this.updateViewportBounds();
+
+      const desiredShadowRes = this.isCoarseOrCompactDevice() ? 1024 : 2048;
+      if (desiredShadowRes !== this.currentShadowRes) {
+        this.currentShadowRes = desiredShadowRes;
+        this.sunLight.shadow.mapSize.set(desiredShadowRes, desiredShadowRes);
+        this.sunLight.shadow.map?.dispose();
+        this.sunLight.shadow.map = null;
+      }
+
+      const coarse = this.isCoarseOrCompactDevice() ? 1.0 : 0.0;
+      for (const isl of this.islands.values()) {
+        isl.floorUniforms.uCoarsePointer.value = coarse;
+      }
+
+      // Guard mobile virtual keyboard open/close (`widthDelta < 4` while an input is focused)
+      const activeTag = document.activeElement?.tagName;
+      const isInputFocused =
+        activeTag === 'INPUT' || activeTag === 'TEXTAREA';
+      if (isInputFocused && Math.abs(w - prevW) < 4) {
+        return;
+      }
 
       if (this.arenaOverviewMode) {
         this.focusArenaOverview(true);
@@ -1427,16 +2739,19 @@ export class Arena3DRenderer {
           (this.focusedPlayerId || this.localPlayerId)!,
           true
         );
-      } else {
-        const frame = this.computeIdealFraming(24.8, 32.0);
-        this.camGoalPolar = frame.polar;
-        this.camPolar = frame.polar;
-        this.camGoalRadius = Math.min(96, frame.radius);
-        this.camRadius = this.camGoalRadius;
       }
+    };
+
+    window.addEventListener('resize', handleResize);
+    window.visualViewport?.addEventListener('resize', handleResize);
+    window.addEventListener('blur', () => {
+      this.keysDown.clear();
+      this.isShiftPainting = false;
+      this.isSweepSelling = false;
     });
 
     window.addEventListener('keydown', (e) => {
+      if (this._modalOpen) return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (e.ctrlKey || e.metaKey) return;
@@ -1450,10 +2765,18 @@ export class Arena3DRenderer {
     dom.addEventListener('contextmenu', (e) => e.preventDefault());
 
     // ------------------------------------------------------------------------
-    // POINTER DOWN (Touch State Machine vs Desktop Mouse)
+    // POINTER DOWN
     // ------------------------------------------------------------------------
     dom.addEventListener('pointerdown', (e) => {
+      this.updateViewportBounds();
+
       if (e.pointerType === 'touch') {
+        try {
+          dom.setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore synthetic pointer events without capture support
+        }
+
         this.activeTouches.set(e.pointerId, {
           x: e.clientX,
           y: e.clientY,
@@ -1463,9 +2786,87 @@ export class Arena3DRenderer {
 
         if (this.activeTouches.size === 1) {
           this.touchGestureMoved = false;
+          this.postPinchGuard = false;
+          this.isLoupeDragging = false;
+          this.canGrabExistingGhost = false;
+          this.clearTouchHoldTimer();
+
+          const isSpectatingOther =
+            this.focusedPlayerId !== null &&
+            this.focusedPlayerId !== this.localPlayerId;
+          const canBuildTouch =
+            !this._modalOpen &&
+            !this.arenaOverviewMode &&
+            !isSpectatingOther &&
+            this.currentRoomState?.phase === 'BUILD' &&
+            this._activeTool === 'BLOCK' &&
+            this.localPlayerId !== null;
+
+          if (canBuildTouch) {
+            this.loupeSavedBeforeGesture = this.pendingTouchCell
+              ? { ...this.pendingTouchCell }
+              : null;
+
+            // Check if pressing within <= 56px of an active ghost for instant Loupe Grab!
+            if (this.pendingTouchCell && this.localPlayerId) {
+              const localIsl = this.islands.get(this.localPlayerId);
+              if (localIsl) {
+                this._tmpWorld.set(
+                  localIsl.offsetX + this.pendingTouchCell.x + 1.0,
+                  0.65,
+                  localIsl.offsetZ + this.pendingTouchCell.y + 1.0
+                );
+                const proj = this.projectWorldToScreen(this._tmpWorld);
+                const distToGhost = Math.hypot(
+                  e.clientX - proj.x,
+                  e.clientY - proj.y
+                );
+                if (distToGhost <= 56) {
+                  this.canGrabExistingGhost = true;
+                  this.loupeGrabInitOffset = {
+                    x: proj.x - e.clientX,
+                    y: proj.y - e.clientY,
+                  };
+                  this.loupeCurrentOffset = { ...this.loupeGrabInitOffset };
+                }
+              }
+            }
+
+            // 155ms stationary hold on island enters Loupe Ghost Drag
+            const holdStartX = e.clientX;
+            const holdStartY = e.clientY;
+            this.touchHoldTimer = setTimeout(() => {
+              this.touchHoldTimer = null;
+              if (
+                this.activeTouches.size !== 1 ||
+                this.touchGestureMoved ||
+                this.postPinchGuard ||
+                this._activeTool !== 'BLOCK'
+              ) {
+                return;
+              }
+              if (this.tryStartHoldLoupeDrag(holdStartX, holdStartY)) {
+                this.isLoupeDragging = true;
+                this.touchGestureMoved = true;
+                this.loupeHoldStartMs = performance.now();
+                this.loupeCurrentOffset = { x: 0, y: 0 };
+                this.updateLoupeDragAtScreen(holdStartX, holdStartY, true);
+              }
+            }, 155);
+          }
         } else if (this.activeTouches.size >= 2) {
-          // 2-finger pinch/pan immediately cancels any tap placement!
+          this.clearTouchHoldTimer();
+          if (this.isLoupeDragging) {
+            this.isLoupeDragging = false;
+            if (this.loupeSavedBeforeGesture) {
+              this.pendingTouchCell = { ...this.loupeSavedBeforeGesture };
+              this.applyTouchSelectionVisuals();
+            } else {
+              this.cancelTouchGhost();
+            }
+          }
           this.touchGestureMoved = true;
+          this.canGrabExistingGhost = false;
           const pts = Array.from(this.activeTouches.values());
           this.lastPinchDist = Math.hypot(
             pts[1].x - pts[0].x,
@@ -1476,90 +2877,76 @@ export class Arena3DRenderer {
             y: (pts[0].y + pts[1].y) * 0.5,
           };
         }
-        // NEVER place or sell on pointerdown for touch!
         return;
       }
 
       // Desktop mouse controls
-      const rect = dom.getBoundingClientRect();
+      if (this._modalOpen) return;
       this.lastPointerScreen = { x: e.clientX, y: e.clientY };
-      this.mouseNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      this.mouseNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      this.screenToNDC(e.clientX, e.clientY, this.mouseNDC);
 
       if (e.button === 1 || (e.button === 0 && e.altKey)) {
-        this.isDraggingCamera = true;
+        this.isMiddleOrAltDragging = true;
         this.dragStart = { x: e.clientX, y: e.clientY };
         return;
       }
 
       if (e.button === 2) {
-        if (this.dismissTransientUI?.()) return;
-        if (
-          !this.arenaOverviewMode &&
-          this.currentRoomState?.phase === 'BUILD' &&
-          (!this.focusedPlayerId || this.focusedPlayerId === this.localPlayerId)
-        ) {
-          this.updateBuildHover();
-          if (this.hoveredExistingTower) {
-            this.onSellTower?.(this.hoveredExistingTower.id);
-            return;
-          }
-        }
-        this.isDraggingCamera = true;
+        this.isRightMouseDown = true;
+        this.rightMouseStart = { x: e.clientX, y: e.clientY };
         this.dragStart = { x: e.clientX, y: e.clientY };
+        this.rightMousePanned = false;
         return;
       }
 
       if (e.button === 0) {
         if (this.dismissTransientUI?.()) return;
         if (this.pendingTouchCell || this.pendingTouchTowerId) {
-          this.doClearTouchPreview();
+          this.cancelTouchGhost();
         }
 
         const isSpectatingOther =
           this.focusedPlayerId !== null &&
           this.focusedPlayerId !== this.localPlayerId;
+        const canEditLocal =
+          !this.arenaOverviewMode &&
+          !isSpectatingOther &&
+          this.currentRoomState?.phase === 'BUILD' &&
+          this._activeTool !== 'PAN';
 
-        if (
-          this.arenaOverviewMode ||
-          isSpectatingOther ||
-          this.currentRoomState?.phase !== 'BUILD'
-        ) {
-          this.isLeftMouseDown = true;
-          this.leftMouseStart = { x: e.clientX, y: e.clientY };
-          this.dragStart = { x: e.clientX, y: e.clientY };
-          this.leftMousePanned = false;
-          this.leftMouseCanPan = true;
-          return;
-        }
+        if (canEditLocal) {
+          this.updateBuildHover();
 
-        this.updateBuildHover();
-
-        // Starting outside buildable grass during BUILD allows smooth left-mouse drag panning!
-        if (!this.mouseOverLocalGrass) {
-          this.isLeftMouseDown = true;
-          this.leftMouseStart = { x: e.clientX, y: e.clientY };
-          this.dragStart = { x: e.clientX, y: e.clientY };
-          this.leftMousePanned = false;
-          this.leftMouseCanPan = true;
-          return;
-        }
-
-        if (this.activeTool === 'SELL') {
-          if (this.hoveredExistingTower) {
-            this.onSellTower?.(this.hoveredExistingTower.id);
+          // Shift + Left-Drag line-paint in BLOCK mode
+          if (e.shiftKey && this._activeTool === 'BLOCK') {
+            this.isShiftPainting = true;
+            this.lastPaintedCellKey = '';
+            if (this.hoveredCell && this.lastHoverValid) {
+              this.lastPaintedCellKey = `${this.hoveredCell.x},${this.hoveredCell.y}`;
+              this.onPlaceTower?.(this.hoveredCell.x, this.hoveredCell.y);
+            }
+            return;
           }
-          return;
+
+          // Sweep-remove when pressing directly on an existing wall in SELL mode
+          if (this._activeTool === 'SELL' && this.hoveredExistingTower) {
+            this.isSweepSelling = true;
+            const t = this.hoveredExistingTower;
+            this.onSellTower?.(t.id, t.x, t.y);
+            return;
+          }
         }
 
-        if (this.hoveredCell) {
-          this.onPlaceTower?.(this.hoveredCell.x, this.hoveredCell.y);
-        }
+        // Standard Left-Mouse: defer click build/focus to pointerup (<=5px) so Left-Drag (>5px) pans smoothly anywhere!
+        this.isLeftMouseDown = true;
+        this.leftMouseStart = { x: e.clientX, y: e.clientY };
+        this.dragStart = { x: e.clientX, y: e.clientY };
+        this.leftMousePanned = false;
       }
     });
 
     // ------------------------------------------------------------------------
-    // POINTER MOVE (2-Finger Pinch/Pan, 1-Finger Pan, or Desktop Hover/Drag)
+    // POINTER MOVE
     // ------------------------------------------------------------------------
     dom.addEventListener('pointermove', (e) => {
       if (e.pointerType === 'touch') {
@@ -1581,16 +2968,35 @@ export class Arena3DRenderer {
           };
 
           if (this.lastPinchDist > 8 && dist > 8) {
-            const pinchScale = this.lastPinchDist / dist;
-            this.camGoalRadius = this.clampCameraRadius(
-              this.camGoalRadius * pinchScale
+            const oldR = this.camGoalRadius;
+            const newR = this.clampCameraRadius(
+              oldR * (this.lastPinchDist / dist)
             );
+            const ratio = newR / Math.max(1, oldR);
+            this.camGoalRadius = newR;
+            this.updateZoomCoupledPolar();
+
+            // Focal-point anchored pinch-zoom around world point under finger midpoint!
+            const pinchNdc = new THREE.Vector2();
+            this.screenToNDC(this.lastPinchMid.x, this.lastPinchMid.y, pinchNdc);
+            this.camera.updateMatrixWorld();
+            this.raycaster.setFromCamera(pinchNdc, this.camera);
+            if (
+              this.raycaster.ray.intersectPlane(this.groundPlane, this._tmpPinch)
+            ) {
+              this.camGoalTarget.x +=
+                (this._tmpPinch.x - this.camGoalTarget.x) * (1 - ratio);
+              this.camGoalTarget.z +=
+                (this._tmpPinch.z - this.camGoalTarget.z) * (1 - ratio);
+            }
           }
 
           const midDx = mid.x - this.lastPinchMid.x;
           const midDy = mid.y - this.lastPinchMid.y;
           if (Math.abs(midDx) > 0.1 || Math.abs(midDy) > 0.1) {
             this.panCameraByScreenDelta(midDx, midDy);
+          } else {
+            this.clampCameraTarget();
           }
 
           this.lastPinchDist = dist;
@@ -1603,10 +3009,47 @@ export class Arena3DRenderer {
             tracked.x - tracked.startX,
             tracked.y - tracked.startY
           );
-          if (!this.touchGestureMoved && totalDist > 9) {
+
+          // Explicit PAN tool: 0px deadzone smooth 1-finger camera pan
+          if (this._activeTool === 'PAN') {
+            this.touchGestureMoved = true;
+            this.panCameraByScreenDelta(tracked.x - prevX, tracked.y - prevY);
+            return;
+          }
+
+          // Grabbed active ghost (<= 56px) -> smooth -54px Loupe Ghost Drag!
+          if (!this.isLoupeDragging && this.canGrabExistingGhost && totalDist > 7) {
+            this.clearTouchHoldTimer();
+            this.isLoupeDragging = true;
             this.touchGestureMoved = true;
           }
-          if (this.touchGestureMoved) {
+
+          if (this.isLoupeDragging) {
+            if (this.canGrabExistingGhost) {
+              const ramp = Math.min(1, totalDist / 36);
+              const targetY = Math.min(this.loupeGrabInitOffset.y, -54);
+              this.loupeCurrentOffset.x =
+                this.loupeGrabInitOffset.x * (1 - ramp);
+              this.loupeCurrentOffset.y =
+                this.loupeGrabInitOffset.y +
+                (targetY - this.loupeGrabInitOffset.y) * ramp;
+            } else {
+              const elapsedMs = performance.now() - this.loupeHoldStartMs;
+              const ramp = Math.min(1, elapsedMs / 110);
+              this.loupeCurrentOffset.x = 0;
+              this.loupeCurrentOffset.y = -54 * ramp;
+            }
+            this.updateLoupeDragAtScreen(tracked.x, tracked.y, false);
+            return;
+          }
+
+          const panDeadzone = this.postPinchGuard ? 16 : 14;
+          if (!this.touchGestureMoved && totalDist > panDeadzone) {
+            this.clearTouchHoldTimer();
+            this.touchGestureMoved = true;
+            this.postPinchGuard = false;
+          }
+          if (this.touchGestureMoved && !this.postPinchGuard) {
             this.panCameraByScreenDelta(tracked.x - prevX, tracked.y - prevY);
           }
         }
@@ -1614,17 +3057,15 @@ export class Arena3DRenderer {
       }
 
       // Desktop mouse move
-      const rect = dom.getBoundingClientRect();
+      if (this._modalOpen) return;
       this.lastPointerScreen = { x: e.clientX, y: e.clientY };
-      this.mouseNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      this.mouseNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      this.screenToNDC(e.clientX, e.clientY, this.mouseNDC);
 
-      if (this.isDraggingCamera) {
+      if (this.isMiddleOrAltDragging) {
         const dx = e.clientX - this.dragStart.x;
         const dy = e.clientY - this.dragStart.y;
         this.dragStart = { x: e.clientX, y: e.clientY };
-
-        if (e.buttons === 4 || (e.buttons === 2 && e.shiftKey)) {
+        if (e.buttons === 4) {
           this.camGoalAzimuth -= dx * 0.006;
         } else {
           this.panCameraByScreenDelta(dx, dy);
@@ -1632,14 +3073,58 @@ export class Arena3DRenderer {
         return;
       }
 
-      if (this.isLeftMouseDown && this.leftMouseCanPan) {
+      if (this.isRightMouseDown) {
+        const distFromStart = Math.hypot(
+          e.clientX - this.rightMouseStart.x,
+          e.clientY - this.rightMouseStart.y
+        );
+        if (!this.rightMousePanned && distFromStart > 5) {
+          this.rightMousePanned = true;
+          this.dragStart = { x: e.clientX, y: e.clientY };
+        }
+        if (this.rightMousePanned) {
+          const dx = e.clientX - this.dragStart.x;
+          const dy = e.clientY - this.dragStart.y;
+          this.dragStart = { x: e.clientX, y: e.clientY };
+          if (e.shiftKey) {
+            this.camGoalAzimuth -= dx * 0.006;
+          } else {
+            this.panCameraByScreenDelta(dx, dy);
+          }
+          return;
+        }
+      }
+
+      if (this.isShiftPainting) {
+        this.updateBuildHover();
+        if (this.hoveredCell && this.lastHoverValid) {
+          const key = `${this.hoveredCell.x},${this.hoveredCell.y}`;
+          if (key !== this.lastPaintedCellKey) {
+            this.lastPaintedCellKey = key;
+            this.onPlaceTower?.(this.hoveredCell.x, this.hoveredCell.y);
+          }
+        }
+        return;
+      }
+
+      if (this.isSweepSelling) {
+        this.updateBuildHover();
+        if (this.hoveredExistingTower) {
+          const t = this.hoveredExistingTower;
+          this.onSellTower?.(t.id, t.x, t.y);
+        }
+        return;
+      }
+
+      if (this.isLeftMouseDown) {
         const distFromStart = Math.hypot(
           e.clientX - this.leftMouseStart.x,
           e.clientY - this.leftMouseStart.y
         );
-        if (!this.leftMousePanned && distFromStart > 6) {
+        if (!this.leftMousePanned && distFromStart > 5) {
           this.leftMousePanned = true;
           this.dragStart = { x: e.clientX, y: e.clientY };
+          this.hideDesktopHoverVisuals();
         }
         if (this.leftMousePanned) {
           const dx = e.clientX - this.dragStart.x;
@@ -1656,12 +3141,13 @@ export class Arena3DRenderer {
     });
 
     // ------------------------------------------------------------------------
-    // POINTER UP / CANCEL (Commit 1-Finger Touch Tap <= 9px or Overview Click <= 6px)
+    // POINTER UP / CANCEL
     // ------------------------------------------------------------------------
     const handlePointerEnd = (e: PointerEvent) => {
       if (e.pointerType === 'touch') {
         const tracked = this.activeTouches.get(e.pointerId);
         this.activeTouches.delete(e.pointerId);
+        this.clearTouchHoldTimer();
 
         if (this.activeTouches.size >= 2) {
           const pts = Array.from(this.activeTouches.values());
@@ -1676,51 +3162,137 @@ export class Arena3DRenderer {
           return;
         }
 
+        // 2 -> 1 finger lift guard: re-anchor remaining touch so lift-off never jerks camera!
         if (this.activeTouches.size === 1) {
+          const rem = Array.from(this.activeTouches.values())[0];
+          rem.startX = rem.x;
+          rem.startY = rem.y;
+          this.postPinchGuard = true;
+          this.touchGestureMoved = false;
+          this.isLoupeDragging = false;
           return;
         }
 
         // All fingers lifted
+        if (this.isLoupeDragging) {
+          this.isLoupeDragging = false;
+          this.canGrabExistingGhost = false;
+          this.touchGestureMoved = false;
+          this.postPinchGuard = false;
+          this.applyTouchSelectionVisuals();
+          return;
+        }
+
         const wasCleanTap =
           e.type === 'pointerup' &&
           tracked !== undefined &&
           !this.touchGestureMoved &&
+          !this.postPinchGuard &&
+          this._activeTool !== 'PAN' &&
           Math.hypot(e.clientX - tracked.startX, e.clientY - tracked.startY) <=
-            9;
+            14;
 
         this.touchGestureMoved = false;
+        this.postPinchGuard = false;
+        this.canGrabExistingGhost = false;
         this.lastPinchDist = 0;
 
-        if (wasCleanTap) {
+        if (wasCleanTap && !this._modalOpen) {
           if (this.dismissTransientUI?.()) return;
           this.handleTouchTap(e.clientX, e.clientY);
         }
         return;
       }
 
-      if (this.isLeftMouseDown) {
-        const wasCleanClick =
+      // Desktop mouse up
+      this.isMiddleOrAltDragging = false;
+      this.isShiftPainting = false;
+      this.isSweepSelling = false;
+
+      if (this.isRightMouseDown) {
+        const wasCleanRightClick =
           e.type === 'pointerup' &&
+          e.button === 2 &&
+          !this.rightMousePanned &&
+          Math.hypot(
+            e.clientX - this.rightMouseStart.x,
+            e.clientY - this.rightMouseStart.y
+          ) <= 5;
+        this.isRightMouseDown = false;
+        this.rightMousePanned = false;
+
+        if (wasCleanRightClick && !this._modalOpen) {
+          if (this.dismissTransientUI?.()) return;
+          const isSpectatingOther =
+            this.focusedPlayerId !== null &&
+            this.focusedPlayerId !== this.localPlayerId;
+          if (
+            !this.arenaOverviewMode &&
+            !isSpectatingOther &&
+            this.currentRoomState?.phase === 'BUILD'
+          ) {
+            this.lastPointerScreen = { x: e.clientX, y: e.clientY };
+            this.screenToNDC(e.clientX, e.clientY, this.mouseNDC);
+            this.updateBuildHover();
+            if (this.hoveredExistingTower) {
+              const t = this.hoveredExistingTower;
+              this.onSellTower?.(t.id, t.x, t.y);
+            }
+          }
+        }
+        return;
+      }
+
+      if (this.isLeftMouseDown) {
+        const wasCleanLeftClick =
+          e.type === 'pointerup' &&
+          e.button === 0 &&
           !this.leftMousePanned &&
           Math.hypot(
             e.clientX - this.leftMouseStart.x,
             e.clientY - this.leftMouseStart.y
-          ) <= 6;
+          ) <= 5;
         this.isLeftMouseDown = false;
-        this.leftMouseCanPan = false;
         this.leftMousePanned = false;
 
-        if (wasCleanClick && this.arenaOverviewMode) {
-          const hitIsland = this.raycastAnyIsland(e.clientX, e.clientY);
-          if (hitIsland) {
-            this.doClearTouchPreview();
-            this.focusOnPlayerIsland(hitIsland.playerId);
-            this.onFocusChange?.();
+        if (wasCleanLeftClick && !this._modalOpen) {
+          if (this.arenaOverviewMode) {
+            const hitIsland = this.raycastAnyIsland(e.clientX, e.clientY);
+            if (hitIsland) {
+              this.cancelTouchGhost();
+              this.focusOnPlayerIsland(hitIsland.playerId);
+              this.onFocusChange?.();
+            }
+            return;
+          }
+
+          const isSpectatingOther =
+            this.focusedPlayerId !== null &&
+            this.focusedPlayerId !== this.localPlayerId;
+          if (
+            !isSpectatingOther &&
+            this.currentRoomState?.phase === 'BUILD' &&
+            this._activeTool !== 'PAN'
+          ) {
+            this.lastPointerScreen = { x: e.clientX, y: e.clientY };
+            this.screenToNDC(e.clientX, e.clientY, this.mouseNDC);
+            this.updateBuildHover();
+            if (this._activeTool === 'SELL') {
+              if (this.hoveredExistingTower) {
+                const t = this.hoveredExistingTower;
+                this.onSellTower?.(t.id, t.x, t.y);
+              }
+            } else if (
+              this._activeTool === 'BLOCK' &&
+              this.hoveredCell &&
+              this.lastHoverValid &&
+              !this.hoveredExistingTower
+            ) {
+              this.onPlaceTower?.(this.hoveredCell.x, this.hoveredCell.y);
+            }
           }
         }
       }
-
-      this.isDraggingCamera = false;
     };
 
     window.addEventListener('pointerup', handlePointerEnd);
@@ -1730,96 +3302,246 @@ export class Arena3DRenderer {
       if (e.pointerType === 'touch') return;
       this.mouseNDC.set(-99, -99);
       if (!this.pendingTouchCell && !this.pendingTouchTowerId) {
-        this.updateBuildHover();
+        this.hideDesktopHoverVisuals();
       }
     });
 
     dom.addEventListener(
       'wheel',
       (e) => {
+        if (this._modalOpen) return;
         e.preventDefault();
         this.camGoalRadius = this.clampCameraRadius(
-          this.camGoalRadius + e.deltaY * 0.022
+          this.camGoalRadius + e.deltaY * 0.028
         );
+        this.updateZoomCoupledPolar();
       },
       { passive: false }
     );
   }
 
-  /**
-   * Projects a 3D world position to viewport pixel coordinates.
-   */
-  private projectWorldToScreen(worldPos: THREE.Vector3): {
-    x: number;
-    y: number;
-    visible: boolean;
-  } {
-    this.camera.updateMatrixWorld();
-    const projected = worldPos.clone().project(this.camera);
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const w = rect.width || window.innerWidth;
-    const h = rect.height || window.innerHeight;
-    return {
-      x: rect.left + (projected.x * 0.5 + 0.5) * w,
-      y: rect.top + (-projected.y * 0.5 + 0.5) * h,
-      visible: projected.z <= 1,
-    };
+  private clearTouchHoldTimer() {
+    if (this.touchHoldTimer !== null) {
+      clearTimeout(this.touchHoldTimer);
+      this.touchHoldTimer = null;
+    }
   }
 
-  private isTouchProjectionOffscreen(proj: {
-    x: number;
-    y: number;
-    visible: boolean;
-  }): boolean {
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const w = rect.width || window.innerWidth;
-    const h = rect.height || window.innerHeight;
+  private tryStartHoldLoupeDrag(clientX: number, clientY: number): boolean {
+    if (
+      !this.currentRoomState ||
+      this.currentRoomState.phase !== 'BUILD' ||
+      !this.localPlayerId
+    ) {
+      return false;
+    }
+    const localIsland = this.islands.get(this.localPlayerId);
+    const localPlayer = this.currentRoomState.players.find(
+      (p) => p.id === this.localPlayerId
+    );
+    if (!localIsland || !localPlayer) return false;
+
+    const ndc = new THREE.Vector2();
+    this.screenToNDC(clientX, clientY, ndc);
+    this.camera.updateMatrixWorld();
+    this.raycaster.setFromCamera(ndc, this.camera);
+
+    // If holding on an existing tower (unless grabbing active ghost), let clean tap handle Remove selection
+    if (
+      !this.canGrabExistingGhost &&
+      this.raycastExistingWallMesh(localIsland, localPlayer)
+    ) {
+      return false;
+    }
+
     return (
-      !proj.visible ||
-      proj.x < 12 ||
-      proj.x > w - 12 ||
-      proj.y < 84 ||
-      proj.y > h - 52
+      this.intersectClampedBuildPlane(
+        localIsland,
+        this.currentRoomState.roundConfig,
+        1.6
+      ) !== null
     );
   }
 
-  /**
-   * Clears any active mobile touch ghost preview or selected pillar state.
-   */
-  public clearTouchPreview?: () => void = () => {
-    this.doClearTouchPreview();
-  };
+  private updateLoupeDragAtScreen(
+    fingerX: number,
+    fingerY: number,
+    forceEmit: boolean
+  ) {
+    if (
+      !this.currentRoomState ||
+      this.currentRoomState.phase !== 'BUILD' ||
+      !this.localPlayerId
+    ) {
+      return;
+    }
+    const localIsland = this.islands.get(this.localPlayerId);
+    const localPlayer = this.currentRoomState.players.find(
+      (p) => p.id === this.localPlayerId
+    );
+    if (!localIsland || !localPlayer) return;
 
-  private doClearTouchPreview(): void {
+    const aimX = fingerX + this.loupeCurrentOffset.x;
+    const aimY = fingerY + this.loupeCurrentOffset.y;
+    const ndc = new THREE.Vector2();
+    this.screenToNDC(aimX, aimY, ndc);
+    this.camera.updateMatrixWorld();
+    this.raycaster.setFromCamera(ndc, this.camera);
+
+    const round = this.currentRoomState.roundConfig;
+    const hit = this.intersectClampedBuildPlane(localIsland, round, 2.2);
+    if (!hit) return;
+
+    const smart = resolveSmart2x2Placement(
+      round,
+      localPlayer.towers,
+      hit.relX,
+      hit.relZ,
+      { mode: 'touch', availableGold: localPlayer.gold }
+    );
+
+    const cellChanged =
+      !this.pendingTouchCell ||
+      this.pendingTouchCell.x !== smart.x ||
+      this.pendingTouchCell.y !== smart.y;
+
+    this.pendingTouchTowerId = null;
+    this.pendingTouchCell = { x: smart.x, y: smart.y };
+
+    if (cellChanged || forceEmit) {
+      if (cellChanged) {
+        this.onTouchSnapChange?.({ x: smart.x, y: smart.y }, smart.valid);
+      }
+      this.applyTouchSelectionVisuals(false, smart.snapped);
+    }
+  }
+
+  // ==========================================================================
+  // MOBILE TOUCH PRECISION PUBLIC CONTRACT METHODS (`tech_contracts.md §2.1`)
+  // ==========================================================================
+
+  public hasActiveTouchGhost(): boolean {
+    return (
+      this.pendingTouchCell !== null || this.pendingTouchTowerId !== null
+    );
+  }
+
+  public nudgeTouchGhost(dx: number, dy: number): boolean {
+    if (
+      !this.currentRoomState ||
+      this.currentRoomState.phase !== 'BUILD' ||
+      !this.localPlayerId ||
+      this.arenaOverviewMode
+    ) {
+      return false;
+    }
+    const localPlayer = this.currentRoomState.players.find(
+      (p) => p.id === this.localPlayerId
+    );
+    if (!localPlayer) return false;
+
+    const round = this.currentRoomState.roundConfig;
+    let baseCell = this.pendingTouchCell;
+    if (!baseCell && this.pendingTouchTowerId) {
+      const existing = localPlayer.towers.find(
+        (t) => t.id === this.pendingTouchTowerId
+      );
+      if (existing) baseCell = { x: existing.x, y: existing.y };
+    }
+    if (!baseCell) return false;
+
+    const nx = Math.max(0, Math.min(round.gridWidth - 2, baseCell.x + dx));
+    const ny = Math.max(0, Math.min(round.gridHeight - 2, baseCell.y + dy));
+    if (
+      this.pendingTouchCell &&
+      nx === this.pendingTouchCell.x &&
+      ny === this.pendingTouchCell.y
+    ) {
+      return false;
+    }
+
+    this.pendingTouchTowerId = null;
+    this.pendingTouchCell = { x: nx, y: ny };
+    this.applyTouchSelectionVisuals(true, false);
+
+    const valid = this.activeTouchHoverInfo?.valid ?? false;
+    this.onTouchSnapChange?.({ x: nx, y: ny }, valid);
+    return true;
+  }
+
+  public confirmTouchGhost(): boolean {
+    if (
+      !this.currentRoomState ||
+      this.currentRoomState.phase !== 'BUILD' ||
+      !this.localPlayerId ||
+      this.arenaOverviewMode
+    ) {
+      return false;
+    }
+    const localPlayer = this.currentRoomState.players.find(
+      (p) => p.id === this.localPlayerId
+    );
+    if (!localPlayer) return false;
+
+    if (this.pendingTouchTowerId) {
+      const existing = localPlayer.towers.find(
+        (t) => t.id === this.pendingTouchTowerId
+      );
+      this.cancelTouchGhost();
+      if (existing) {
+        this.onSellTower?.(existing.id, existing.x, existing.y);
+        return true;
+      }
+      return false;
+    }
+
+    if (this.pendingTouchCell) {
+      const { x, y } = this.pendingTouchCell;
+      const hasGold = localPlayer.gold >= TOWER_SPECS.BLOCK.goldCost;
+      const val = validateTowerPlacement(
+        this.currentRoomState.roundConfig,
+        localPlayer.towers,
+        x,
+        y
+      );
+      if (!hasGold || !val.valid) {
+        return false;
+      }
+      this.cancelTouchGhost();
+      this.onPlaceTower?.(x, y);
+      return true;
+    }
+
+    return false;
+  }
+
+  public cancelTouchGhost(): void {
+    this.clearTouchHoldTimer();
     this.pendingTouchCell = null;
     this.pendingTouchTowerId = null;
     this.activeTouchHoverInfo = null;
+    this.isLoupeDragging = false;
+    this.canGrabExistingGhost = false;
     this.hoveredCell = null;
     this.hoveredExistingTower = null;
+    this.lastHoverValid = false;
+    this.cachedHoverPreview = null;
 
     this.ghostGroup.visible = false;
-    this.ghostGroup.scale.set(1, 1, 1);
+    this.ghostTurretGroup.visible = true;
     this.ghostConnGroup.clear();
-    this.clearPreviewPathMesh();
+    this.clearPreviewConduits();
+    this.hidePreviewPathMesh();
 
     if (this.localPlayerId) {
       const localIsland = this.islands.get(this.localPlayerId);
       if (localIsland) {
         localIsland.floorUniforms.uCursorPos.value.set(-99, -99);
+        localIsland.floorUniforms.uReticleMode.value = 0;
         for (const sr of localIsland.spireRigs) {
           sr.targetHoverBoost = 0;
         }
-        if (this.cachedBaseEval) {
-          this.populateClapMarkers(
-            localIsland,
-            this.cachedBaseEval.clapLocations,
-            false
-          );
-          this.applySpireOverchargeVisuals(
-            localIsland,
-            this.cachedBaseEval.spireOverchargeTiers
-          );
-        }
+        this.restoreIslandBaseSynergyVisuals(localIsland);
       }
     }
 
@@ -1831,28 +3553,18 @@ export class Arena3DRenderer {
     });
   }
 
-  /**
-   * Resets camera target, zoom radius, and azimuth to clean aspect-adaptive framing.
-   */
-  public resetCameraView?: () => void = () => {
-    this.doResetCameraView();
-  };
-
-  private doResetCameraView(): void {
-    if (this.arenaOverviewMode) {
-      this.focusArenaOverview();
-    } else if (this.focusedPlayerId || this.localPlayerId) {
-      this.focusOnPlayerIsland((this.focusedPlayerId || this.localPlayerId)!);
-    }
+  public clearTouchPreview(): void {
+    this.cancelTouchGhost();
   }
 
   /**
-   * Handles a clean 1-finger touch tap (`<= 9px` movement) with Arena Overview Focus
-   * and Two-Stage Touch Preview & Reclaim.
+   * Clean 1-finger touch tap (`<= 14px`):
+   * NEVER auto-commits on the 3D board (`tech_contracts.md §2.2`) — strictly aims `pendingTouchCell`
+   * or selects `pendingTouchTowerId` for confirmation via `#touch-precision-tray`!
    */
   private handleTouchTap(clientX: number, clientY: number) {
     if (this.arenaOverviewMode) {
-      this.doClearTouchPreview();
+      this.cancelTouchGhost();
       const hitIsland = this.raycastAnyIsland(clientX, clientY);
       if (hitIsland) {
         this.focusOnPlayerIsland(hitIsland.playerId);
@@ -1871,7 +3583,7 @@ export class Arena3DRenderer {
       !this.localPlayerId ||
       isSpectatingOther
     ) {
-      this.doClearTouchPreview();
+      this.cancelTouchGhost();
       return;
     }
 
@@ -1880,110 +3592,112 @@ export class Arena3DRenderer {
       (p) => p.id === this.localPlayerId
     );
     if (!localIsland || !localPlayer) {
-      this.doClearTouchPreview();
+      this.cancelTouchGhost();
       return;
     }
 
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const ndc = new THREE.Vector2(
-      ((clientX - rect.left) / rect.width) * 2 - 1,
-      -((clientY - rect.top) / rect.height) * 2 + 1
-    );
     this.lastPointerScreen = { x: clientX, y: clientY };
-
+    const ndc = new THREE.Vector2();
+    this.screenToNDC(clientX, clientY, ndc);
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera(ndc, this.camera);
-    const hits = this.raycaster.intersectObject(localIsland.hitPlane);
-    if (hits.length === 0) {
-      this.doClearTouchPreview();
-      return;
-    }
 
-    const hitPt = hits[0].point;
-    const relX = hitPt.x - localIsland.offsetX;
-    const relZ = hitPt.z - localIsland.offsetZ;
+    // 1. 3D Mesh-First Raycast against existing Stone Walls (zero cap parallax miss!)
+    let existing = this.raycastExistingWallMesh(localIsland, localPlayer);
+
     const round = this.currentRoomState.roundConfig;
-    const cellX = Math.floor(relX);
-    const cellY = Math.floor(relZ);
+    const planeHit = this.intersectClampedBuildPlane(localIsland, round, 1.5);
 
-    const existing =
-      localPlayer.towers.find(
-        (t) =>
-          cellX >= t.x &&
-          cellX < t.x + 2 &&
-          cellY >= t.y &&
-          cellY < t.y + 2
-      ) || null;
+    if (!existing && planeHit) {
+      const cx = Math.floor(planeHit.relX);
+      const cy = Math.floor(planeHit.relZ);
+      existing =
+        localPlayer.towers.find((t) => isCellIn2x2(cx, cy, t)) || null;
+    }
 
-    // 1. Direct SELL tool tap
-    if (this.activeTool === 'SELL') {
-      this.doClearTouchPreview();
+    if (this._activeTool === 'SELL') {
       if (existing) {
-        this.onSellTower?.(existing.id);
+        this.pendingTouchCell = null;
+        this.pendingTouchTowerId = existing.id;
+        this.applyTouchSelectionVisuals();
+      } else {
+        this.cancelTouchGhost();
       }
       return;
     }
 
-    // 2. Tapped an existing player Castle Pillar -> Two-stage Touch Reclaim
+    // Tapped an existing Stone Wall in BLOCK mode -> select it for Remove (+1) or Nudge
     if (existing) {
-      if (this.pendingTouchTowerId === existing.id) {
-        this.doClearTouchPreview();
-        this.onSellTower?.(existing.id);
-        return;
-      }
-
       this.pendingTouchCell = null;
       this.pendingTouchTowerId = existing.id;
       this.applyTouchSelectionVisuals();
       return;
     }
 
-    // 3. Tapped buildable grass (`activeTool === 'BLOCK'`) -> Two-stage Touch Ghost Preview
-    const placeX = Math.max(
-      0,
-      Math.min(round.gridWidth - 2, Math.round(relX - 1))
-    );
-    const placeY = Math.max(
-      0,
-      Math.min(round.gridHeight - 2, Math.round(relZ - 1))
-    );
-
-    const validation = validateTowerPlacement(
-      round,
-      localPlayer.towers,
-      placeX,
-      placeY
-    );
-
-    if (
-      this.pendingTouchCell &&
-      this.pendingTouchCell.x === placeX &&
-      this.pendingTouchCell.y === placeY
-    ) {
-      this.doClearTouchPreview();
-      if (validation.valid) {
-        this.onPlaceTower?.(placeX, placeY);
-      }
+    if (!planeHit) {
+      this.cancelTouchGhost();
       return;
     }
 
+    // Smart 2x2 Obstacle-Aware Flush Snap (eliminates 0.5m 'Occupied' dead-moat!)
+    const smart = resolveSmart2x2Placement(
+      round,
+      localPlayer.towers,
+      planeHit.relX,
+      planeHit.relZ,
+      { mode: 'touch', availableGold: localPlayer.gold }
+    );
+
+    const changed =
+      !this.pendingTouchCell ||
+      this.pendingTouchCell.x !== smart.x ||
+      this.pendingTouchCell.y !== smart.y;
+
     this.pendingTouchTowerId = null;
-    this.pendingTouchCell = { x: placeX, y: placeY };
-    this.applyTouchSelectionVisuals();
+    this.pendingTouchCell = { x: smart.x, y: smart.y };
+    this.applyTouchSelectionVisuals(false, smart.snapped);
+
+    if (changed) {
+      this.onTouchSnapChange?.({ x: smart.x, y: smart.y }, smart.valid);
+    }
   }
 
-  /**
-   * Renders 3D ghost / reclaim highlight for active mobile touch preview and emits
-   * `onHoverStatusChange` with `isTouchPreview: true` and confirm/cancel callbacks.
-   */
-  private applyTouchSelectionVisuals() {
+  private projectWorldToScreen(worldPos: THREE.Vector3): {
+    x: number;
+    y: number;
+    visible: boolean;
+  } {
+    this.camera.updateMatrixWorld();
+    this._tmpProj.copy(worldPos).project(this.camera);
+    return {
+      x: this.viewportLeft + (this._tmpProj.x * 0.5 + 0.5) * this.viewportW,
+      y: this.viewportTop + (-this._tmpProj.y * 0.5 + 0.5) * this.viewportH,
+      visible: this._tmpProj.z <= 1,
+    };
+  }
+
+  private isTouchProjectionOffscreen(proj: {
+    x: number;
+    y: number;
+    visible: boolean;
+  }): boolean {
+    return (
+      !proj.visible ||
+      proj.x < 12 ||
+      proj.x > this.viewportW - 12 ||
+      proj.y < this.hudSafeTopPx + 8 ||
+      proj.y > this.viewportH - this.hudSafeBottomPx - 8
+    );
+  }
+
+  private applyTouchSelectionVisuals(isManualNudge = false, snapped = false) {
     if (
       !this.currentRoomState ||
       this.currentRoomState.phase !== 'BUILD' ||
       !this.localPlayerId ||
       this.arenaOverviewMode
     ) {
-      this.doClearTouchPreview();
+      this.cancelTouchGhost();
       return;
     }
 
@@ -1995,113 +3709,86 @@ export class Arena3DRenderer {
 
     const round = this.currentRoomState.roundConfig;
 
-    // Case A: Reclaim existing player pillar preview
+    // Case A: Selected existing Stone Wall for Remove (+1)
     if (this.pendingTouchTowerId) {
       const existing = localPlayer.towers.find(
         (t) => t.id === this.pendingTouchTowerId
       );
       if (!existing) {
-        this.doClearTouchPreview();
+        this.cancelTouchGhost();
         return;
       }
 
-      this.clearPreviewPathMesh();
-      this.ghostConnGroup.clear();
-      localIsland.floorUniforms.uCursorPos.value.set(
-        existing.x + 1.0,
-        existing.y + 1.0
-      );
-
-      this.ghostGroup.visible = true;
-      this.ghostGroup.scale.set(1.05, 1.03, 1.05);
-      this.ghostGroup.position.set(
-        localIsland.offsetX + existing.x + 1.0,
-        0,
-        localIsland.offsetZ + existing.y + 1.0
-      );
-      this.setGhostTint(false);
-
-      if (this.cachedBaseEval) {
-        this.populateClapMarkers(
-          localIsland,
-          this.cachedBaseEval.clapLocations,
-          false
-        );
-        this.applySpireOverchargeVisuals(
-          localIsland,
-          this.cachedBaseEval.spireOverchargeTiers
-        );
-      }
+      this.showRemoveBracketVisuals(localIsland, existing.x, existing.y);
 
       this.touchWorldAnchor.set(
         localIsland.offsetX + existing.x + 1.0,
-        1.48,
+        1.42,
         localIsland.offsetZ + existing.y + 1.0
       );
       const proj = this.projectWorldToScreen(this.touchWorldAnchor);
       const isGestureMoving =
-        this.activeTouches.size > 0 && this.touchGestureMoved;
+        this.activeTouches.size > 0 &&
+        this.touchGestureMoved &&
+        !this.isLoupeDragging;
       const offscreen = this.isTouchProjectionOffscreen(proj);
+      const placeNearTopEdge =
+        proj.y < this.hudSafeTopPx + 108 || existing.y <= 3;
 
-      const towerId = existing.id;
       const info: HoverStatusInfo = {
         cell: { x: existing.x, y: existing.y },
         screenX: proj.x,
         screenY: proj.y,
         valid: true,
-        reason: 'Refund Pillar',
+        reason: 'Remove (+1)',
         existingTower: existing,
         isTouchPreview: true,
+        isLoupeDragging: this.isLoupeDragging,
         isGestureMoving,
+        placeNearTopEdge,
         offscreen,
-        onConfirmTouchAction: () => {
-          this.doClearTouchPreview();
-          this.onSellTower?.(towerId);
-        },
-        onCancelTouchAction: () => {
-          this.doClearTouchPreview();
-        },
       };
       this.activeTouchHoverInfo = info;
       this.onHoverStatusChange?.(info);
       return;
     }
 
-    // Case B: New 2x2 Pillar Placement Ghost Preview
+    // Case B: 2x2 Stone Wall Placement Ghost Preview
     if (this.pendingTouchCell) {
       const { x: placeX, y: placeY } = this.pendingTouchCell;
       this.hoveredCell = { x: placeX, y: placeY };
       this.hoveredExistingTower = null;
-
-      localIsland.floorUniforms.uCursorPos.value.set(
-        placeX + 1.0,
-        placeY + 1.0
-      );
 
       const preview = this.buildGhostAndPathPreview(
         localIsland,
         localPlayer,
         round,
         placeX,
-        placeY
+        placeY,
+        snapped && !isManualNudge
       );
+      this.lastHoverValid = preview.valid;
 
       this.touchWorldAnchor.set(
         localIsland.offsetX + placeX + 1.0,
-        1.48,
+        1.42,
         localIsland.offsetZ + placeY + 1.0
       );
       const proj = this.projectWorldToScreen(this.touchWorldAnchor);
       const isGestureMoving =
-        this.activeTouches.size > 0 && this.touchGestureMoved;
+        this.activeTouches.size > 0 &&
+        this.touchGestureMoved &&
+        !this.isLoupeDragging;
       const offscreen = this.isTouchProjectionOffscreen(proj);
-      const isValid = preview.valid;
+      const placeNearTopEdge =
+        proj.y < this.hudSafeTopPx + 108 || placeY <= 3;
 
       const info: HoverStatusInfo = {
         cell: { x: placeX, y: placeY },
         screenX: proj.x,
         screenY: proj.y,
-        valid: isValid,
+        valid: preview.valid,
+        snapped: preview.snapped,
         reason: preview.reason,
         deltaTime: preview.deltaTime,
         deltaClaps: preview.deltaClaps,
@@ -2110,104 +3797,33 @@ export class Arena3DRenderer {
         previewTime: preview.previewTime,
         existingTower: null,
         isTouchPreview: true,
+        isLoupeDragging: this.isLoupeDragging,
         isGestureMoving,
+        placeNearTopEdge,
         offscreen,
-        onConfirmTouchAction: () => {
-          if (isValid) {
-            this.doClearTouchPreview();
-            this.onPlaceTower?.(placeX, placeY);
-          }
-        },
-        onCancelTouchAction: () => {
-          this.doClearTouchPreview();
-        },
       };
       this.activeTouchHoverInfo = info;
       this.onHoverStatusChange?.(info);
     }
   }
 
-  public focusOnPlayerIsland(playerId: string, snapImmediate = false) {
-    this.arenaOverviewMode = false;
-    this.focusedPlayerId = playerId;
-    if (
-      playerId !== this.localPlayerId &&
-      (this.pendingTouchCell || this.pendingTouchTowerId)
-    ) {
-      this.doClearTouchPreview();
-    }
-    const island = this.islands.get(playerId);
-    if (!island || !this.currentRoomState) return;
-
-    const gw = this.currentRoomState.roundConfig.gridWidth;
-    const gh = this.currentRoomState.roundConfig.gridHeight;
-    const frame = this.computeIdealFraming(gw + 4.8, gh + 6.0);
-
-    this.camGoalTarget.set(
-      island.offsetX + gw / 2,
-      0,
-      island.offsetZ + gh / 2 + frame.zBias
-    );
-    this.camGoalPolar = frame.polar;
-    this.camGoalRadius = Math.max(14, Math.min(96, frame.radius));
-    this.camGoalAzimuth = 0;
-
-    if (snapImmediate) {
-      this.camTarget.copy(this.camGoalTarget);
-      this.camPolar = this.camGoalPolar;
-      this.camRadius = this.camGoalRadius;
-      this.camAzimuth = 0;
-    }
-    this.updateSunShadowFrustum();
-  }
-
-  public focusArenaOverview(snapImmediate = false) {
-    this.arenaOverviewMode = true;
-    if (this.pendingTouchCell || this.pendingTouchTowerId) {
-      this.doClearTouchPreview();
-    } else {
-      this.ghostGroup.visible = false;
-      this.ghostConnGroup.clear();
-      this.clearPreviewPathMesh();
-    }
-    if (!this.currentRoomState) return;
-
-    const count = Math.max(1, this.currentRoomState.players.length);
-    const cols = Math.min(3, count);
-    const rows = Math.ceil(count / 3);
-    const gw = this.currentRoomState.roundConfig.gridWidth;
-    const gh = this.currentRoomState.roundConfig.gridHeight;
-
-    const centerX = ((cols - 1) * ISLAND_SPACING_X + gw) / 2;
-    const centerZ = ((rows - 1) * ISLAND_SPACING_Z + gh) / 2;
-    const totalW = (cols - 1) * ISLAND_SPACING_X + gw + 5.6;
-    const totalH = (rows - 1) * ISLAND_SPACING_Z + gh + 7.2;
-
-    const frame = this.computeIdealFraming(totalW, totalH, 2.5);
-    this.camGoalTarget.set(centerX, 0, centerZ + frame.zBias * 0.6);
-    this.camGoalPolar = frame.polar;
-    this.camGoalRadius = Math.max(24, Math.min(135, frame.radius));
-    this.camGoalAzimuth = 0;
-
-    if (snapImmediate) {
-      this.camTarget.copy(this.camGoalTarget);
-      this.camPolar = this.camGoalPolar;
-      this.camRadius = this.camGoalRadius;
-      this.camAzimuth = 0;
-    }
-    this.updateSunShadowFrustum();
-  }
+  // ==========================================================================
+  // ELEVATED TABLETOP ISLAND, 3-SHAPE PROPS, SPIRES, GATES & RUNNERS
+  // ==========================================================================
 
   private computeLayoutSignature(round: RoundConfig): string {
     const sStr = round.preplacedSpires
       .map((s) => `${s.x},${s.y},${s.spireType || 'THUNDERCLAP'}`)
       .join(';');
     const oStr = round.obstacles.map((o) => `${o.x},${o.y}`).join(';');
-    return `${round.roundNumber}|${round.spawn.x},${round.spawn.y}|${round.exit.x},${round.exit.y}|${round.runnerType || 'SCOUT'}|${sStr}|${oStr}`;
+    return `${round.roundNumber}|${round.seed ?? 0}|${round.spawn.x},${round.spawn.y}|${round.exit.x},${round.exit.y}|${round.runnerType || 'SCOUT'}|${sStr}|${oStr}`;
   }
 
-  public syncRoomState(state: RoomState, localPlayerId: string | null) {
+  public syncRoomState(state: RoomState, localPlayerId: string | null): void {
     const firstSync = !this.currentRoomState;
+    const prevPhase = this.lastRoomPhase;
+    this.lastRoomPhase = state.phase;
+
     const newSig = this.computeLayoutSignature(state.roundConfig);
     const layoutChanged = newSig !== this.lastLayoutSignature;
     this.lastLayoutSignature = newSig;
@@ -2215,7 +3831,11 @@ export class Arena3DRenderer {
     this.currentRoomState = state;
     this.localPlayerId = localPlayerId;
 
-    // Dynamically center Tranquil Cerulean Sea on the active multi-island arena bounds
+    if (state.phase !== 'RUN') {
+      this.latestSimStates.clear();
+    }
+
+    // Center sea around active multi-island grid
     const count = Math.max(1, state.players.length);
     const cols = Math.min(3, count);
     const rows = Math.ceil(count / 3);
@@ -2223,20 +3843,50 @@ export class Arena3DRenderer {
       ((cols - 1) * ISLAND_SPACING_X + state.roundConfig.gridWidth) * 0.5;
     const arenaCenterZ =
       ((rows - 1) * ISLAND_SPACING_Z + state.roundConfig.gridHeight) * 0.5;
-    this.seaMesh.position.set(arenaCenterX, -0.65, arenaCenterZ);
+    this.seaMesh.position.set(arenaCenterX, SEA_LEVEL_Y, arenaCenterZ);
     this.voidSeaMat.uniforms.uArenaCenter.value.set(arenaCenterX, arenaCenterZ);
 
+    // Dispose & remove disconnected islands cleanly (zero VRAM leaks!)
     const activeIds = new Set(state.players.map((p) => p.id));
     for (const [pid, isl] of this.islands.entries()) {
       if (!activeIds.has(pid)) {
-        if (isl.pathMesh) isl.pathMesh.geometry.dispose();
+        this.disposeSubtree(isl.root);
         this.scene.remove(isl.root);
         this.islands.delete(pid);
-        this.labelElements.get(pid)?.remove();
-        this.labelElements.delete(pid);
-        this.runnerLabels.get(pid)?.remove();
-        this.runnerLabels.delete(pid);
+        this.islandBadges.get(pid)?.root.remove();
+        this.islandBadges.delete(pid);
+        this.runnerBadges.get(pid)?.root.remove();
+        this.runnerBadges.delete(pid);
       }
+    }
+
+    const localPlayer =
+      state.players.find((p) => p.id === localPlayerId) || null;
+    const newLocalEvalSig = localPlayer
+      ? `${newSig}|${localPlayer.towers.map((t) => `${t.x},${t.y}`).join(';')}`
+      : '';
+    const localTowersChanged = newLocalEvalSig !== this.lastLocalEvalSig;
+
+    if (localPlayer && (localTowersChanged || !this.cachedBaseEval)) {
+      this.lastLocalEvalSig = newLocalEvalSig;
+      const localPath = computeFullMazePath(
+        state.roundConfig,
+        localPlayer.towers
+      );
+      this.cachedBaseEval = evaluateMazeRunTime(
+        state.roundConfig,
+        localPlayer.towers,
+        { precomputedPath: localPath, collectClapLocations: true }
+      );
+      this.cachedLocalCircuitry = computeCitadelCircuitry(
+        state.roundConfig,
+        localPlayer.towers
+      );
+      this.cachedHoverPreview = null;
+    } else if (!localPlayer) {
+      this.lastLocalEvalSig = '';
+      this.cachedBaseEval = null;
+      this.cachedLocalCircuitry = null;
     }
 
     state.players.forEach((player, index) => {
@@ -2251,15 +3901,21 @@ export class Arena3DRenderer {
           player,
           state.roundConfig,
           offsetX,
-          offsetZ
+          offsetZ,
+          index
         );
         this.islands.set(player.id, island);
       } else {
         island.offsetX = offsetX;
         island.offsetZ = offsetZ;
         island.root.position.set(offsetX, 0, offsetZ);
+        if (island.playerColor !== player.color) {
+          island.playerColor = player.color;
+          island.trimMesh.material = this.getPlayerTrimMaterial(player.color);
+        }
         if (layoutChanged) {
           this.rebuildIslandPadsAndObstacles(island, state.roundConfig);
+          island.lastTowersSig = '__force__';
         }
       }
 
@@ -2269,119 +3925,81 @@ export class Arena3DRenderer {
         state.roundConfig,
         firstSync || layoutChanged
       );
-      this.updateIslandHeaderBadge(player);
+      this.updateIslandHeaderBadge(player, island);
     });
-
-    const localPlayer = state.players.find((p) => p.id === localPlayerId);
-    if (localPlayer) {
-      this.cachedBaseEval = evaluateMazeRunTime(
-        state.roundConfig,
-        localPlayer.towers
-      );
-    }
 
     if (firstSync && localPlayerId) {
       this.focusOnPlayerIsland(localPlayerId, true);
+    } else if (
+      prevPhase &&
+      prevPhase !== state.phase &&
+      !this.arenaOverviewMode
+    ) {
+      // Gently adjust HUD aperture zBias when bottom build dock hides/shows on BUILD <-> RUN
+      const pid = this.focusedPlayerId || this.localPlayerId;
+      const isl = pid ? this.islands.get(pid) : undefined;
+      if (isl) {
+        const gw = state.roundConfig.gridWidth;
+        const gh = state.roundConfig.gridHeight;
+        const frame = this.computeIdealFraming(gw + 2.0, gh + 3.4, 1.6);
+        const distFromCenter = Math.hypot(
+          this.camGoalTarget.x - (isl.offsetX + gw * 0.5),
+          this.camGoalTarget.z - (isl.offsetZ + gh * 0.5)
+        );
+        if (distFromCenter < 5.0) {
+          this.camGoalTarget.z = isl.offsetZ + gh * 0.5 + frame.zBias;
+        }
+      }
     }
 
     if (state.phase !== 'BUILD' || layoutChanged) {
       if (this.pendingTouchCell || this.pendingTouchTowerId) {
-        this.doClearTouchPreview();
+        this.cancelTouchGhost();
       } else {
-        this.updateBuildHover();
+        this.hideDesktopHoverVisuals();
       }
     } else if (this.pendingTouchCell || this.pendingTouchTowerId) {
-      // Preserve active mobile touch preview across bot/multiplayer ROOM_STATE ticks!
-      this.applyTouchSelectionVisuals();
-    } else {
-      this.updateBuildHover();
+      // Only re-run touch preview math on ROOM_STATE if local towers/gold actually changed!
+      if (localTowersChanged) {
+        this.applyTouchSelectionVisuals();
+      }
+    } else if (localTowersChanged) {
+      this.updateBuildHover(true);
     }
   }
 
-  /**
-   * Builds a clean, smooth-shaded miniature Cypress/Pine cluster for outer corner scale charm.
-   */
   private buildMiniatureCypressCluster(scale = 1.0): THREE.Group {
     const cluster = new THREE.Group();
+    const trunks = new THREE.Mesh(
+      this.sharedGeos.cypressTrunks,
+      this.cypressTrunkMat
+    );
+    cluster.add(trunks);
 
-    const specs = [
-      { dx: 0, dz: 0, h: 1.15, r: 0.34, matIdx: 0 },
-      { dx: 0.38, dz: 0.24, h: 0.86, r: 0.27, matIdx: 1 },
-    ];
-
-    for (const s of specs) {
-      const trunk = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.06, 0.09, 0.28, 6),
-        this.cypressTrunkMat
-      );
-      trunk.position.set(s.dx, 0.14, s.dz);
-      cluster.add(trunk);
-
-      const foliage = new THREE.Mesh(
-        new THREE.ConeGeometry(s.r, s.h, 7),
-        this.cypressFoliageMats[s.matIdx]
-      );
-      foliage.position.set(s.dx, 0.24 + s.h * 0.5, s.dz);
-      foliage.castShadow = true;
-      foliage.receiveShadow = true;
-      cluster.add(foliage);
-    }
+    const cones = new THREE.Mesh(
+      this.sharedGeos.cypressCones,
+      this.cypressFoliageMat
+    );
+    cones.castShadow = true;
+    cones.receiveShadow = true;
+    cluster.add(cones);
 
     cluster.scale.setScalar(scale);
     return cluster;
   }
 
   /**
-   * Builds a clean sculpted warm-limestone cliff segment with smooth sage turf rim
-   * (zero noisy bump maps, zero perimeter clutter).
-   */
-  private createSculptedCliffSegment(
-    cx: number,
-    cz: number,
-    w: number,
-    d: number
-  ): THREE.Group {
-    const seg = new THREE.Group();
-    if (w <= 0.2 || d <= 0.2) return seg;
-
-    const talus = new THREE.Mesh(
-      new THREE.BoxGeometry(w + 0.24, 0.42, d + 0.24),
-      this.cliffTalusMat
-    );
-    talus.position.set(cx, 0.21, cz);
-    talus.receiveShadow = true;
-    seg.add(talus);
-
-    const cliffBody = new THREE.Mesh(
-      new THREE.BoxGeometry(w, 1.16, d),
-      this.cliffLimestoneMat
-    );
-    cliffBody.position.set(cx, 0.58, cz);
-    cliffBody.castShadow = true;
-    cliffBody.receiveShadow = true;
-    seg.add(cliffBody);
-
-    const meadowRim = new THREE.Mesh(
-      new THREE.BoxGeometry(w + 0.14, 0.18, d + 0.14),
-      this.cliffMeadowRimMat
-    );
-    meadowRim.position.set(cx, 1.25, cz);
-    meadowRim.receiveShadow = true;
-    seg.add(meadowRim);
-
-    return seg;
-  }
-
-  /**
-   * Builds the Sunlit Limestone & Sage Meadow Island Basin.
-   * Eliminates the 4 giant blue-roofed corner bastions and 80%+ of cliff clutter,
-   * tucking only 3-4 clean miniature cypress clusters outside the outer corners.
+   * Builds the Elevated *Bad North* / *Townscaper* Sunlit Limestone Tabletop Plateau:
+   * - Meadow sits at `y = 0.01m` on TOP of the mesa.
+   * - Zero `1.34m` overhead trench walls blocking South rows `24–25` or Z-fighting at corners!
+   * - Chamfered warm-limestone cliffs step DOWNWARD (`y = 0.00 -> -1.42m` sea) into a submerged reef shelf.
    */
   private createIslandVisuals(
     player: PlayerState,
     round: RoundConfig,
     offsetX: number,
-    offsetZ: number
+    offsetZ: number,
+    islandIndex: number
   ): IslandVisuals {
     const root = new THREE.Group();
     root.position.set(offsetX, 0, offsetZ);
@@ -2389,72 +4007,130 @@ export class Arena3DRenderer {
     const gw = round.gridWidth;
     const gh = round.gridHeight;
 
-    // 1. Warm Limestone Island Plinth & Crisp Cream-White Shoreline Foam
-    const bankW = gw + 5.2;
-    const bankD = gh + 5.2;
-    const bank = new THREE.Mesh(
-      new THREE.BoxGeometry(bankW, 1.05, bankD),
+    // 1. Submerged Coastal Reef Terrace & Lower Talus (`y = -1.58 .. -1.06`)
+    const reefW = gw + 2.6;
+    const reefD = gh + 2.6;
+    const reefShelf = new THREE.Mesh(
+      new THREE.BoxGeometry(reefW, 0.52, reefD),
       this.cliffTalusMat
     );
-    bank.position.set(gw / 2, -0.54, gh / 2);
-    bank.receiveShadow = true;
-    root.add(bank);
+    reefShelf.position.set(gw / 2, -1.32, gh / 2);
+    reefShelf.receiveShadow = true;
+    root.add(reefShelf);
 
-    const foamGeo = new THREE.PlaneGeometry(bankW + 3.4, bankD + 3.4);
+    // Rounded Shoreline Foam + Shallow Coastal Turquoise Halo at sea level (`y = -1.39`)
+    const bankW = gw + 1.64;
+    const bankD = gh + 1.64;
+    const foamGeo = new THREE.PlaneGeometry(bankW + 4.8, bankD + 4.8);
     foamGeo.rotateX(-Math.PI / 2);
-    const foamMat = createShorelineFoamShader(bankW, bankD);
+    const foamMat = createShorelineFoamShader(
+      bankW,
+      bankD,
+      islandIndex * 0.27
+    );
     const foamMesh = new THREE.Mesh(foamGeo, foamMat);
-    foamMesh.position.set(gw / 2, -0.62, gh / 2);
+    foamMesh.position.set(gw / 2, SEA_LEVEL_Y + 0.03, gh / 2);
     foamMesh.renderOrder = 1;
     root.add(foamMesh);
 
-    // Subtle satin player-colored waterline band
-    const trimMat = new THREE.MeshStandardMaterial({
-      color: player.color,
-      roughness: 0.62,
-      metalness: 0.05,
-    });
+    // 2. Player Heraldry Waterline Band (`y = -1.08 .. -0.94`)
     const trimMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(bankW + 0.16, 0.14, bankD + 0.16),
-      trimMat
+      new THREE.BoxGeometry(bankW + 0.12, 0.14, bankD + 0.12),
+      this.getPlayerTrimMaterial(player.color)
     );
-    trimMesh.position.set(gw / 2, -0.1, gh / 2);
+    trimMesh.position.set(gw / 2, -1.01, gh / 2);
     root.add(trimMesh);
 
-    // 2. Lit Velvety Meadow Floor (20x26, receives real directional cast shadows!)
+    // 3. Upper Sunlit Limestone Escarpment (`y = -0.94 .. -0.08`) + 4 Chamfered Corner Bastion Buttresses
+    const upperCliff = new THREE.Mesh(
+      new THREE.BoxGeometry(gw + 1.48, 0.86, gh + 1.48),
+      this.cliffLimestoneMat
+    );
+    upperCliff.position.set(gw / 2, -0.51, gh / 2);
+    upperCliff.castShadow = true;
+    upperCliff.receiveShadow = true;
+    root.add(upperCliff);
+
+    const cornerCoords = [
+      { x: -0.36, z: -0.36 },
+      { x: gw + 0.36, z: -0.36 },
+      { x: -0.36, z: gh + 0.36 },
+      { x: gw + 0.36, z: gh + 0.36 },
+    ];
+    for (const c of cornerCoords) {
+      const bastion = new THREE.Mesh(
+        this.sharedGeos.plateauCornerBastion,
+        this.cliffLimestoneMat
+      );
+      bastion.position.set(c.x, -0.68, c.z);
+      bastion.castShadow = true;
+      bastion.receiveShadow = true;
+      root.add(bastion);
+    }
+
+    // 4. Outer Grassy Plateau Shoulder (`y = -0.08 .. 0.00`)
+    const turfShoulder = new THREE.Mesh(
+      new THREE.BoxGeometry(gw + 1.62, 0.08, gh + 1.62),
+      this.plateauShoulderTurfMat
+    );
+    turfShoulder.position.set(gw / 2, -0.04, gh / 2);
+    turfShoulder.receiveShadow = true;
+    root.add(turfShoulder);
+
+    // 5. Low Flush West & East Limestone Coping Curbs (`y = 0.00..0.036`, strictly outside `[0..gw]`)
+    const curbThick = 0.22;
+    const westCurb = new THREE.Mesh(
+      new THREE.BoxGeometry(curbThick, 0.038, gh + curbThick * 2),
+      this.plateauCurbMat
+    );
+    westCurb.position.set(-curbThick * 0.5, 0.019, gh / 2);
+    westCurb.receiveShadow = true;
+    root.add(westCurb);
+
+    const eastCurb = new THREE.Mesh(
+      new THREE.BoxGeometry(curbThick, 0.038, gh + curbThick * 2),
+      this.plateauCurbMat
+    );
+    eastCurb.position.set(gw + curbThick * 0.5, 0.019, gh / 2);
+    eastCurb.receiveShadow = true;
+    root.add(eastCurb);
+
+    // 6. Grounded Miniature Cypress Clusters on the 4 Outer Plateau Shoulders (`y = 0.0`)
+    const cornerClusters = [
+      { x: -0.58, z: -0.56, s: 0.84, rot: 0.4 },
+      { x: gw + 0.56, z: -0.58, s: 0.78, rot: 2.1 },
+      { x: -0.56, z: gh + 0.54, s: 0.8, rot: 1.2 },
+      { x: gw + 0.58, z: gh + 0.56, s: 0.86, rot: 3.6 },
+    ];
+    for (const cc of cornerClusters) {
+      const cluster = this.buildMiniatureCypressCluster(cc.s);
+      cluster.position.set(cc.x, 0.0, cc.z);
+      cluster.rotation.y = cc.rot;
+      root.add(cluster);
+    }
+
+    // 7. Lit Velvety Meadow Floor (`20x26` at `y = 0.01`)
     const floorGeo = new THREE.PlaneGeometry(gw, gh);
     floorGeo.rotateX(-Math.PI / 2);
     const { material: floorMat, uniforms: floorUniforms } =
-      createGrasslandFloorMaterial();
+      createGrasslandFloorMaterial(this.isCoarseOrCompactDevice());
     floorUniforms.uGridSize.value.set(gw, gh);
     const floorMesh = new THREE.Mesh(floorGeo, floorMat);
     floorMesh.position.set(gw / 2, 0.01, gh / 2);
     floorMesh.receiveShadow = true;
     root.add(floorMesh);
 
-    // 3. Clean West & East Sculpted Limestone Cliff Walls
-    const rimThick = 2.0;
-    root.add(this.createSculptedCliffSegment(-rimThick / 2, gh / 2, rimThick, gh));
-    root.add(
-      this.createSculptedCliffSegment(gw + rimThick / 2, gh / 2, rimThick, gh)
-    );
+    // Veiled Fog-of-War Mist Shroud for hidden rival islands
+    const fogVeilGeo = new THREE.PlaneGeometry(gw - 0.3, gh - 0.3);
+    fogVeilGeo.rotateX(-Math.PI / 2);
+    const fogVeilMesh = new THREE.Mesh(fogVeilGeo, this.fogVeilMat);
+    fogVeilMesh.position.set(gw / 2, 0.24, gh / 2);
+    fogVeilMesh.renderOrder = 8;
+    fogVeilMesh.visible = false;
+    root.add(fogVeilMesh);
 
-    // Only 3-4 clean miniature cypress clusters tucked outside outer corners for scale charm
-    const cornerClusters = [
-      { x: -1.25, z: -1.15, s: 0.92, rot: 0.4 },
-      { x: gw + 1.15, z: -1.2, s: 0.85, rot: 2.1 },
-      { x: -1.2, z: gh + 1.1, s: 0.88, rot: 1.2 },
-      { x: gw + 1.2, z: gh + 1.15, s: 0.95, rot: 3.6 },
-    ];
-    for (const cc of cornerClusters) {
-      const cluster = this.buildMiniatureCypressCluster(cc.s);
-      cluster.position.set(cc.x, 1.34, cc.z);
-      cluster.rotation.y = cc.rot;
-      root.add(cluster);
-    }
-
-    // Invisible Raycast Hit Plane covering the exact 20x26 buildable meadow
-    const hitGeo = new THREE.PlaneGeometry(gw, gh);
+    // Padded Raycast Hit Plane (`gw + 1.2 x gh + 1.2`)
+    const hitGeo = new THREE.PlaneGeometry(gw + 1.2, gh + 1.2);
     hitGeo.rotateX(-Math.PI / 2);
     const hitPlane = new THREE.Mesh(
       hitGeo,
@@ -2466,6 +4142,9 @@ export class Arena3DRenderer {
     const padGroup = new THREE.Group();
     root.add(padGroup);
 
+    const conduitGroup = new THREE.Group();
+    root.add(conduitGroup);
+
     const towerGroup = new THREE.Group();
     root.add(towerGroup);
 
@@ -2475,7 +4154,9 @@ export class Arena3DRenderer {
     const clapMarkerGroup = new THREE.Group();
     root.add(clapMarkerGroup);
 
-    // Toy-Box Runner standing right at the North border entrance (y = 0)
+    const pathMat = createPathRibbonShader('#fefce8', 0.66);
+    const conduitMat = createLeyConduitShader(false);
+
     const runner = this.buildArticulatedRunnerRig(
       player.color,
       round.runnerType || 'SCOUT'
@@ -2498,20 +4179,25 @@ export class Arena3DRenderer {
       floorMat,
       floorUniforms,
       foamMat,
+      conduitMat,
+      fogVeilMesh,
       trimMesh,
       hitPlane,
       padGroup,
       towerGroup,
       bridgeGroup,
+      conduitGroup,
       bridgeEntries: [],
       clapMarkerGroup,
       towerMeshes: new Map(),
       spireRigs: [],
       ruinRigs: [],
       pathMesh: null,
-      pathMat: null,
+      pathMat,
       runner,
-      checkpointRings: [],
+      lastTowersSig: '',
+      lastSimStatus: '',
+      lastSimTimeText: '',
     };
 
     this.rebuildIslandPadsAndObstacles(visuals, round);
@@ -2521,11 +4207,12 @@ export class Arena3DRenderer {
   }
 
   /**
-   * Builds unmistakable *Bad North* Toy-Box Runner rigs with distinct archetype silhouettes & props:
-   * - `SCOUT`: Azure tunic, feathered wayfarer hood + compact glowing lantern-staff
-   * - `OUTRIDER`: Terracotta-crimson tunic, sweeping gold plume + forward-couched cavalry lance & gold pennant
-   * - `JUGGERNAUT`: Heavy slate-iron plate, broad steel pauldrons + wide Heater/Tower Shield (left) & iron warhammer (right)
-   * - `HERALD`: Viridian-teal tunic, twin swept-back emerald wind-wings + forked gale rod
+   * Heroic Top-Down Runner Archetypes (Zero Wall-Clipping, High Shadow Contrast):
+   * - `SCOUT`: Azure cloak + sky-white feather + glowing cyan wayfarer lantern (`r = 0.14m`).
+   * - `OUTRIDER`: Royal Cobalt (`#1d4ed8`) + White/Gold (decoupled from Crimson Keep red!),
+   *   shortened `0.90m` non-clipping spear + tall back-mounted fluttering gold pennant (`y = 1.48m`).
+   * - `JUGGERNAUT`: Gleaming Silver-Steel (`#cbd5e1`) pauldrons & greathelm + wide `0.56m` gilded Pavise + maul.
+   * - `HERALD`: Viridian tunic + wide `0.68m` swept emerald V-wings that flare wide during Tailwind Haste!
    */
   private buildArticulatedRunnerRig(
     playerColor: string,
@@ -2536,24 +4223,18 @@ export class Arena3DRenderer {
       root.scale.set(1.16, 1.12, 1.16);
     }
 
-    // Soft ground contact shadow under feet
     const footShadow = new THREE.Mesh(this.sharedGeos.aoQuad, this.aoDiscMat);
-    footShadow.scale.setScalar(0.52);
+    footShadow.scale.setScalar(0.54);
     footShadow.position.y = 0.016;
     footShadow.renderOrder = 2;
     root.add(footShadow);
 
-    // Flat status ring under Runner's feet (Slow / Frost / Haste)
-    const statusRingGeo = new THREE.RingGeometry(0.35, 0.49, 28);
-    statusRingGeo.rotateX(-Math.PI / 2);
-    const statusRingMat = new THREE.MeshBasicMaterial({
-      color: '#f59e0b',
-      transparent: true,
-      opacity: 0.85,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const statusRing = new THREE.Mesh(statusRingGeo, statusRingMat);
+    const statusRingMat = createRunnerStatusRingShader();
+    const statusRing = new THREE.Mesh(
+      this.sharedGeos.unitCirclePlane,
+      statusRingMat
+    );
+    statusRing.scale.setScalar(0.52);
     statusRing.position.y = 0.028;
     statusRing.renderOrder = 7;
     statusRing.visible = false;
@@ -2565,7 +4246,7 @@ export class Arena3DRenderer {
 
     const tunicColor =
       runnerType === 'OUTRIDER'
-        ? '#c84b31'
+        ? '#1d4ed8'
         : runnerType === 'JUGGERNAUT'
         ? '#475569'
         : runnerType === 'HERALD'
@@ -2573,31 +4254,40 @@ export class Arena3DRenderer {
         : '#2563eb';
 
     const torsoMesh = new THREE.Mesh(
-      new THREE.ConeGeometry(0.33, 0.8, 8),
+      this.sharedGeos.runnerTorso,
       new THREE.MeshStandardMaterial({
         color: tunicColor,
         emissive: playerColor,
-        emissiveIntensity: 0.14,
-        roughness: runnerType === 'JUGGERNAUT' ? 0.38 : 0.62,
-        metalness: runnerType === 'JUGGERNAUT' ? 0.45 : 0.12,
+        emissiveIntensity: 0.12,
+        roughness: runnerType === 'JUGGERNAUT' ? 0.36 : 0.58,
+        metalness: runnerType === 'JUGGERNAUT' ? 0.48 : 0.1,
       })
     );
     torsoMesh.position.y = 0.25;
     torsoMesh.castShadow = true;
     pelvis.add(torsoMesh);
 
+    // High-contrast bright collar so runners never disappear inside directional shadows
+    const collar = new THREE.Mesh(
+      this.sharedGeos.runnerCollar,
+      runnerType === 'JUGGERNAUT'
+        ? this.runnerSteelBrightMat
+        : this.runnerCollarIvoryMat
+    );
+    collar.position.y = 0.54;
+    pelvis.add(collar);
+
+    let leftWing: THREE.Mesh | null = null;
+    let rightWing: THREE.Mesh | null = null;
+    let pennantMesh: THREE.Mesh | null = null;
+
     if (runnerType === 'JUGGERNAUT') {
-      const pauldronMat = new THREE.MeshStandardMaterial({
-        color: '#94a3b8',
-        roughness: 0.35,
-        metalness: 0.55,
-      });
-      for (const side of [-0.32, 0.32]) {
+      for (const side of [-0.34, 0.34]) {
         const pauldron = new THREE.Mesh(
-          new THREE.DodecahedronGeometry(0.18, 0),
-          pauldronMat
+          this.sharedGeos.runnerPauldron,
+          this.runnerSteelBrightMat
         );
-        pauldron.position.set(side, 0.5, 0);
+        pauldron.position.set(side, 0.52, 0);
         pauldron.castShadow = true;
         pelvis.add(pauldron);
       }
@@ -2605,81 +4295,82 @@ export class Arena3DRenderer {
       const wingMat = new THREE.MeshStandardMaterial({
         color: '#6ee7b7',
         emissive: '#10b981',
-        emissiveIntensity: 0.3,
-        roughness: 0.4,
+        emissiveIntensity: 0.28,
+        roughness: 0.36,
       });
-      for (const side of [-0.23, 0.23]) {
-        const wing = new THREE.Mesh(
-          new THREE.BoxGeometry(0.06, 0.48, 0.3),
-          wingMat
-        );
-        wing.position.set(side, 0.43, -0.21);
-        wing.rotation.y = side > 0 ? 0.38 : -0.38;
-        wing.rotation.x = 0.28;
-        wing.castShadow = true;
-        pelvis.add(wing);
-      }
+      leftWing = new THREE.Mesh(this.sharedGeos.runnerWing, wingMat);
+      leftWing.position.set(-0.26, 0.46, -0.22);
+      leftWing.rotation.set(0.28, -0.42, -0.14);
+      leftWing.castShadow = true;
+      pelvis.add(leftWing);
+
+      rightWing = new THREE.Mesh(this.sharedGeos.runnerWing, wingMat);
+      rightWing.position.set(0.26, 0.46, -0.22);
+      rightWing.rotation.set(0.28, 0.42, 0.14);
+      rightWing.castShadow = true;
+      pelvis.add(rightWing);
+    } else if (runnerType === 'OUTRIDER') {
+      // Tall back-mounted fluttering gold cavalry pennant visible above walls!
+      const pole = new THREE.Mesh(
+        this.sharedGeos.runnerPennantPole,
+        this.cypressTrunkMat
+      );
+      pole.position.set(-0.14, 0.68, -0.18);
+      pole.rotation.x = -0.12;
+      pelvis.add(pole);
+
+      pennantMesh = new THREE.Mesh(
+        this.sharedGeos.runnerPennantFlag,
+        this.runnerGoldAccentMat
+      );
+      pennantMesh.position.set(-0.14, 1.06, -0.4);
+      pennantMesh.castShadow = true;
+      pelvis.add(pennantMesh);
     }
 
     const headGroup = new THREE.Group();
-    headGroup.position.y = 0.73;
+    headGroup.position.y = 0.75;
 
-    const helmColor =
-      runnerType === 'SCOUT'
-        ? '#1d4ed8'
-        : runnerType === 'HERALD'
-        ? '#115e59'
-        : '#334155';
-    const helm = new THREE.Mesh(
-      new THREE.DodecahedronGeometry(0.22, 0),
-      new THREE.MeshStandardMaterial({
-        color: helmColor,
-        roughness: runnerType === 'SCOUT' ? 0.65 : 0.45,
-        metalness: runnerType === 'SCOUT' ? 0.08 : 0.35,
-      })
-    );
+    const helmMat =
+      runnerType === 'JUGGERNAUT'
+        ? this.runnerSteelBrightMat
+        : new THREE.MeshStandardMaterial({
+            color:
+              runnerType === 'OUTRIDER'
+                ? '#e2e8f0'
+                : runnerType === 'HERALD'
+                ? '#115e59'
+                : '#1e40af',
+            roughness: 0.45,
+            metalness: runnerType === 'OUTRIDER' ? 0.42 : 0.12,
+          });
+    const helm = new THREE.Mesh(this.sharedGeos.runnerHelm, helmMat);
     helm.castShadow = true;
     headGroup.add(helm);
 
     if (runnerType === 'SCOUT') {
-      // Feathered wayfarer hood crest
       const hoodPeak = new THREE.Mesh(
-        new THREE.ConeGeometry(0.16, 0.24, 6),
-        new THREE.MeshStandardMaterial({
-          color: '#1e40af',
-          roughness: 0.7,
-        })
+        this.sharedGeos.runnerHoodPeak,
+        this.northGateRoofMat
       );
       hoodPeak.position.set(0, 0.16, -0.06);
       hoodPeak.rotation.x = -0.45;
       headGroup.add(hoodPeak);
 
       const feather = new THREE.Mesh(
-        new THREE.ConeGeometry(0.055, 0.32, 5),
-        new THREE.MeshStandardMaterial({
-          color: '#38bdf8',
-          emissive: '#0284c7',
-          emissiveIntensity: 0.25,
-          roughness: 0.45,
-        })
+        this.sharedGeos.runnerFeather,
+        this.runnerCollarIvoryMat
       );
-      feather.position.set(0.12, 0.24, -0.1);
+      feather.position.set(0.12, 0.25, -0.1);
       feather.rotation.set(-0.55, 0, -0.22);
       headGroup.add(feather);
     } else if (runnerType === 'OUTRIDER') {
-      // Sweeping golden cavalry helm plume
       const plume = new THREE.Mesh(
-        new THREE.ConeGeometry(0.11, 0.42, 6),
-        new THREE.MeshStandardMaterial({
-          color: '#fbbf24',
-          emissive: '#d97706',
-          emissiveIntensity: 0.2,
-          roughness: 0.45,
-        })
+        this.sharedGeos.runnerPlume,
+        this.runnerGoldAccentMat
       );
-      plume.position.set(0, 0.25, -0.11);
-      plume.rotation.x = -0.62;
-      plume.castShadow = true;
+      plume.position.set(0, 0.25, -0.1);
+      plume.rotation.x = -0.58;
       headGroup.add(plume);
     }
 
@@ -2692,30 +4383,28 @@ export class Arena3DRenderer {
         ? '#34d399'
         : '#38bdf8';
     const visor = new THREE.Mesh(
-      new THREE.BoxGeometry(0.2, 0.08, 0.1),
+      this.sharedGeos.runnerVisor,
       new THREE.MeshBasicMaterial({ color: visorColor })
     );
-    visor.position.set(0, 0.01, 0.17);
+    visor.position.set(0, 0.01, 0.18);
     headGroup.add(visor);
     pelvis.add(headGroup);
 
-    const armGeo = new THREE.BoxGeometry(0.11, 0.38, 0.11);
-    const armMat = new THREE.MeshStandardMaterial({
-      color: runnerType === 'JUGGERNAUT' ? '#64748b' : '#f5f0e6',
-      roughness: runnerType === 'JUGGERNAUT' ? 0.45 : 0.65,
-      metalness: runnerType === 'JUGGERNAUT' ? 0.35 : 0.05,
-    });
+    const armMat =
+      runnerType === 'JUGGERNAUT'
+        ? this.runnerSteelBrightMat
+        : this.ivoryShaftMat;
 
     const leftArm = new THREE.Group();
-    leftArm.position.set(-0.27, 0.46, 0);
-    const lArmMesh = new THREE.Mesh(armGeo, armMat);
+    leftArm.position.set(-0.28, 0.46, 0);
+    const lArmMesh = new THREE.Mesh(this.sharedGeos.runnerArm, armMat);
     lArmMesh.position.y = -0.15;
     leftArm.add(lArmMesh);
     pelvis.add(leftArm);
 
     const rightArm = new THREE.Group();
-    rightArm.position.set(0.27, 0.46, 0);
-    const rArmMesh = new THREE.Mesh(armGeo, armMat);
+    rightArm.position.set(0.28, 0.46, 0);
+    const rArmMesh = new THREE.Mesh(this.sharedGeos.runnerArm, armMat);
     rArmMesh.position.y = -0.15;
     rightArm.add(rArmMesh);
     pelvis.add(rightArm);
@@ -2723,207 +4412,117 @@ export class Arena3DRenderer {
     let accentMesh: THREE.Mesh | null = null;
 
     if (runnerType === 'JUGGERNAUT') {
-      // Chunky wide Heater/Tower Shield on leftArm (angled forward-left so it reads from top-down!)
       const shieldGroup = new THREE.Group();
-      shieldGroup.position.set(-0.08, -0.12, 0.24);
-      shieldGroup.rotation.set(-0.22, -0.32, 0.08);
+      shieldGroup.position.set(-0.1, -0.1, 0.25);
+      shieldGroup.rotation.set(-0.24, -0.34, 0.08);
 
       const shieldPlate = new THREE.Mesh(
-        new THREE.BoxGeometry(0.46, 0.58, 0.09),
-        new THREE.MeshStandardMaterial({
-          color: '#334155',
-          roughness: 0.38,
-          metalness: 0.52,
-        })
+        this.sharedGeos.runnerShieldPlate,
+        this.runnerSteelDarkMat
       );
       shieldPlate.castShadow = true;
-      shieldPlate.receiveShadow = true;
       shieldGroup.add(shieldPlate);
 
       const shieldRim = new THREE.Mesh(
-        new THREE.BoxGeometry(0.5, 0.1, 0.11),
-        new THREE.MeshStandardMaterial({
-          color: '#cbd5e1',
-          roughness: 0.32,
-          metalness: 0.6,
-        })
+        this.sharedGeos.runnerShieldRim,
+        this.runnerSteelBrightMat
       );
-      shieldRim.position.y = 0.25;
+      shieldRim.position.y = 0.27;
       shieldGroup.add(shieldRim);
 
       const shieldBoss = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.11, 0.13, 0.08, 8),
-        new THREE.MeshStandardMaterial({
-          color: '#fbbf24',
-          emissive: '#d97706',
-          emissiveIntensity: 0.28,
-          roughness: 0.3,
-          metalness: 0.5,
-        })
+        this.sharedGeos.runnerShieldBoss,
+        this.runnerGoldAccentMat
       );
-      shieldBoss.rotation.x = Math.PI / 2;
       shieldBoss.position.z = 0.05;
       shieldGroup.add(shieldBoss);
       leftArm.add(shieldGroup);
       leftArm.rotation.x = 0.28;
 
-      // Heavy iron warhammer/mace on rightArm
       const maceShaft = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.03, 0.035, 0.86, 6),
+        this.sharedGeos.runnerWeaponShaft,
         this.cypressTrunkMat
       );
-      maceShaft.position.set(0.05, 0.02, 0.18);
+      maceShaft.position.set(0.05, 0.04, 0.18);
       maceShaft.rotation.x = 0.45;
       rightArm.add(maceShaft);
 
       const maceHead = new THREE.Mesh(
-        new THREE.DodecahedronGeometry(0.17, 0),
-        new THREE.MeshStandardMaterial({
-          color: '#64748b',
-          roughness: 0.34,
-          metalness: 0.62,
-        })
+        this.sharedGeos.runnerMaceHead,
+        this.runnerSteelBrightMat
       );
-      maceHead.position.set(0.05, 0.39, 0.36);
+      maceHead.position.set(0.05, 0.42, 0.36);
       maceHead.castShadow = true;
       rightArm.add(maceHead);
     } else if (runnerType === 'OUTRIDER') {
-      // Forward-couched Cavalry Lance + Gold Pennant on rightArm
-      const lanceGroup = new THREE.Group();
-      lanceGroup.position.set(0.05, -0.14, 0.34);
-      lanceGroup.rotation.x = 1.18; // Couched forward along travel direction!
+      // Compact 0.90m non-clipping cavalry spear
+      const spearGroup = new THREE.Group();
+      spearGroup.position.set(0.05, -0.12, 0.18);
+      spearGroup.rotation.x = 1.05;
 
-      const lanceShaft = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.02, 0.042, 1.62, 6),
+      const spearShaft = new THREE.Mesh(
+        this.sharedGeos.runnerWeaponShaft,
         this.cypressTrunkMat
       );
-      lanceShaft.castShadow = true;
-      lanceGroup.add(lanceShaft);
+      spearGroup.add(spearShaft);
 
-      const vamplate = new THREE.Mesh(
-        new THREE.ConeGeometry(0.12, 0.18, 8),
-        new THREE.MeshStandardMaterial({
-          color: '#cbd5e1',
-          roughness: 0.32,
-          metalness: 0.58,
-        })
+      const spearTip = new THREE.Mesh(
+        this.sharedGeos.runnerSpearTip,
+        this.runnerSteelBrightMat
       );
-      vamplate.position.y = -0.22;
-      lanceGroup.add(vamplate);
-
-      const lanceTip = new THREE.Mesh(
-        new THREE.ConeGeometry(0.055, 0.28, 6),
-        new THREE.MeshStandardMaterial({
-          color: '#e2e8f0',
-          roughness: 0.28,
-          metalness: 0.68,
-        })
-      );
-      lanceTip.position.y = 0.92;
-      lanceGroup.add(lanceTip);
-
-      const pennant = new THREE.Mesh(
-        new THREE.BoxGeometry(0.025, 0.24, 0.34),
-        new THREE.MeshStandardMaterial({
-          color: '#fbbf24',
-          emissive: '#d97706',
-          emissiveIntensity: 0.3,
-          roughness: 0.45,
-        })
-      );
-      pennant.position.set(0, 0.58, -0.18);
-      lanceGroup.add(pennant);
-      rightArm.add(lanceGroup);
+      spearTip.position.y = 0.54;
+      spearGroup.add(spearTip);
+      rightArm.add(spearGroup);
     } else if (runnerType === 'HERALD') {
-      // Forked Gale Rod + Emerald Wind Crystal on rightArm
       const rodGroup = new THREE.Group();
-      rodGroup.position.set(0.04, 0.06, 0.18);
-      rodGroup.rotation.x = 0.26;
+      rodGroup.position.set(0.05, 0.04, 0.18);
+      rodGroup.rotation.x = 0.28;
 
       const rodShaft = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.024, 0.028, 1.12, 6),
+        this.sharedGeos.runnerWeaponShaft,
         this.cypressTrunkMat
       );
       rodGroup.add(rodShaft);
 
-      const prongMat = new THREE.MeshStandardMaterial({
-        color: '#99f6e4',
-        roughness: 0.35,
-        metalness: 0.3,
-      });
-      for (const side of [-1, 1]) {
-        const prong = new THREE.Mesh(
-          new THREE.BoxGeometry(0.04, 0.28, 0.04),
-          prongMat
-        );
-        prong.position.set(side * 0.085, 0.64, 0);
-        prong.rotation.z = -side * 0.28;
-        rodGroup.add(prong);
-      }
-
       const galeGem = new THREE.Mesh(
-        new THREE.OctahedronGeometry(0.11, 0),
+        this.sharedGeos.runnerOrbGem,
         new THREE.MeshBasicMaterial({ color: '#34d399' })
       );
-      galeGem.position.set(0, 0.68, 0);
+      galeGem.position.set(0, 0.54, 0);
       rodGroup.add(galeGem);
       accentMesh = galeGem;
       rightArm.add(rodGroup);
     } else {
-      // SCOUT: Compact Wayfarer Lantern-Staff on rightArm
       const staffGroup = new THREE.Group();
-      staffGroup.position.set(0.04, 0.04, 0.18);
-      staffGroup.rotation.x = 0.22;
+      staffGroup.position.set(0.06, 0.04, 0.18);
+      staffGroup.rotation.x = 0.24;
 
       const staffShaft = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.024, 0.028, 1.02, 6),
+        this.sharedGeos.runnerWeaponShaft,
         this.cypressTrunkMat
       );
       staffGroup.add(staffShaft);
 
-      const crookBar = new THREE.Mesh(
-        new THREE.BoxGeometry(0.04, 0.04, 0.18),
-        this.cypressTrunkMat
-      );
-      crookBar.position.set(0, 0.52, 0.07);
-      staffGroup.add(crookBar);
-
-      const lanternCap = new THREE.Mesh(
-        new THREE.ConeGeometry(0.11, 0.08, 6),
-        new THREE.MeshStandardMaterial({
-          color: '#334155',
-          roughness: 0.5,
-          metalness: 0.4,
-        })
-      );
-      lanternCap.position.set(0, 0.47, 0.14);
-      staffGroup.add(lanternCap);
-
       const lanternGlow = new THREE.Mesh(
-        new THREE.OctahedronGeometry(0.11, 0),
+        this.sharedGeos.runnerOrbGem,
         new THREE.MeshBasicMaterial({ color: '#38bdf8' })
       );
-      lanternGlow.position.set(0, 0.36, 0.14);
+      lanternGlow.position.set(0.04, 0.48, 0.1);
       staffGroup.add(lanternGlow);
       accentMesh = lanternGlow;
       rightArm.add(staffGroup);
     }
 
-    const legGeo = new THREE.BoxGeometry(0.12, 0.36, 0.14);
-    const legMat = new THREE.MeshStandardMaterial({
-      color: '#334155',
-      roughness: 0.65,
-    });
     const leftLeg = new THREE.Group();
     leftLeg.position.set(-0.12, -0.05, 0);
-    const lLegMesh = new THREE.Mesh(legGeo, legMat);
+    const lLegMesh = new THREE.Mesh(this.sharedGeos.runnerLeg, this.runnerLegMat);
     lLegMesh.position.y = -0.15;
     leftLeg.add(lLegMesh);
     pelvis.add(leftLeg);
 
     const rightLeg = new THREE.Group();
     rightLeg.position.set(0.12, -0.05, 0);
-    const rLegMesh = new THREE.Mesh(legGeo, legMat);
+    const rLegMesh = new THREE.Mesh(this.sharedGeos.runnerLeg, this.runnerLegMat);
     rLegMesh.position.y = -0.15;
     rightLeg.add(rLegMesh);
     pelvis.add(rightLeg);
@@ -2935,32 +4534,36 @@ export class Arena3DRenderer {
       headGroup,
       leftArm,
       rightArm,
+      leftWing,
+      rightWing,
+      pennantMesh,
       accentMesh,
       leftLeg,
       rightLeg,
       statusRing,
+      statusRingMat,
       walkPhase: 0,
       currentYaw: 0,
     };
   }
 
   /**
-   * Rebuilds North Gatehouse (`z < 0`, flush at `y = 0`), South Shrine (`z > 26`, flush at `y = 26`),
-   * Pre-Placed Elemental Spires, and Pre-Placed Crimson Keep Pillars.
+   * Rebuilds North Gatehouse, South Shrine, Flush North/South Coping Curbs,
+   * Open-Crown Elemental Spires, and Buttressed Crimson Keeps (disposing prior dynamic resources).
    */
   private rebuildIslandPadsAndObstacles(
     island: IslandVisuals,
     round: RoundConfig
   ) {
+    this.disposeSubtree(island.padGroup);
     island.padGroup.clear();
-    island.checkpointRings = [];
     island.spireRigs = [];
     island.ruinRigs = [];
 
     const gw = round.gridWidth;
     const gh = round.gridHeight;
-    const rimThick = 2.0;
-    const gateHalfGap = 1.95;
+    const curbThick = 0.22;
+    const gateHalfGap = 1.45;
 
     const spawnCx = round.spawn.x + 1.0;
     const spawnBorderZ = round.spawn.y === 0 ? 0.0 : round.spawn.y + 1.0;
@@ -2970,175 +4573,137 @@ export class Arena3DRenderer {
         ? round.gridHeight
         : round.exit.y + 1.0;
 
-    // 1. Sculpted North & South Cliff Walls notched cleanly at spawnCx & exitCx
-    const leftNorthW = spawnCx - gateHalfGap + rimThick;
-    island.padGroup.add(
-      this.createSculptedCliffSegment(
-        -rimThick + leftNorthW / 2,
-        -rimThick / 2,
-        leftNorthW,
-        rimThick
-      )
-    );
-    const rightNorthW = gw - (spawnCx + gateHalfGap) + rimThick;
-    island.padGroup.add(
-      this.createSculptedCliffSegment(
-        spawnCx + gateHalfGap + rightNorthW / 2,
-        -rimThick / 2,
-        rightNorthW,
-        rimThick
-      )
-    );
+    // 1. Low Flush North & South Coping Curbs notched cleanly at Spawn & Exit (zero cell occlusion!)
+    const addCurbSpan = (x0: number, x1: number, cz: number) => {
+      const spanW = x1 - x0;
+      if (spanW <= 0.1) return;
+      const curb = new THREE.Mesh(
+        new THREE.BoxGeometry(spanW, 0.038, curbThick),
+        this.plateauCurbMat
+      );
+      curb.position.set((x0 + x1) * 0.5, 0.019, cz);
+      curb.receiveShadow = true;
+      island.padGroup.add(curb);
+    };
 
-    const leftSouthW = exitCx - gateHalfGap + rimThick;
-    island.padGroup.add(
-      this.createSculptedCliffSegment(
-        -rimThick + leftSouthW / 2,
-        gh + rimThick / 2,
-        leftSouthW,
-        rimThick
-      )
-    );
-    const rightSouthW = gw - (exitCx + gateHalfGap) + rimThick;
-    island.padGroup.add(
-      this.createSculptedCliffSegment(
-        exitCx + gateHalfGap + rightSouthW / 2,
-        gh + rimThick / 2,
-        rightSouthW,
-        rimThick
-      )
-    );
+    addCurbSpan(0, spawnCx - gateHalfGap, -curbThick * 0.5);
+    addCurbSpan(spawnCx + gateHalfGap, gw, -curbThick * 0.5);
+    addCurbSpan(0, exitCx - gateHalfGap, gh + curbThick * 0.5);
+    addCurbSpan(exitCx + gateHalfGap, gw, gh + curbThick * 0.5);
 
-    // 2. Clean Warm-Limestone North Gatehouse (z < 0, flush at y = 0 with sky-azure threshold #38bdf8)
+    // 2. Distinct North Gatehouse (`y = 0`, slate-blue steeped roof + south-pointing chevron apron)
     const spawnGate = new THREE.Group();
     spawnGate.position.set(spawnCx, 0, spawnBorderZ);
 
-    const northStep = new THREE.Mesh(
-      new THREE.BoxGeometry(3.2, 0.12, 1.85),
+    const northApron = new THREE.Mesh(
+      new THREE.BoxGeometry(2.8, 0.06, 1.5),
       this.plinthSandstoneMat
     );
-    northStep.position.set(0, 0.06, -0.96);
-    northStep.receiveShadow = true;
-    spawnGate.add(northStep);
+    northApron.position.set(0, 0.01, -0.45);
+    northApron.receiveShadow = true;
+    spawnGate.add(northApron);
 
-    for (const side of [-1.25, 1.25]) {
-      const pier = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.4, 0.45, 1.65, 8),
-        this.ivoryShaftMat
-      );
-      pier.rotation.y = Math.PI / 8;
-      pier.position.set(side, 0.84, -0.72);
+    for (const side of [-1.22, 1.22]) {
+      const pier = new THREE.Mesh(this.sharedGeos.gatePier, this.ivoryShaftMat);
+      pier.position.set(side, 0.81, -0.58);
       pier.castShadow = true;
       pier.receiveShadow = true;
       spawnGate.add(pier);
 
       const pierCap = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.47, 0.42, 0.18, 8),
+        this.sharedGeos.gatePierCap,
         this.creamCapMat
       );
-      pierCap.rotation.y = Math.PI / 8;
-      pierCap.position.set(side, 1.74, -0.72);
+      pierCap.position.set(side, 1.7, -0.58);
       spawnGate.add(pierCap);
     }
 
-    const archLintel = new THREE.Mesh(
-      new THREE.BoxGeometry(3.15, 0.32, 0.62),
-      this.ivoryShaftMat
+    const northRoof = new THREE.Mesh(
+      new THREE.BoxGeometry(3.15, 0.34, 0.68),
+      this.northGateRoofMat
     );
-    archLintel.position.set(0, 1.68, -0.72);
-    archLintel.castShadow = true;
-    spawnGate.add(archLintel);
+    northRoof.position.set(0, 1.82, -0.58);
+    northRoof.castShadow = true;
+    spawnGate.add(northRoof);
 
-    const archCornice = new THREE.Mesh(
-      new THREE.BoxGeometry(3.32, 0.14, 0.72),
-      this.creamCapMat
+    const chevron = new THREE.Mesh(
+      this.sharedGeos.gateChevron,
+      this.spawnAzureMat
     );
-    archCornice.position.set(0, 1.9, -0.72);
-    spawnGate.add(archCornice);
-
-    const spawnThreshold = new THREE.Mesh(
-      new THREE.BoxGeometry(2.04, 0.05, 0.14),
-      new THREE.MeshBasicMaterial({ color: '#38bdf8' })
-    );
-    spawnThreshold.position.set(0, 0.028, -0.07);
-    spawnGate.add(spawnThreshold);
+    chevron.position.set(0, 0.03, 0.28);
+    spawnGate.add(chevron);
     island.padGroup.add(spawnGate);
 
-    // 3. Clean Warm-Limestone South Shrine (z > 26, flush at y = 26 with coral-rose threshold #fb7185)
+    // 3. Distinct South Triumphal Shrine (`y = 26`, tall obsidian/ivory piers + sacred coral-gold braziers + goal seal)
     const exitShrine = new THREE.Group();
     exitShrine.position.set(exitCx, 0, exitBorderZ);
 
-    const southStep = new THREE.Mesh(
-      new THREE.BoxGeometry(3.2, 0.12, 1.85),
+    const southApron = new THREE.Mesh(
+      new THREE.BoxGeometry(2.8, 0.06, 1.5),
       this.plinthSandstoneMat
     );
-    southStep.position.set(0, 0.06, 0.96);
-    southStep.receiveShadow = true;
-    exitShrine.add(southStep);
+    southApron.position.set(0, 0.01, 0.45);
+    southApron.receiveShadow = true;
+    exitShrine.add(southApron);
 
-    const coralLanternMat = new THREE.MeshStandardMaterial({
-      color: '#fb7185',
-      emissive: '#f43f5e',
-      emissiveIntensity: 0.35,
-      roughness: 0.38,
-    });
-
-    for (const side of [-1.25, 1.25]) {
+    for (const side of [-1.22, 1.22]) {
       const ped = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.38, 0.44, 1.12, 8),
-        this.ivoryShaftMat
+        this.sharedGeos.gatePier,
+        this.darkBasaltMat
       );
-      ped.rotation.y = Math.PI / 8;
-      ped.position.set(side, 0.58, 0.72);
+      ped.scale.set(0.96, 0.9, 0.96);
+      ped.position.set(side, 0.73, 0.58);
       ped.castShadow = true;
       ped.receiveShadow = true;
       exitShrine.add(ped);
 
-      const pedCap = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.46, 0.4, 0.16, 8),
-        this.creamCapMat
+      const bowl = new THREE.Mesh(
+        this.sharedGeos.keepBrazierBowl,
+        this.goldBridgeTrimMat
       );
-      pedCap.rotation.y = Math.PI / 8;
-      pedCap.position.set(side, 1.22, 0.72);
-      exitShrine.add(pedCap);
+      bowl.position.set(side, 1.52, 0.58);
+      exitShrine.add(bowl);
 
-      const lantern = new THREE.Mesh(
-        new THREE.OctahedronGeometry(0.18, 0),
-        coralLanternMat
+      const flame = new THREE.Mesh(
+        this.sharedGeos.keepBrazierFlame,
+        this.southShrineFlameMat
       );
-      lantern.position.set(side, 1.46, 0.72);
-      exitShrine.add(lantern);
+      flame.scale.setScalar(0.82);
+      flame.position.set(side, 1.74, 0.58);
+      exitShrine.add(flame);
     }
 
-    const exitThreshold = new THREE.Mesh(
-      new THREE.BoxGeometry(2.04, 0.05, 0.14),
-      new THREE.MeshBasicMaterial({ color: '#fb7185' })
+    const goalSeal = new THREE.Mesh(
+      this.sharedGeos.goalSealRing,
+      this.exitCoralMat
     );
-    exitThreshold.position.set(0, 0.028, 0.07);
-    exitShrine.add(exitThreshold);
+    goalSeal.position.set(0, 0.026, -0.32);
+    exitShrine.add(goalSeal);
     island.padGroup.add(exitShrine);
 
-    // 4. Pre-Placed 2x2 Elemental Spires
-    for (const spirePt of round.preplacedSpires) {
+    // 4. Pre-Placed Freestanding Open-Crown Elemental Spires
+    round.preplacedSpires.forEach((spirePt, idx) => {
       const spireRig = this.buildArticulatedStormSpireRig(
         spirePt.spireType || 'THUNDERCLAP',
         spirePt.x,
-        spirePt.y
+        spirePt.y,
+        idx
       );
       spireRig.group.position.set(spirePt.x + 1.0, 0, spirePt.y + 1.0);
       island.padGroup.add(spireRig.group);
       island.spireRigs.push(spireRig);
-    }
+    });
 
-    // 5. Pre-Placed 2x2 Crimson Keep Pillars
-    for (const obs of round.obstacles) {
-      const ruinRig = this.buildPreplacedCrimsonKeepPillar(obs.x, obs.y);
+    // 5. Pre-Placed Buttressed Cruciform Crimson Keeps
+    round.obstacles.forEach((obs, idx) => {
+      const ruinRig = this.buildPreplacedCrimsonKeepPillar(obs.x, obs.y, idx);
       ruinRig.group.position.set(obs.x + 1.0, 0, obs.y + 1.0);
       island.padGroup.add(ruinRig.group);
       island.ruinRigs.push(ruinRig);
-    }
+    });
 
-    // 6. Rebuild Runner for Round Archetype at North Border Entrance
+    // 6. Rebuild Runner Rig cleanly (disposing previous non-shared runner materials)
+    this.disposeSubtree(island.runner.root);
     island.root.remove(island.runner.root);
     island.runner = this.buildArticulatedRunnerRig(
       island.playerColor,
@@ -3149,39 +4714,40 @@ export class Arena3DRenderer {
   }
 
   /**
-   * Builds clean architectural Elemental Spires (zero spinning torus gyroscopes!):
-   * - `THUNDERCLAP`: Sleek ivory obelisk + warm amber brass finial (`#f59e0b`)
-   * - `FROST_OBELISK`: Faceted pale-glacier monolith (`#38bdf8`)
-   * - `CHRONO_SPIRE`: Twin-pillared limestone arch + calm lavender orb (`#a855f7`)
-   * Includes a Golden Collar Rim Ring + 3 upward-tilted diamond Overcharge plaques readable from top-down!
+   * Builds Freestanding Dark-Slate Open-Crown Elemental Spires (100% distinct from top-down!):
+   * - `THUNDERCLAP`: Bronze-slate obelisk + open 3-pronged brass fork & glowing amber prism.
+   * - `FROST_OBELISK`: 4-pointed pale-cyan glacier star around a central ice monolith.
+   * - `CHRONO_SPIRE`: Unroofed open crescent cradle + brass halo + unobstructed `r=0.34m` violet orb!
+   * - High-contrast dark-bezel gold `◆–◆◆◆` sigils + ground collar tier segments.
    */
   private buildArticulatedStormSpireRig(
     spireType: SpireType = 'THUNDERCLAP',
     gridX = 0,
-    gridY = 0
+    gridY = 0,
+    spireIndex = 0
   ): SpireVisualRig {
     const group = new THREE.Group();
+    group.userData.spireIndex = spireIndex;
     const spec = TOWER_SPECS[spireType];
 
-    // Soft Ground Contact AO Disc
     const ao = new THREE.Mesh(this.sharedGeos.aoQuad, this.aoDiscMat);
-    ao.scale.setScalar(1.08);
+    ao.scale.setScalar(1.1);
     ao.position.y = 0.015;
     ao.renderOrder = 2;
     group.add(ao);
 
-    // Chamfered Sandstone Plinth + Ivory Limestone Pedestal + Cream Collar
     const plinth = new THREE.Mesh(
       this.sharedGeos.spirePlinth,
-      this.plinthSandstoneMat
+      this.spireSlatePlinthMat
     );
-    plinth.position.y = 0.12;
+    plinth.position.y = 0.13;
+    plinth.castShadow = true;
     plinth.receiveShadow = true;
     group.add(plinth);
 
     const pedestal = new THREE.Mesh(
       this.sharedGeos.spirePedestal,
-      this.ivoryShaftMat
+      this.spireSlatePedestalMat
     );
     pedestal.position.y = 0.62;
     pedestal.castShadow = true;
@@ -3190,205 +4756,177 @@ export class Arena3DRenderer {
 
     const collar = new THREE.Mesh(
       this.sharedGeos.spireCollar,
-      this.creamCapMat
+      this.spireSlatePlinthMat
     );
-    collar.position.y = 1.08;
-    collar.castShadow = true;
+    collar.position.y = 1.06;
     collar.receiveShadow = true;
     group.add(collar);
 
-    // Sculpted Collar Rim Ring (illuminates Sun-Gold when Overcharged >= 1!)
     const collarRimMesh = new THREE.Mesh(
       this.sharedGeos.spireCollarRim,
       this.collarRimInactiveMat
     );
-    collarRimMesh.position.y = 1.17;
-    collarRimMesh.castShadow = true;
-    collarRimMesh.receiveShadow = true;
+    collarRimMesh.position.y = 1.16;
     group.add(collarRimMesh);
 
-    // 3 Upward-Tilted Diamond Overcharge Plaques on South-facing collar rim (readable from top-down!)
+    // 3 Bold Dark-Bezel Gold Diamond Sigils (`◆–◆◆◆`) + 3 Ground Collar Segments
     const overchargePips: THREE.Mesh[] = [];
+    const groundTierArcs: THREE.Mesh[] = [];
     for (let i = 0; i < 3; i++) {
-      const ang = (i - 1) * 0.52;
-      const pip = new THREE.Mesh(this.sharedGeos.spirePip, this.pipInactiveMat);
-      pip.position.set(Math.sin(ang) * 0.84, 1.14, Math.cos(ang) * 0.84);
-      pip.rotation.order = 'YXZ';
-      pip.rotation.y = ang;
-      pip.rotation.x = -0.65;
-      pip.scale.setScalar(0.86);
-      pip.castShadow = true;
-      group.add(pip);
-      overchargePips.push(pip);
+      const ang = (i - 1) * 0.62;
+      const pipHolder = new THREE.Group();
+      pipHolder.position.set(Math.sin(ang) * 0.84, 1.15, Math.cos(ang) * 0.84);
+      pipHolder.rotation.order = 'YXZ';
+      pipHolder.rotation.y = ang;
+      pipHolder.rotation.x = -0.74;
+
+      const bezel = new THREE.Mesh(
+        this.sharedGeos.spirePipBezel,
+        this.pipBezelDarkMat
+      );
+      pipHolder.add(bezel);
+
+      const gem = new THREE.Mesh(
+        this.sharedGeos.spirePipGem,
+        this.pipInactiveMat
+      );
+      gem.position.y = 0.03;
+      pipHolder.add(gem);
+      group.add(pipHolder);
+      overchargePips.push(gem);
+
+      const groundArc = new THREE.Mesh(
+        this.sharedGeos.spireGroundArc,
+        this.groundArcInactiveMat
+      );
+      groundArc.position.y = 0.032;
+      groundArc.rotation.y = ang;
+      groundArc.renderOrder = 4;
+      group.add(groundArc);
+      groundTierArcs.push(groundArc);
     }
 
     let upperCore: THREE.Object3D;
     let baseCoreY = 1.85;
 
     if (spireType === 'FROST_OBELISK') {
-      // Faceted Pale-Glacier Monolith (#38bdf8)
+      // 4-Pointed Cyan Glacier Star + Central Hexagonal Monolith
       const frostGroup = new THREE.Group();
-      const glacierMainMat = new THREE.MeshStandardMaterial({
-        color: '#7dd3fc',
-        emissive: '#38bdf8',
-        emissiveIntensity: 0.26,
-        roughness: 0.24,
-        metalness: 0.18,
-      });
-      const glacierShardMat = new THREE.MeshStandardMaterial({
-        color: '#bae6fd',
-        emissive: '#38bdf8',
-        emissiveIntensity: 0.18,
-        roughness: 0.28,
-        metalness: 0.12,
-      });
-
-      const monolithShaft = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.18, 0.44, 1.24, 6),
-        glacierMainMat
+      const shaft = new THREE.Mesh(
+        this.sharedGeos.frostCentralShaft,
+        this.frostMainMat
       );
-      monolithShaft.position.y = 0.62;
-      monolithShaft.castShadow = true;
-      frostGroup.add(monolithShaft);
+      shaft.position.y = 0.64;
+      shaft.castShadow = true;
+      frostGroup.add(shaft);
 
-      const monolithTip = new THREE.Mesh(
-        new THREE.ConeGeometry(0.18, 0.34, 6),
-        glacierShardMat
-      );
-      monolithTip.position.y = 1.41;
-      monolithTip.castShadow = true;
-      frostGroup.add(monolithTip);
+      const tip = new THREE.Mesh(this.sharedGeos.frostTip, this.frostBladeMat);
+      tip.position.y = 1.46;
+      frostGroup.add(tip);
 
-      for (let s = 0; s < 3; s++) {
-        const ang = (s / 3) * Math.PI * 2 + 0.5;
-        const shard = new THREE.Mesh(
-          new THREE.ConeGeometry(0.14, 0.56, 5),
-          glacierShardMat
+      for (let s = 0; s < 4; s++) {
+        const ang = (s * Math.PI) / 2;
+        const blade = new THREE.Mesh(
+          this.sharedGeos.frostStarBlade,
+          this.frostBladeMat
         );
-        shard.position.set(Math.cos(ang) * 0.38, 0.28, Math.sin(ang) * 0.38);
-        shard.rotation.z = -Math.cos(ang) * 0.18;
-        shard.rotation.x = Math.sin(ang) * 0.18;
-        shard.castShadow = true;
-        frostGroup.add(shard);
+        blade.position.set(Math.sin(ang) * 0.44, 0.36, Math.cos(ang) * 0.44);
+        blade.rotation.y = ang;
+        blade.rotation.x = 0.38;
+        blade.castShadow = true;
+        frostGroup.add(blade);
       }
 
-      baseCoreY = 1.15;
+      baseCoreY = 1.14;
       frostGroup.position.y = baseCoreY;
       group.add(frostGroup);
       upperCore = frostGroup;
     } else if (spireType === 'CHRONO_SPIRE') {
-      // Twin-Pillared Limestone Arch + Calm Lavender Orb (#a855f7)
-      for (const sideX of [-0.38, 0.38]) {
-        const col = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.13, 0.15, 1.04, 8),
-          this.ivoryShaftMat
+      // UNROOFED Open Crescent Astrolabe Cradle + Unobstructed Violet-Gold Orb (`r = 0.34m`)!
+      for (const sideX of [-1, 1]) {
+        const horn = new THREE.Mesh(
+          this.sharedGeos.chronoHorn,
+          this.chronoHornMat
         );
-        col.position.set(sideX, 1.68, 0);
-        col.castShadow = true;
-        col.receiveShadow = true;
-        group.add(col);
+        horn.position.set(sideX * 0.46, 1.66, 0);
+        horn.rotation.z = -sideX * 0.24;
+        horn.castShadow = true;
+        group.add(horn);
       }
 
-      const archLintel = new THREE.Mesh(
-        new THREE.BoxGeometry(1.06, 0.18, 0.38),
-        this.creamCapMat
+      const coreGroup = new THREE.Group();
+      const halo = new THREE.Mesh(
+        this.sharedGeos.chronoHalo,
+        this.stormBrassMat
       );
-      archLintel.position.y = 2.28;
-      archLintel.castShadow = true;
-      group.add(archLintel);
-
-      const archCap = new THREE.Mesh(
-        new THREE.BoxGeometry(0.68, 0.12, 0.3),
-        this.plinthSandstoneMat
-      );
-      archCap.position.y = 2.43;
-      group.add(archCap);
+      coreGroup.add(halo);
 
       const orb = new THREE.Mesh(
-        new THREE.SphereGeometry(0.27, 20, 16),
-        new THREE.MeshStandardMaterial({
-          color: '#c084fc',
-          emissive: '#a855f7',
-          emissiveIntensity: 0.42,
-          roughness: 0.25,
-          metalness: 0.15,
-        })
+        this.sharedGeos.chronoOrb,
+        this.chronoOrbMat
       );
-      baseCoreY = 1.72;
-      orb.position.y = baseCoreY;
       orb.castShadow = true;
-      group.add(orb);
-      upperCore = orb;
+      coreGroup.add(orb);
+
+      baseCoreY = 1.88;
+      coreGroup.position.y = baseCoreY;
+      group.add(coreGroup);
+      upperCore = coreGroup;
     } else {
-      // THUNDERCLAP: Ivory Limestone Obelisk + Warm Amber Brass Finial (#f59e0b)
-      const obeliskBody = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.23, 0.5, 1.06, 4),
-        this.ivoryShaftMat
+      // THUNDERCLAP: Dark Bronze-Slate Obelisk + Open 3-Prong Brass Fork & Glowing Amber Prism
+      const body = new THREE.Mesh(
+        this.sharedGeos.stormObeliskBody,
+        this.stormBodyMat
       );
-      obeliskBody.rotation.y = Math.PI / 4;
-      obeliskBody.position.y = 1.69;
-      obeliskBody.castShadow = true;
-      obeliskBody.receiveShadow = true;
-      group.add(obeliskBody);
+      body.position.y = 1.62;
+      body.castShadow = true;
+      body.receiveShadow = true;
+      group.add(body);
 
-      const obeliskNeck = new THREE.Mesh(
-        new THREE.BoxGeometry(0.46, 0.1, 0.46),
-        this.creamCapMat
+      for (let p = 0; p < 3; p++) {
+        const ang = (p * Math.PI * 2) / 3;
+        const prong = new THREE.Mesh(
+          this.sharedGeos.stormProng,
+          this.stormBrassMat
+        );
+        prong.position.set(Math.sin(ang) * 0.36, 2.12, Math.cos(ang) * 0.36);
+        prong.rotation.y = ang;
+        prong.rotation.x = 0.26;
+        group.add(prong);
+      }
+
+      const prism = new THREE.Mesh(
+        this.sharedGeos.stormPrism,
+        this.stormPrismMat
       );
-      obeliskNeck.position.y = 2.26;
-      group.add(obeliskNeck);
-
-      const brassMat = new THREE.MeshStandardMaterial({
-        color: '#f59e0b',
-        emissive: '#d97706',
-        emissiveIntensity: 0.32,
-        roughness: 0.28,
-        metalness: 0.58,
-      });
-      const finialGroup = new THREE.Group();
-      const finialStem = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.08, 0.14, 0.12, 8),
-        brassMat
-      );
-      finialGroup.add(finialStem);
-
-      const finialDiamond = new THREE.Mesh(
-        new THREE.OctahedronGeometry(0.24, 0),
-        brassMat
-      );
-      finialDiamond.scale.set(0.9, 1.35, 0.9);
-      finialDiamond.position.y = 0.26;
-      finialDiamond.castShadow = true;
-      finialGroup.add(finialDiamond);
-
-      baseCoreY = 2.34;
-      finialGroup.position.y = baseCoreY;
-      group.add(finialGroup);
-      upperCore = finialGroup;
+      prism.castShadow = true;
+      baseCoreY = 2.24;
+      prism.position.y = baseCoreY;
+      group.add(prism);
+      upperCore = prism;
     }
 
-    // Compact Radial Cooldown Ring hugging Spire base plinth (r = 1.08m, visible during RUN)
-    const cdGeo = new THREE.PlaneGeometry(2.25, 2.25);
-    cdGeo.rotateX(-Math.PI / 2);
     const cooldownRingMat = createSpireBaseCooldownShader(spireType);
-    const cooldownRingMesh = new THREE.Mesh(cdGeo, cooldownRingMat);
+    const cooldownRingMesh = new THREE.Mesh(
+      this.sharedGeos.spireCooldownPlane,
+      cooldownRingMat
+    );
     cooldownRingMesh.position.y = 0.04;
     cooldownRingMesh.renderOrder = 8;
     cooldownRingMesh.visible = false;
     group.add(cooldownRingMesh);
 
-    // Single Crisp Perimeter Range Hairline
     const baseRange = spec.range;
-    const aoeGeo = new THREE.PlaneGeometry(baseRange * 2, baseRange * 2);
-    aoeGeo.rotateX(-Math.PI / 2);
     const aoeMat = createSpireAoEShader(baseRange, spireType);
-    const aoeMesh = new THREE.Mesh(aoeGeo, aoeMat);
+    const aoeMesh = new THREE.Mesh(this.sharedGeos.unitCirclePlane, aoeMat);
+    aoeMesh.scale.set(baseRange, 1, baseRange);
     aoeMesh.position.y = 0.022;
     aoeMesh.renderOrder = 3;
     group.add(aoeMesh);
 
     return {
       group,
+      spireIndex,
       spireType,
       baseRange,
       gridX,
@@ -3397,143 +4935,144 @@ export class Arena3DRenderer {
       baseCoreY,
       collarRimMesh,
       overchargePips,
+      groundTierArcs,
       cooldownRingMesh,
       cooldownRingMat,
       aoeMesh,
       aoeMat,
       targetHoverBoost: 0,
       recoil: 0,
+      cdrFlash: 0,
     };
   }
 
   /**
-   * Builds a Pre-Placed 2x2 Crimson Keep Pillar (`obstacles`):
-   * Warm Terracotta-Crimson Masonry (`#b84a39`), cream stone trim (`#f5f0e6`),
-   * taller (`h = 1.50`) pitched keep cap, and Sun-Gold (`#fbbf24`) crown lantern when linked!
+   * Pre-Placed Crimson Keep (`obstacle`):
+   * Buttressed Cruciform Dark-Basalt Skirt + Deep Crimson Masonry + Large `r=0.28m` Crown Brazier!
    */
   private buildPreplacedCrimsonKeepPillar(
     gridX: number,
-    gridY: number
+    gridY: number,
+    keepIndex: number
   ): RuinVisualRig {
     const group = new THREE.Group();
+    group.userData.keepIndex = keepIndex;
 
     const ao = new THREE.Mesh(this.sharedGeos.aoQuad, this.aoDiscMat);
-    ao.scale.setScalar(1.03);
+    ao.scale.setScalar(1.06);
     ao.position.y = 0.015;
     ao.renderOrder = 2;
     group.add(ao);
 
-    const plinth = new THREE.Mesh(
-      this.sharedGeos.keepPlinth,
-      this.plinthSandstoneMat
+    const skirt = new THREE.Mesh(
+      this.sharedGeos.keepBasaltSkirt,
+      this.darkBasaltMat
     );
-    plinth.position.y = 0.11;
-    plinth.receiveShadow = true;
-    group.add(plinth);
+    skirt.castShadow = true;
+    skirt.receiveShadow = true;
+    group.add(skirt);
 
     const shaft = new THREE.Mesh(
       this.sharedGeos.keepShaft,
       this.crimsonKeepWallMat
     );
-    shaft.position.y = 0.7;
+    shaft.position.y = 0.78;
     shaft.castShadow = true;
     shaft.receiveShadow = true;
     group.add(shaft);
 
-    const cornice = new THREE.Mesh(
+    const corniceMesh = new THREE.Mesh(
       this.sharedGeos.keepCornice,
       this.creamStoneTrimMat
     );
-    cornice.position.y = 1.26;
-    cornice.castShadow = true;
-    cornice.receiveShadow = true;
-    group.add(cornice);
+    corniceMesh.position.y = 1.36;
+    corniceMesh.receiveShadow = true;
+    group.add(corniceMesh);
 
     const pitchedCap = new THREE.Mesh(
       this.sharedGeos.keepPitchedCap,
       this.crimsonKeepRoofMat
     );
-    pitchedCap.position.y = 1.43; // reaches ~1.52m
+    pitchedCap.position.y = 1.56;
     pitchedCap.castShadow = true;
     group.add(pitchedCap);
 
-    const lanternMesh = new THREE.Mesh(
-      this.sharedGeos.keepLantern,
-      this.keepLanternUnlinkedMat
+    const bowl = new THREE.Mesh(
+      this.sharedGeos.keepBrazierBowl,
+      this.darkBasaltMat
     );
-    lanternMesh.position.y = 1.59;
+    bowl.position.y = 1.72;
+    group.add(bowl);
+
+    const lanternMesh = new THREE.Mesh(
+      this.sharedGeos.keepBrazierFlame,
+      this.keepBrazierDormantMat
+    );
+    lanternMesh.position.y = 1.88;
     group.add(lanternMesh);
 
-    return { group, lanternMesh, gridX, gridY };
+    return { group, keepIndex, lanternMesh, corniceMesh, gridX, gridY };
   }
 
   /**
-   * Builds the Clean 4-Part Tactile *Townscaper* / *Thronefall* 2x2 Limestone Pillar:
-   * 1. Soft Ground Contact AO Disc (`r = 1.02`, `y = 0.015`)
-   * 2. Chamfered Sandstone Plinth (`#ddd5c7`)
-   * 3. Smooth Octagonal Ivory Limestone Shaft (`#f5f0e6`)
-   * 4. Crisp Sunlit Cream Cap (`#fcfaf5`) + flat matte player-colored/terracotta medallion
+   * Player Stone Wall (`BLOCK`):
+   * Chamfered Square Ivory Turret (`h = 1.38m`) + 4 Corner Merlons + True Player-Color Square Emblem!
    */
   private buildWall3DMesh(
+    towerId: string,
     x: number,
     y: number,
     playerColor = '#38bdf8',
     bornTime = performance.now()
   ): WallVisualEntry {
     const group = new THREE.Group();
+    group.userData.towerId = towerId;
 
-    // 1. Soft Ground Contact AO Disc
     const ao = new THREE.Mesh(this.sharedGeos.aoQuad, this.aoDiscMat);
     ao.position.y = 0.015;
     ao.renderOrder = 2;
     group.add(ao);
 
-    // 2. Chamfered Sandstone Plinth
     const plinth = new THREE.Mesh(
       this.sharedGeos.pillarPlinth,
       this.plinthSandstoneMat
     );
     plinth.position.y = 0.11;
+    plinth.castShadow = true;
     plinth.receiveShadow = true;
     group.add(plinth);
 
-    // 3. Smooth Octagonal Ivory Limestone Shaft
     const shaft = new THREE.Mesh(
       this.sharedGeos.pillarShaft,
       this.ivoryShaftMat
     );
-    shaft.position.y = 0.73;
+    shaft.position.y = 0.7;
     shaft.castShadow = true;
     shaft.receiveShadow = true;
     group.add(shaft);
 
-    // 4. Crisp Sunlit Cream Cap + Flat Matte Medallion
-    const cap = new THREE.Mesh(this.sharedGeos.pillarCap, this.creamCapMat);
-    cap.position.y = 1.34;
-    cap.castShadow = true;
+    const cap = new THREE.Mesh(
+      this.sharedGeos.pillarCapMerlons,
+      this.creamCapMat
+    );
     cap.receiveShadow = true;
     group.add(cap);
 
-    const medallion = new THREE.Mesh(
-      this.sharedGeos.pillarMedallion,
+    const emblem = new THREE.Mesh(
+      this.sharedGeos.pillarEmblem,
       this.getPlayerMedallionMaterial(playerColor)
     );
-    medallion.position.y = 1.435;
-    medallion.receiveShadow = true;
-    group.add(medallion);
+    emblem.position.y = 1.34;
+    emblem.receiveShadow = true;
+    group.add(emblem);
 
-    return {
-      group,
-      born: bornTime,
-      x,
-      y,
-    };
+    return { group, born: bornTime, x, y };
   }
 
-  /**
-   * Builds a single non-overlapping Curtain Bridge span `[tStart, tEnd]` between `(ax, az)` and `(bx, bz)`
-   * using shared unit geometries (zero coplanar Z-fighting!).
-   */
+  // ==========================================================================
+  // PRUNED CURTAIN BRIDGES, GOLD LEY-LINE CONDUITS & SYNERGY PREVIEWS
+  // ==========================================================================
+
   private createBridgeSpanSegment(
     ax: number,
     az: number,
@@ -3556,6 +5095,14 @@ export class Arena3DRenderer {
     bridge.position.set(ax + dx * midT, 0, az + dz * midT);
     bridge.rotation.y = angle;
 
+    if (!isGhost) {
+      const ao = new THREE.Mesh(this.sharedGeos.bridgeAoQuad, this.aoDiscMat);
+      ao.scale.z = spanLen;
+      ao.position.y = 0.014;
+      ao.renderOrder = 2;
+      bridge.add(ao);
+    }
+
     const wallSeg = new THREE.Mesh(this.sharedGeos.bridgeWallUnit, wallMat);
     wallSeg.scale.z = spanLen;
     wallSeg.position.y = 0.49;
@@ -3567,7 +5114,6 @@ export class Arena3DRenderer {
     const parapet = new THREE.Mesh(this.sharedGeos.bridgeCapUnit, trimMat);
     parapet.scale.z = spanLen;
     parapet.position.y = 1.05;
-    parapet.castShadow = !isGhost;
     parapet.receiveShadow = !isGhost;
     if (isGhost) parapet.renderOrder = 10;
     bridge.add(parapet);
@@ -3575,10 +5121,6 @@ export class Arena3DRenderer {
     return bridge;
   }
 
-  /**
-   * Builds a sculpted Keystone Collar right at the `0.50` midpoint of a `PLAYER <-> RUIN` bridge
-   * so the ivory-to-crimson masonry transition looks intentionally crafted rather than Z-fighting.
-   */
   private createBridgeKeystoneCollar(
     mx: number,
     mz: number,
@@ -3600,7 +5142,6 @@ export class Arena3DRenderer {
 
     const cap = new THREE.Mesh(this.sharedGeos.keystoneCap, capMat);
     cap.position.y = 1.06;
-    cap.castShadow = true;
     cap.receiveShadow = true;
     keystone.add(cap);
 
@@ -3608,8 +5149,109 @@ export class Arena3DRenderer {
   }
 
   /**
-   * Updates Spire Overcharge range hairlines, Golden Collar Rim Ring, and 3 upward-tilted diamond plaques.
+   * Gabriel-Graph Pruning Rule (`gfx-models Spec 3`):
+   * Suppress diagonal `(+-2, +-2)` or knight `(+-2, +-1)` bridges whenever a third wall/keep node `C`
+   * forms a `>= 90°` elbow (`distSq(A,C) + distSq(C,B) <= distSq(A,B)`).
+   * Eliminates 100% of L-corner walkable-cell cuts and `2x2` X-clump Z-fighting!
    */
+  private shouldPruneNonOrthogonalBridge(
+    ax: number,
+    ay: number,
+    bx: number,
+    by: number,
+    nodes: ReadonlyArray<{ x: number; y: number }>
+  ): boolean {
+    const dx = bx - ax;
+    const dy = by - ay;
+    const isOrtho =
+      (Math.abs(dx) === 2 && dy === 0) || (dx === 0 && Math.abs(dy) === 2);
+    if (isOrtho) return false;
+
+    const abSq = dx * dx + dy * dy;
+    for (let k = 0; k < nodes.length; k++) {
+      const c = nodes[k];
+      if ((c.x === ax && c.y === ay) || (c.x === bx && c.y === by)) continue;
+      const dACx = c.x - ax;
+      const dACy = c.y - ay;
+      if (Math.abs(dACx) > 2 || Math.abs(dACy) > 2) continue;
+      const dCBx = bx - c.x;
+      const dCBy = by - c.y;
+      if (Math.abs(dCBx) > 2 || Math.abs(dCBy) > 2) continue;
+
+      const acSq = dACx * dACx + dACy * dACy;
+      const cbSq = dCBx * dCBx + dCBy * dCBy;
+      if (acSq + cbSq <= abSq) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private createLeyConduitMesh(
+    fromCx: number,
+    fromCz: number,
+    toCx: number,
+    toCz: number,
+    mat: THREE.ShaderMaterial
+  ): THREE.Mesh | null {
+    const dx = toCx - fromCx;
+    const dz = toCz - fromCz;
+    const fullDist = Math.hypot(dx, dz);
+    // Start at edge of Wall/Keep plinth (~0.74m) and end at edge of Spire plinth (~0.84m)
+    const startInset = Math.min(0.74, fullDist * 0.35);
+    const endInset = Math.min(0.84, fullDist * 0.38);
+    const spanLen = fullDist - startInset - endInset;
+    if (spanLen <= 0.08) return null;
+
+    const ux = dx / fullDist;
+    const uz = dz / fullDist;
+    const mesh = new THREE.Mesh(this.sharedGeos.conduitQuad, mat);
+    mesh.position.set(
+      fromCx + ux * startInset,
+      0.024,
+      fromCz + uz * startInset
+    );
+    mesh.rotation.y = Math.atan2(dx, dz);
+    mesh.scale.z = spanLen;
+    mesh.renderOrder = 3;
+    return mesh;
+  }
+
+  private populateSpireConduits(
+    targetGroup: THREE.Group,
+    links: SpireConduitLink[],
+    offsetX: number,
+    offsetZ: number,
+    mat: THREE.ShaderMaterial
+  ) {
+    targetGroup.clear();
+    for (const link of links) {
+      const m = this.createLeyConduitMesh(
+        offsetX + link.fromX + 1.0,
+        offsetZ + link.fromY + 1.0,
+        offsetX + link.spireX + 1.0,
+        offsetZ + link.spireY + 1.0,
+        mat
+      );
+      if (m) targetGroup.add(m);
+    }
+  }
+
+  private applyKeepLinkVisuals(
+    island: IslandVisuals,
+    linkedIndices: Set<number>
+  ) {
+    island.ruinRigs.forEach((ruin, idx) => {
+      const isLinked = linkedIndices.has(idx);
+      ruin.lanternMesh.material = isLinked
+        ? this.keepBrazierLinkedMat
+        : this.keepBrazierDormantMat;
+      ruin.corniceMesh.material = isLinked
+        ? this.goldBridgeTrimMat
+        : this.creamStoneTrimMat;
+    });
+  }
+
   private applySpireOverchargeVisuals(
     island: IslandVisuals,
     tiers: number[]
@@ -3617,8 +5259,7 @@ export class Arena3DRenderer {
     island.spireRigs.forEach((spireRig, idx) => {
       const tier = tiers[idx] || 0;
       const effectiveRange = spireRig.baseRange + tier * 0.25;
-      const scaleFactor = effectiveRange / spireRig.baseRange;
-      spireRig.aoeMesh.scale.set(scaleFactor, 1, scaleFactor);
+      spireRig.aoeMesh.scale.set(effectiveRange, 1, effectiveRange);
       spireRig.aoeMat.uniforms.uOverchargeTier.value = tier;
 
       spireRig.collarRimMesh.material =
@@ -3627,19 +5268,78 @@ export class Arena3DRenderer {
       spireRig.overchargePips.forEach((pip, pipIdx) => {
         const active = pipIdx < tier;
         pip.material = active ? this.pipActiveGoldMat : this.pipInactiveMat;
-        pip.scale.setScalar(active ? 1.12 : 0.86);
+        pip.scale.setScalar(active ? 1.15 : 0.88);
+      });
+
+      spireRig.groundTierArcs.forEach((arc, arcIdx) => {
+        arc.material =
+          arcIdx < tier ? this.groundArcGoldMat : this.groundArcInactiveMat;
       });
     });
   }
 
-  /**
-   * Rebuilds deduplicated all-directional (`90°`, `45°`, and `(2,1)`/`(1,2)` angled) curtain bridges
-   * across each unique unordered pair `(i < j)` of touching `2x2` structures:
-   * - `PLAYER <-> PLAYER`: 1 full-span bridge (`0.0..1.0`)
-   * - `RUIN <-> RUIN`: 1 full-span bridge (`0.0..1.0`)
-   * - `PLAYER <-> SPIRE` / `RUIN <-> SPIRE`: 1 single bridge (`0.0..0.62`) from Pillar/Keep toward Spire
-   * - `PLAYER <-> RUIN`: Cleanly butted `0.00..0.50` ivory + `0.50..1.00` crimson halves + sculpted Keystone Collar!
-   */
+  private restoreIslandBaseSynergyVisuals(island: IslandVisuals) {
+    if (
+      island.playerId === this.localPlayerId &&
+      this.cachedBaseEval &&
+      this.cachedLocalCircuitry &&
+      this.currentRoomState
+    ) {
+      this.populateClapMarkers(
+        island,
+        this.currentRoomState.roundConfig,
+        this.cachedBaseEval.clapLocations
+      );
+      this.applyKeepLinkVisuals(
+        island,
+        this.cachedLocalCircuitry.linkedKeepIndices
+      );
+      this.applySpireOverchargeVisuals(
+        island,
+        this.cachedBaseEval.spireOverchargeTiers
+      );
+    }
+  }
+
+  private computeFallbackConduitLinks(
+    round: RoundConfig,
+    wallNodes: Array<{ x: number; y: number }>,
+    circuitry: CitadelCircuitryResult
+  ): SpireConduitLink[] {
+    if (circuitry.spireConduitLinks) {
+      return circuitry.spireConduitLinks;
+    }
+    const links: SpireConduitLink[] = [];
+    const poweredKeys = circuitry.poweredNodeKeys;
+    round.preplacedSpires.forEach((spire, spireIndex) => {
+      const tier = circuitry.spireOverchargeTiers[spireIndex] || 0;
+      if (tier <= 0) return;
+      let bestNode: { x: number; y: number } | null = null;
+      let bestD2 = Infinity;
+      for (const n of wallNodes) {
+        if (poweredKeys && !poweredKeys.has(`${n.x},${n.y}`)) continue;
+        const dx = n.x - spire.x;
+        const dy = n.y - spire.y;
+        const d2 = dx * dx + dy * dy;
+        if (Math.abs(dx) <= 3 && Math.abs(dy) <= 3 && d2 <= 13 && d2 < bestD2) {
+          bestD2 = d2;
+          bestNode = n;
+        }
+      }
+      if (bestNode) {
+        links.push({
+          spireIndex,
+          spireX: spire.x,
+          spireY: spire.y,
+          fromX: bestNode.x,
+          fromY: bestNode.y,
+          overchargeTier: tier,
+        });
+      }
+    });
+    return links;
+  }
+
   private rebuildAllDirectionalConnections(
     island: IslandVisuals,
     player: PlayerState,
@@ -3647,56 +5347,26 @@ export class Arena3DRenderer {
   ) {
     island.bridgeGroup.clear();
     island.bridgeEntries = [];
+    island.conduitGroup.clear();
 
     const now = performance.now();
-    const circuitry = computeCitadelCircuitry(round, player.towers);
+    const circuitry =
+      player.id === this.localPlayerId && this.cachedLocalCircuitry
+        ? this.cachedLocalCircuitry
+        : computeCitadelCircuitry(round, player.towers);
 
-    // Identify which Player/Keep nodes belong to an active Citadel Circuitry component (Player + Keep)
-    const wallNodes = [
-      ...player.towers.map((t) => ({ x: t.x, y: t.y, isPlayer: true, isKeep: false })),
-      ...round.obstacles.map((o) => ({ x: o.x, y: o.y, isPlayer: false, isKeep: true })),
-    ];
-    const visited = new Uint8Array(wallNodes.length);
-    const circuitNodeSet = new Set<string>();
-    for (let i = 0; i < wallNodes.length; i++) {
-      if (visited[i]) continue;
-      const comp: number[] = [];
-      const queue: number[] = [i];
-      visited[i] = 1;
-      while (queue.length > 0) {
-        const curr = queue.pop()!;
-        comp.push(curr);
-        const cn = wallNodes[curr];
-        for (let j = 0; j < wallNodes.length; j++) {
-          if (visited[j]) continue;
-          const nn = wallNodes[j];
-          if (Math.abs(cn.x - nn.x) <= 2 && Math.abs(cn.y - nn.y) <= 2) {
-            visited[j] = 1;
-            queue.push(j);
-          }
-        }
-      }
-      const hasPlayer = comp.some((idx) => wallNodes[idx].isPlayer);
-      const hasKeep = comp.some((idx) => wallNodes[idx].isKeep);
-      if (hasPlayer && hasKeep) {
-        for (const idx of comp) {
-          circuitNodeSet.add(`${wallNodes[idx].x},${wallNodes[idx].y}`);
-        }
-      }
-    }
-
-    interface PillarNode {
+    interface WallMasonryNode {
       x: number;
       y: number;
       cx: number;
       cz: number;
-      kind: 'PLAYER' | 'RUIN' | 'SPIRE';
+      kind: 'PLAYER' | 'RUIN';
       born: number;
       keepIdx?: number;
-      spireIdx?: number;
     }
 
-    const allPillars: PillarNode[] = [
+    // Spires NEVER emit solid stone walls — only PLAYER & RUIN nodes connect via masonry!
+    const masonryNodes: WallMasonryNode[] = [
       ...player.towers.map((t) => {
         const entry = island.towerMeshes.get(t.id);
         return {
@@ -3717,15 +5387,6 @@ export class Arena3DRenderer {
         born: now - 10000,
         keepIdx: idx,
       })),
-      ...round.preplacedSpires.map((s, idx) => ({
-        x: s.x,
-        y: s.y,
-        cx: s.x + 1.0,
-        cz: s.y + 1.0,
-        kind: 'SPIRE' as const,
-        born: now - 10000,
-        spireIdx: idx,
-      })),
     ];
 
     const addBridgeEntry = (grp: THREE.Group, born: number) => {
@@ -3737,19 +5398,31 @@ export class Arena3DRenderer {
       island.bridgeEntries.push({ group: grp, born });
     };
 
-    for (let i = 0; i < allPillars.length; i++) {
-      const a = allPillars[i];
-      for (let j = i + 1; j < allPillars.length; j++) {
-        const b = allPillars[j];
+    const poweredSet = circuitry.poweredNodeKeys;
+
+    for (let i = 0; i < masonryNodes.length; i++) {
+      const a = masonryNodes[i];
+      for (let j = i + 1; j < masonryNodes.length; j++) {
+        const b = masonryNodes[j];
         const dxGrid = b.x - a.x;
         const dzGrid = b.y - a.y;
         if (Math.abs(dxGrid) > 2 || Math.abs(dzGrid) > 2) continue;
         if (dxGrid === 0 && dzGrid === 0) continue;
+        if (do2x2Overlap(a.x, a.y, b.x, b.y)) continue;
+
+        if (
+          this.shouldPruneNonOrthogonalBridge(a.x, a.y, b.x, b.y, masonryNodes)
+        ) {
+          continue;
+        }
 
         const pairBorn = Math.max(a.born, b.born);
+        const bothPowered =
+          poweredSet !== undefined &&
+          poweredSet.has(`${a.x},${a.y}`) &&
+          poweredSet.has(`${b.x},${b.y}`);
 
         if (a.kind === 'PLAYER' && b.kind === 'PLAYER') {
-          // ONE single full-span ivory limestone bridge (0.0..1.0)
           const span = this.createBridgeSpanSegment(
             a.cx,
             a.cz,
@@ -3758,15 +5431,16 @@ export class Arena3DRenderer {
             0.0,
             1.0,
             this.bridgeWallMat,
-            this.creamCapMat,
+            bothPowered ? this.goldBridgeTrimMat : this.creamCapMat,
             false
           );
           addBridgeEntry(span, pairBorn);
         } else if (a.kind === 'RUIN' && b.kind === 'RUIN') {
-          // ONE single full-span crimson masonry bridge (0.0..1.0)
           const isLinked =
-            (a.keepIdx !== undefined && circuitry.linkedKeepIndices.has(a.keepIdx)) ||
-            (b.keepIdx !== undefined && circuitry.linkedKeepIndices.has(b.keepIdx));
+            (a.keepIdx !== undefined &&
+              circuitry.linkedKeepIndices.has(a.keepIdx)) ||
+            (b.keepIdx !== undefined &&
+              circuitry.linkedKeepIndices.has(b.keepIdx));
           const span = this.createBridgeSpanSegment(
             a.cx,
             a.cz,
@@ -3779,11 +5453,7 @@ export class Arena3DRenderer {
             false
           );
           addBridgeEntry(span, pairBorn);
-        } else if (
-          (a.kind === 'PLAYER' && b.kind === 'RUIN') ||
-          (a.kind === 'RUIN' && b.kind === 'PLAYER')
-        ) {
-          // Cleanly butt ivory half (0.0..0.5) & crimson half (0.5..1.0) + sculpted Keystone Collar!
+        } else {
           const pNode = a.kind === 'PLAYER' ? a : b;
           const rNode = a.kind === 'RUIN' ? a : b;
           const isLinked =
@@ -3831,71 +5501,89 @@ export class Arena3DRenderer {
             )
           );
           addBridgeEntry(pairGroup, pairBorn);
-        } else if (
-          (a.kind === 'SPIRE' && (b.kind === 'PLAYER' || b.kind === 'RUIN')) ||
-          (b.kind === 'SPIRE' && (a.kind === 'PLAYER' || a.kind === 'RUIN'))
-        ) {
-          // ONE single bridge (0.0..0.62) from Pillar/Keep toward Spire (Spire never emits reverse bridge)
-          const sNode = a.kind === 'SPIRE' ? a : b;
-          const wNode = a.kind === 'SPIRE' ? b : a;
-          const spireTier =
-            sNode.spireIdx !== undefined
-              ? circuitry.spireOverchargeTiers[sNode.spireIdx] || 0
-              : 0;
-          const inCircuit = circuitNodeSet.has(`${wNode.x},${wNode.y}`);
-          const wallMat =
-            wNode.kind === 'RUIN' ? this.crimsonKeepWallMat : this.bridgeWallMat;
-          const trimMat =
-            spireTier > 0 && inCircuit
-              ? this.goldBridgeTrimMat
-              : wNode.kind === 'RUIN'
-              ? this.creamStoneTrimMat
-              : this.creamCapMat;
-
-          const span = this.createBridgeSpanSegment(
-            wNode.cx,
-            wNode.cz,
-            sNode.cx,
-            sNode.cz,
-            0.0,
-            0.62,
-            wallMat,
-            trimMat,
-            false
-          );
-          addBridgeEntry(span, pairBorn);
         }
       }
     }
 
-    // Activate Sun-Gold crown lantern on linked Crimson Keeps
-    island.ruinRigs.forEach((ruin, idx) => {
-      const isLinked = circuitry.linkedKeepIndices.has(idx);
-      ruin.lanternMesh.material = isLinked
-        ? this.keepLanternLinkedMat
-        : this.keepLanternUnlinkedMat;
-    });
+    // Render flush ground inlaid gold ley-line conduits (`dx^2 + dy^2 <= 13`) into Overcharged Spires!
+    const links = this.computeFallbackConduitLinks(
+      round,
+      masonryNodes,
+      circuitry
+    );
+    this.populateSpireConduits(
+      island.conduitGroup,
+      links,
+      0,
+      0,
+      island.conduitMat
+    );
 
-    // Update Spire Overcharge range hairlines, golden collar rim, & tilted diamond plaques
+    this.applyKeepLinkVisuals(island, circuitry.linkedKeepIndices);
     this.applySpireOverchargeVisuals(island, circuitry.spireOverchargeTiers);
   }
 
+  /**
+   * Syncs an island's placed Stone Walls & path ribbon with in-place `opt_* -> twr_*`
+   * reconciliation and signature dirty-checking (eliminating 500ms bot-tick hitches!).
+   */
   private syncIslandTowersAndPath(
     island: IslandVisuals,
     player: PlayerState,
     round: RoundConfig,
     skipPopAnim = false
   ) {
-    const incomingIds = new Set(player.towers.map((t) => t.id));
+    const isFogged = Boolean(player.fogMasked);
+    island.fogVeilMesh.visible = isFogged;
+    island.towerGroup.visible = !isFogged;
+    island.bridgeGroup.visible = !isFogged;
+    island.conduitGroup.visible = !isFogged;
 
-    for (const [tid, entry] of island.towerMeshes.entries()) {
+    if (isFogged) {
+      if (island.pathMesh) island.pathMesh.visible = false;
+      island.clapMarkerGroup.clear();
+      return;
+    }
+
+    // 1. Reconcile optimistic `opt_*` meshes in-place when server assigns authoritative `twr_*` ID!
+    const incomingIds = new Set(player.towers.map((t) => t.id));
+    const unmatchedIncoming = player.towers.filter(
+      (t) => !island.towerMeshes.has(t.id)
+    );
+
+    for (const [tid, entry] of Array.from(island.towerMeshes.entries())) {
       if (!incomingIds.has(tid)) {
-        if (!skipPopAnim) {
+        const matchIdx = unmatchedIncoming.findIndex(
+          (t) => t.x === entry.x && t.y === entry.y
+        );
+        if (matchIdx !== -1) {
+          const matched = unmatchedIncoming.splice(matchIdx, 1)[0];
+          island.towerMeshes.delete(tid);
+          entry.group.userData.towerId = matched.id;
+          island.towerMeshes.set(matched.id, entry);
+        }
+      }
+    }
+
+    // Signature check: skip redundant path/bridge rebuilds if `(x, y)` coordinates are unchanged!
+    const coordSig = `${this.lastLayoutSignature}|${player.towers
+      .map((t) => `${t.x},${t.y}`)
+      .join(';')}`;
+    if (coordSig === island.lastTowersSig && !skipPopAnim) {
+      if (island.pathMesh) island.pathMesh.visible = true;
+      return;
+    }
+    island.lastTowersSig = coordSig;
+
+    // 2. Remove sold/cleared walls
+    for (const [tid, entry] of Array.from(island.towerMeshes.entries())) {
+      if (!incomingIds.has(tid)) {
+        if (!skipPopAnim && island.root.visible) {
           this.spawnPlacementDustPuffs(
             island.offsetX + entry.x + 1.0,
             island.offsetZ + entry.y + 1.0,
             '#fda4af',
-            6
+            5
           );
         }
         island.towerGroup.remove(entry.group);
@@ -3903,23 +5591,31 @@ export class Arena3DRenderer {
       }
     }
 
+    // 3. Add newly built walls
     const now = performance.now();
     for (const tower of player.towers) {
       if (!island.towerMeshes.has(tower.id)) {
         const born = skipPopAnim ? now - 1000 : now;
-        const entry = this.buildWall3DMesh(tower.x, tower.y, player.color, born);
+        const entry = this.buildWall3DMesh(
+          tower.id,
+          tower.x,
+          tower.y,
+          player.color,
+          born
+        );
         entry.group.position.set(tower.x + 1.0, 0, tower.y + 1.0);
         if (!skipPopAnim) {
           const sY = 0.2;
           const sXZ = 1 / Math.sqrt(sY);
           entry.group.scale.set(sXZ, sY, sXZ);
-          // 6 soft circular dust puffs & ZERO cameraShake on pillar placement!
-          this.spawnPlacementDustPuffs(
-            island.offsetX + tower.x + 1.0,
-            island.offsetZ + tower.y + 1.0,
-            '#f5efe4',
-            6
-          );
+          if (island.root.visible) {
+            this.spawnPlacementDustPuffs(
+              island.offsetX + tower.x + 1.0,
+              island.offsetZ + tower.y + 1.0,
+              '#f5efe4',
+              5
+            );
+          }
         }
         island.towerGroup.add(entry.group);
         island.towerMeshes.set(tower.id, entry);
@@ -3928,60 +5624,93 @@ export class Arena3DRenderer {
 
     this.rebuildAllDirectionalConnections(island, player, round);
 
+    // 4. Update persistent flagstone path ribbon (disposing old geometry, keeping `island.pathMat`)
     if (island.pathMesh) {
       island.root.remove(island.pathMesh);
       island.pathMesh.geometry.dispose();
       island.pathMesh = null;
-      island.pathMat = null;
     }
 
-    const pathRes = computeFullMazePath(round, player.towers);
+    const pathRes: PathResult = computeFullMazePath(round, player.towers);
     if (pathRes.valid && pathRes.allPoints.length > 1) {
       const ribbonGeo = createFlatPathRibbonGeometry(
         pathRes.allPoints,
         0,
         0,
         0.025,
-        0.14
+        0.15
       );
-      const initOpacity =
-        this.currentRoomState?.phase === 'BUILD' ? 0.58 : 0.22;
-      const pathMat = createPathRibbonShader('#fefce8', initOpacity);
-      island.pathMesh = new THREE.Mesh(ribbonGeo, pathMat);
+      island.pathMat.uniforms.uOpacity.value =
+        this.currentRoomState?.phase === 'BUILD' ? 0.66 : 0.24;
+      island.pathMesh = new THREE.Mesh(ribbonGeo, island.pathMat);
       island.pathMesh.renderOrder = 4;
-      island.pathMat = pathMat;
       island.root.add(island.pathMesh);
     }
 
-    if (player.id === this.localPlayerId) {
-      const evalRes = evaluateMazeRunTime(round, player.towers);
-      this.populateClapMarkers(island, evalRes.clapLocations, false);
+    if (player.id === this.localPlayerId && this.cachedBaseEval) {
+      this.populateClapMarkers(island, round, this.cachedBaseEval.clapLocations);
     } else {
       island.clapMarkerGroup.clear();
     }
   }
 
   /**
-   * Populates subtle flat golden ground pips (`CircleGeometry(0.14, 16)` at `y = 0.032`)
-   * instead of floating spinning octahedrons.
+   * Populates Spire-archetype colored ground clap pips (`#f59e0b` Storm, `#38bdf8` Frost, `#c084fc` Chrono)
+   * over a dark `#1e293b` bezel, adding a crisp emerald gain halo ONLY on newly gained claps!
    */
   private populateClapMarkers(
     island: IslandVisuals,
+    round: RoundConfig,
     locations: GridPoint[],
-    isBonusPreview = false
+    baseLocations?: GridPoint[]
   ) {
     island.clapMarkerGroup.clear();
-    const innerMat = isBonusPreview
-      ? this.clapPipGainMat
-      : this.clapPipGoldMat;
 
-    for (const loc of locations) {
+    for (let i = 0; i < locations.length; i++) {
+      const loc = locations[i];
       const pipGroup = new THREE.Group();
       pipGroup.position.set(loc.x, 0.032, loc.y);
 
+      // Identify closest Spire to tint the clap pip by elemental archetype
+      let spireType: SpireType = 'THUNDERCLAP';
+      let bestDist = Infinity;
+      for (const s of round.preplacedSpires) {
+        const d = Math.hypot(s.x + 1.0 - loc.x, s.y + 1.0 - loc.y);
+        if (d < bestDist) {
+          bestDist = d;
+          spireType = s.spireType || 'THUNDERCLAP';
+        }
+      }
+
+      const innerMat =
+        spireType === 'FROST_OBELISK'
+          ? this.clapPipFrostMat
+          : spireType === 'CHRONO_SPIRE'
+          ? this.clapPipChronoMat
+          : this.clapPipStormMat;
+
+      let isNewClap = false;
+      if (baseLocations) {
+        const matchInBase = baseLocations.some(
+          (b) => Math.hypot(b.x - loc.x, b.y - loc.y) < 0.45
+        );
+        if (!matchInBase && locations.length > baseLocations.length) {
+          isNewClap = true;
+        }
+      }
+
+      if (isNewClap) {
+        const halo = new THREE.Mesh(
+          this.sharedGeos.clapPipHalo,
+          this.clapPipGainHaloMat
+        );
+        halo.renderOrder = 6;
+        pipGroup.add(halo);
+      }
+
       const outer = new THREE.Mesh(
         this.sharedGeos.clapPipOuter,
-        this.clapPipCreamMat
+        this.clapPipRimMat
       );
       outer.renderOrder = 6;
       pipGroup.add(outer);
@@ -3995,15 +5724,17 @@ export class Arena3DRenderer {
     }
   }
 
+  // ==========================================================================
+  // RETICLE, REMOVE BRACKET, LIVE GHOST PREVIEW & WORLD FEATURE INSPECTION
+  // ==========================================================================
+
   private setGhostTint(valid: boolean) {
     if (valid) {
-      // Soft mint #86efac
       this.ghostBodyMat.color.set('#86efac');
       this.ghostBodyMat.emissive.set('#22c55e');
       this.ghostCapMat.color.set('#dcfce7');
       this.ghostCapMat.emissive.set('#4ade80');
     } else {
-      // Soft coral #fda4af
       this.ghostBodyMat.color.set('#fda4af');
       this.ghostBodyMat.emissive.set('#fb7185');
       this.ghostCapMat.color.set('#ffe4e6');
@@ -4011,25 +5742,138 @@ export class Arena3DRenderer {
     }
   }
 
-  /**
-   * Shared builder for 3D Ghost Pillar + Trimmed Bridge Connections + Preview Path + Spire Hover Hairlines
-   * (used by both desktop pointer hover and mobile 2-stage touch preview).
-   */
+  private computeBlockedSubCells(
+    round: RoundConfig,
+    towers: PlacedTower[],
+    placeX: number,
+    placeY: number,
+    out: THREE.Vector4
+  ) {
+    const isSubBlocked = (cx: number, cy: number): number => {
+      if (cx < 0 || cy < 0 || cx >= round.gridWidth || cy >= round.gridHeight) {
+        return 1;
+      }
+      // Protected 2x1 gate mouths
+      if (
+        cy === 0 &&
+        round.spawn.y === 0 &&
+        cx >= round.spawn.x &&
+        cx <= round.spawn.x + 1
+      ) {
+        return 1;
+      }
+      if (
+        cy === round.gridHeight - 1 &&
+        round.exit.y >= round.gridHeight - 2 &&
+        cx >= round.exit.x &&
+        cx <= round.exit.x + 1
+      ) {
+        return 1;
+      }
+      if (round.obstacles.some((o) => isCellIn2x2(cx, cy, o))) return 1;
+      if (round.preplacedSpires.some((s) => isCellIn2x2(cx, cy, s))) return 1;
+      if (towers.some((t) => isCellIn2x2(cx, cy, t))) return 1;
+      return 0;
+    };
+
+    out.set(
+      isSubBlocked(placeX, placeY),
+      isSubBlocked(placeX + 1, placeY),
+      isSubBlocked(placeX, placeY + 1),
+      isSubBlocked(placeX + 1, placeY + 1)
+    );
+  }
+
+  private showRemoveBracketVisuals(
+    localIsland: IslandVisuals,
+    tx: number,
+    ty: number
+  ) {
+    this.hidePreviewPathMesh();
+    this.clearPreviewConduits();
+    this.ghostConnGroup.clear();
+
+    // Hide 3D translucent ghost turret so it NEVER Z-fights over the existing wall!
+    this.ghostGroup.visible = true;
+    this.ghostTurretGroup.visible = false;
+    this.ghostGroup.scale.set(1, 1, 1);
+    this.ghostGroup.position.set(
+      localIsland.offsetX + tx + 1.0,
+      0,
+      localIsland.offsetZ + ty + 1.0
+    );
+
+    this.reticlePadMat.uniforms.uMode.value = 3.0;
+    this.reticlePadMat.uniforms.uBlockedCells.value.set(0, 0, 0, 0);
+    this.reticlePadMat.uniforms.uBlocksPath.value = 0.0;
+
+    localIsland.floorUniforms.uCursorPos.value.set(tx + 1.0, ty + 1.0);
+    localIsland.floorUniforms.uAnchorBox.value.set(tx, ty, tx + 2.0, ty + 2.0);
+    localIsland.floorUniforms.uReticleMode.value = 3.0;
+
+    for (const sr of localIsland.spireRigs) {
+      sr.targetHoverBoost = 0;
+    }
+    this.restoreIslandBaseSynergyVisuals(localIsland);
+  }
+
+  private hidePreviewPathMesh() {
+    if (this.previewPathMesh) {
+      this.scene.remove(this.previewPathMesh);
+      this.previewPathMesh.geometry.dispose();
+      this.previewPathMesh = null;
+    }
+  }
+
+  private clearPreviewConduits() {
+    this.previewConduitGroup.clear();
+  }
+
+  private hideDesktopHoverVisuals() {
+    this.hoveredCell = null;
+    this.hoveredExistingTower = null;
+    this.lastHoverValid = false;
+    this.cachedHoverPreview = null;
+    this.ghostGroup.visible = false;
+    this.ghostTurretGroup.visible = true;
+    this.ghostConnGroup.clear();
+    this.clearPreviewConduits();
+    this.hidePreviewPathMesh();
+
+    if (this.localPlayerId) {
+      const localIsland = this.islands.get(this.localPlayerId);
+      if (localIsland) {
+        localIsland.floorUniforms.uCursorPos.value.set(-99, -99);
+        localIsland.floorUniforms.uReticleMode.value = 0;
+        for (const sr of localIsland.spireRigs) {
+          sr.targetHoverBoost = 0;
+        }
+        this.restoreIslandBaseSynergyVisuals(localIsland);
+      }
+    }
+
+    this.onHoverStatusChange?.({
+      cell: null,
+      screenX: this.lastPointerScreen.x,
+      screenY: this.lastPointerScreen.y,
+      valid: false,
+    });
+  }
+
   private buildGhostAndPathPreview(
     localIsland: IslandVisuals,
     localPlayer: PlayerState,
     round: RoundConfig,
     placeX: number,
-    placeY: number
-  ): {
-    valid: boolean;
-    reason?: string;
-    deltaTime: number;
-    deltaClaps: number;
-    deltaKeeps: number;
-    deltaOvercharge: number;
-    previewTime: number;
-  } {
+    placeY: number,
+    snapped = false
+  ): CachedHoverPreview {
+    const cacheKey = `${this.lastLocalEvalSig}|${localPlayer.gold}|${placeX},${placeY}|${snapped ? 1 : 0}`;
+    if (this.cachedHoverPreview && this.cachedHoverPreview.key === cacheKey) {
+      return this.cachedHoverPreview;
+    }
+
+    const hasGold = localPlayer.gold >= TOWER_SPECS.BLOCK.goldCost;
     const validation = validateTowerPlacement(
       round,
       localPlayer.towers,
@@ -4037,79 +5881,68 @@ export class Arena3DRenderer {
       placeY
     );
 
+    const isValid = hasGold && validation.valid;
+    const reason = !hasGold ? 'No walls left' : validation.reason;
+    const reasonCode = !hasGold ? 'NO_PILLARS' : validation.reasonCode;
+
     this.ghostGroup.visible = true;
+    this.ghostTurretGroup.visible = true;
     this.ghostGroup.scale.set(1, 1, 1);
     this.ghostGroup.position.set(
       localIsland.offsetX + placeX + 1.0,
       0,
       localIsland.offsetZ + placeY + 1.0
     );
-    this.setGhostTint(validation.valid);
+    this.setGhostTint(isValid);
 
-    this.ghostConnGroup.clear();
-    if (validation.valid) {
-      const neighbors: GridPoint[] = [
-        ...localPlayer.towers,
-        ...round.obstacles,
-        ...round.preplacedSpires,
-      ];
-      for (const nb of neighbors) {
-        const dx = nb.x - placeX;
-        const dz = nb.y - placeY;
-        if (
-          (dx !== 0 || dz !== 0) &&
-          Math.abs(dx) <= 2 &&
-          Math.abs(dz) <= 2 &&
-          !do2x2Overlap(placeX, placeY, nb.x, nb.y)
-        ) {
-          // Span strictly between the outer faces of the two octagonal shafts (~0.68..fullDist-0.68)
-          // so translucent ghost bridges never poke inside opaque neighbor pillars!
-          const fullDist = Math.hypot(dx, dz);
-          const insetT = Math.min(0.42, 0.68 / fullDist);
-          const previewBridge = this.createBridgeSpanSegment(
-            0,
-            0,
-            dx,
-            dz,
-            insetT,
-            1.0 - insetT,
-            this.ghostBodyMat,
-            this.ghostCapMat,
-            true
-          );
-          this.ghostConnGroup.add(previewBridge);
-        }
-      }
+    const blockedVec = this.reticlePadMat.uniforms.uBlockedCells
+      .value as THREE.Vector4;
+    if (!isValid) {
+      this.computeBlockedSubCells(
+        round,
+        localPlayer.towers,
+        placeX,
+        placeY,
+        blockedVec
+      );
+    } else {
+      blockedVec.set(0, 0, 0, 0);
     }
 
-    this.clearPreviewPathMesh();
+    const allCellsClear =
+      blockedVec.x === 0 &&
+      blockedVec.y === 0 &&
+      blockedVec.z === 0 &&
+      blockedVec.w === 0;
+    this.reticlePadMat.uniforms.uBlocksPath.value =
+      !isValid && allCellsClear && reasonCode === 'BLOCKS_PATH' ? 1.0 : 0.0;
+
+    this.ghostConnGroup.clear();
+    this.clearPreviewConduits();
+    this.hidePreviewPathMesh();
 
     let deltaTime = 0;
     let deltaClaps = 0;
     let deltaKeeps = 0;
     let deltaOvercharge = 0;
     let previewTime = this.cachedBaseEval?.finishTimeSeconds || 0;
+    let joinsCircuit = false;
 
-    if (validation.valid && validation.pathResult) {
-      if (validation.pathResult.allPoints.length > 1) {
-        const ribbonGeo = createFlatPathRibbonGeometry(
-          validation.pathResult.allPoints,
-          localIsland.offsetX,
-          localIsland.offsetZ,
-          0.03,
-          0.15
-        );
-        this.previewPathMat = createPathRibbonShader('#ecfccb', 0.72);
-        this.previewPathMesh = new THREE.Mesh(ribbonGeo, this.previewPathMat);
-        this.previewPathMesh.renderOrder = 5;
-        this.scene.add(this.previewPathMesh);
-      }
-
+    if (isValid && validation.pathResult) {
       const testTowers: PlacedTower[] = [
         ...localPlayer.towers,
         { id: '__preview__', type: 'BLOCK', x: placeX, y: placeY, createdAt: 0 },
       ];
-      const previewEval = evaluateMazeRunTime(round, testTowers);
+      const previewEval = evaluateMazeRunTime(round, testTowers, {
+        precomputedPath: validation.pathResult,
+        collectClapLocations: true,
+      });
+      const previewCircuitry = computeCitadelCircuitry(round, testTowers);
+
+      joinsCircuit = Boolean(
+        previewCircuitry.poweredNodeKeys?.has(`${placeX},${placeY}`)
+      );
+
       previewTime = previewEval.finishTimeSeconds;
       if (this.cachedBaseEval) {
         deltaTime = Number(
@@ -4121,289 +5954,623 @@ export class Arena3DRenderer {
         deltaClaps = previewEval.clapsTaken - this.cachedBaseEval.clapsTaken;
         deltaKeeps = previewEval.linkedKeeps - this.cachedBaseEval.linkedKeeps;
         deltaOvercharge =
-          previewEval.overchargedSpires - this.cachedBaseEval.overchargedSpires;
+          previewEval.overchargedSpires -
+          this.cachedBaseEval.overchargedSpires;
       }
+
+      // Pruned ghost bridges (tinted radiant Sun-Gold when joining a Crimson Keep circuit!)
+      const previewMasonryNodes = [
+        ...localPlayer.towers.map((t) => ({ x: t.x, y: t.y })),
+        ...round.obstacles.map((o) => ({ x: o.x, y: o.y })),
+        { x: placeX, y: placeY },
+      ];
+
+      const ghostWallMat = joinsCircuit
+        ? this.ghostGoldBodyMat
+        : this.ghostBodyMat;
+      const ghostTrimMat = joinsCircuit
+        ? this.ghostGoldCapMat
+        : this.ghostCapMat;
+
+      for (const nb of previewMasonryNodes) {
+        const dx = nb.x - placeX;
+        const dz = nb.y - placeY;
+        if (dx === 0 && dz === 0) continue;
+        if (Math.abs(dx) > 2 || Math.abs(dz) > 2) continue;
+        if (do2x2Overlap(placeX, placeY, nb.x, nb.y)) continue;
+        if (
+          this.shouldPruneNonOrthogonalBridge(
+            placeX,
+            placeY,
+            nb.x,
+            nb.y,
+            previewMasonryNodes
+          )
+        ) {
+          continue;
+        }
+
+        const fullDist = Math.hypot(dx, dz);
+        const insetT = Math.min(0.42, 0.72 / fullDist);
+        const previewBridge = this.createBridgeSpanSegment(
+          0,
+          0,
+          dx,
+          dz,
+          insetT,
+          1.0 - insetT,
+          ghostWallMat,
+          ghostTrimMat,
+          true
+        );
+        this.ghostConnGroup.add(previewBridge);
+      }
+
+      // Preview Flagstone Path Ribbon (`#fef08a` sunlit gold-cream)
+      if (validation.pathResult.allPoints.length > 1) {
+        const ribbonGeo = createFlatPathRibbonGeometry(
+          validation.pathResult.allPoints,
+          localIsland.offsetX,
+          localIsland.offsetZ,
+          0.03,
+          0.155
+        );
+        this.previewPathMesh = new THREE.Mesh(ribbonGeo, this.previewPathMat);
+        this.previewPathMesh.renderOrder = 5;
+        this.scene.add(this.previewPathMesh);
+      }
+
+      // Live Synergy Preview: light up newly linked Keep braziers, Spire Overcharge & gold ley-lines!
+      const previewLinks = this.computeFallbackConduitLinks(
+        round,
+        previewMasonryNodes,
+        previewCircuitry
+      );
+      this.populateSpireConduits(
+        this.previewConduitGroup,
+        previewLinks,
+        localIsland.offsetX,
+        localIsland.offsetZ,
+        this.previewConduitMat
+      );
 
       this.populateClapMarkers(
         localIsland,
+        round,
         previewEval.clapLocations,
-        deltaClaps > 0
+        this.cachedBaseEval?.clapLocations
       );
+      this.applyKeepLinkVisuals(localIsland, previewCircuitry.linkedKeepIndices);
       this.applySpireOverchargeVisuals(
         localIsland,
         previewEval.spireOverchargeTiers
       );
 
-      // Brighten Spire range hairline (0.24 -> 0.58) when hovering/ghosting near a Spire or boosting its Overcharge
       localIsland.spireRigs.forEach((sr, idx) => {
         const dist = Math.hypot(sr.gridX - placeX, sr.gridY - placeY);
         const baseTier = this.cachedBaseEval?.spireOverchargeTiers[idx] || 0;
         const newTier = previewEval.spireOverchargeTiers[idx] || 0;
         sr.targetHoverBoost =
-          dist <= sr.baseRange + 2.6 || newTier > baseTier ? 1.0 : 0.0;
+          dist <= sr.baseRange + 2.8 || newTier > baseTier ? 1.0 : 0.0;
       });
     } else {
-      if (this.cachedBaseEval) {
-        this.populateClapMarkers(
-          localIsland,
-          this.cachedBaseEval.clapLocations,
-          false
-        );
-        this.applySpireOverchargeVisuals(
-          localIsland,
-          this.cachedBaseEval.spireOverchargeTiers
-        );
-      }
+      this.restoreIslandBaseSynergyVisuals(localIsland);
       localIsland.spireRigs.forEach((sr) => {
         const dist = Math.hypot(sr.gridX - placeX, sr.gridY - placeY);
         sr.targetHoverBoost = dist <= sr.baseRange + 2.2 ? 1.0 : 0.0;
       });
     }
 
-    return {
-      valid: validation.valid,
-      reason: validation.reason,
+    const modeVal = !isValid
+      ? 2.0
+      : joinsCircuit || deltaKeeps > 0 || deltaOvercharge > 0
+      ? 4.0
+      : 1.0;
+    this.reticlePadMat.uniforms.uMode.value = modeVal;
+
+    localIsland.floorUniforms.uCursorPos.value.set(placeX + 1.0, placeY + 1.0);
+    localIsland.floorUniforms.uAnchorBox.value.set(
+      placeX,
+      placeY,
+      placeX + 2.0,
+      placeY + 2.0
+    );
+    localIsland.floorUniforms.uReticleMode.value =
+      modeVal === 4.0 ? 3.0 : modeVal;
+
+    const result: CachedHoverPreview = {
+      key: cacheKey,
+      valid: isValid,
+      snapped,
+      reason,
+      reasonCode,
       deltaTime,
       deltaClaps,
       deltaKeeps,
       deltaOvercharge,
       previewTime,
     };
+    this.cachedHoverPreview = result;
+    return result;
   }
 
-  private updateBuildHover() {
+  /**
+   * Detects hover over Spires, Crimson Keeps, North/South Gates, or Runners on the focused island
+   * (active in BOTH `BUILD` and `RUN` so players can inspect world features with zero clutter!).
+   */
+  private detectInspectedWorldFeature(
+    island: IslandVisuals,
+    player: PlayerState,
+    round: RoundConfig,
+    rawRelX: number,
+    rawRelZ: number
+  ): InspectedWorldFeature | null {
+    if (player.fogMasked) return null;
+
+    // 1. Check Runner proximity (`r <= 0.78m` around runner position)
+    const rx = island.runner.root.position.x;
+    const rz = island.runner.root.position.z;
+    if (Math.hypot(rawRelX - rx, rawRelZ - rz) <= 0.78) {
+      const sim = this.latestSimStates.get(player.id);
+      const archetype = round.runnerType || 'SCOUT';
+      const baseSpeed = sim?.baseSpeed ?? (archetype === 'OUTRIDER' ? 3.85 : archetype === 'JUGGERNAUT' ? 3.25 : archetype === 'HERALD' ? 3.55 : 3.5);
+      const currentSpeed = sim ? Number(sim.currentSpeed.toFixed(2)) : baseSpeed;
+      let statusLabel: string | undefined;
+      if (sim) {
+        if (sim.finished) statusLabel = 'Finished';
+        else if (sim.clapSlowRemaining > 0 && sim.inPermafrostAura)
+          statusLabel = 'Slow + Frost';
+        else if (sim.clapSlowRemaining > 0) statusLabel = 'Slowed';
+        else if (sim.inPermafrostAura || sim.inFrostMire) statusLabel = 'Chilled';
+        else if (sim.hasTailwindMomentum || sim.inHasteRift)
+          statusLabel = 'Tailwind Haste';
+      }
+      return {
+        kind: 'RUNNER',
+        playerId: player.id,
+        archetype,
+        currentSpeed,
+        baseSpeed,
+        statusLabel,
+      };
+    }
+
+    const cx = Math.floor(rawRelX);
+    const cy = Math.floor(rawRelZ);
+
+    // 2. Check Elemental Spires
+    for (let idx = 0; idx < round.preplacedSpires.length; idx++) {
+      const s = round.preplacedSpires[idx];
+      if (isCellIn2x2(cx, cy, s)) {
+        const spireType: SpireType = s.spireType || 'THUNDERCLAP';
+        const spec = TOWER_SPECS[spireType];
+        const sim = this.latestSimStates.get(player.id);
+        const simTower = sim?.towers[`spire_${idx}`];
+
+        let tier = 0;
+        let projectedOrLiveHits = 0;
+        if (simTower) {
+          tier = simTower.overchargeTier;
+          projectedOrLiveHits = simTower.triggeredCount;
+        } else if (player.id === this.localPlayerId && this.cachedBaseEval) {
+          tier = this.cachedBaseEval.spireOverchargeTiers[idx] || 0;
+          projectedOrLiveHits =
+            this.cachedBaseEval.perSpireClaps[`spire_${idx}`] || 0;
+        } else {
+          const circ = computeCitadelCircuitry(round, player.towers);
+          tier = circ.spireOverchargeTiers[idx] || 0;
+        }
+
+        const safeTier = Math.max(0, Math.min(3, tier));
+        const effectiveRange = Number((spec.range + safeTier * 0.25).toFixed(2));
+        const effectiveCooldown = Number(
+          (spec.cooldown * (1 - OVERCHARGE_CDR[safeTier])).toFixed(2)
+        );
+        const auraSlowPercent =
+          spec.auraSlowPercent !== undefined
+            ? Number((spec.auraSlowPercent + safeTier * 0.02).toFixed(2))
+            : undefined;
+
+        return {
+          kind: 'SPIRE',
+          spireIndex: idx,
+          spireType,
+          x: s.x,
+          y: s.y,
+          overchargeTier: safeTier,
+          effectiveRange,
+          effectiveCooldown,
+          slowPercent: spec.slowPercent,
+          slowDuration: Number(
+            (spec.slowDuration + safeTier * 0.2).toFixed(2)
+          ),
+          auraSlowPercent,
+          cdrPulseSeconds: spec.cdrPulseSeconds,
+          projectedOrLiveHits,
+        };
+      }
+    }
+
+    // 3. Check Crimson Keeps
+    for (let idx = 0; idx < round.obstacles.length; idx++) {
+      const o = round.obstacles[idx];
+      if (isCellIn2x2(cx, cy, o)) {
+        const circ =
+          player.id === this.localPlayerId && this.cachedLocalCircuitry
+            ? this.cachedLocalCircuitry
+            : computeCitadelCircuitry(round, player.towers);
+        return {
+          kind: 'KEEP',
+          keepIndex: idx,
+          x: o.x,
+          y: o.y,
+          linked: circ.linkedKeepIndices.has(idx),
+        };
+      }
+    }
+
+    // 4. Check North Gate & South Shrine Aprons
+    if (
+      rawRelZ >= -1.6 &&
+      rawRelZ <= 0.75 &&
+      rawRelX >= round.spawn.x - 0.3 &&
+      rawRelX <= round.spawn.x + 2.3
+    ) {
+      return {
+        kind: 'GATE',
+        gateType: 'SPAWN',
+        x: round.spawn.x,
+        y: round.spawn.y,
+        parTimeSeconds: round.parTimeSeconds,
+      };
+    }
+
+    if (
+      rawRelZ >= round.gridHeight - 0.75 &&
+      rawRelZ <= round.gridHeight + 1.6 &&
+      rawRelX >= round.exit.x - 0.3 &&
+      rawRelX <= round.exit.x + 2.3
+    ) {
+      return {
+        kind: 'GATE',
+        gateType: 'EXIT',
+        x: round.exit.x,
+        y: round.exit.y,
+        parTimeSeconds: round.parTimeSeconds,
+      };
+    }
+
+    return null;
+  }
+
+  private updateBuildHover(forceRefresh = false) {
     if (
       !this.currentRoomState ||
-      this.currentRoomState.phase !== 'BUILD' ||
-      !this.localPlayerId
-    ) {
-      this.mouseOverLocalGrass = false;
-      this.ghostGroup.visible = false;
-      this.ghostGroup.scale.set(1, 1, 1);
-      this.ghostConnGroup.clear();
-      this.clearPreviewPathMesh();
-      this.onHoverStatusChange?.({
-        cell: null,
-        screenX: this.lastPointerScreen.x,
-        screenY: this.lastPointerScreen.y,
-        valid: false,
-      });
-      return;
-    }
-
-    const localIsland = this.islands.get(this.localPlayerId);
-    const localPlayer = this.currentRoomState.players.find(
-      (p) => p.id === this.localPlayerId
-    );
-    if (!localIsland || !localPlayer) {
-      this.mouseOverLocalGrass = false;
-      this.ghostGroup.visible = false;
-      return;
-    }
-
-    // Suppress build ghost while viewing Arena Overview or spectating a rival island
-    if (
+      this._modalOpen ||
       this.arenaOverviewMode ||
-      (this.focusedPlayerId && this.focusedPlayerId !== this.localPlayerId)
+      this.mouseNDC.x < -9
     ) {
-      this.mouseOverLocalGrass = false;
-      this.ghostGroup.visible = false;
-      this.ghostGroup.scale.set(1, 1, 1);
-      this.ghostConnGroup.clear();
-      this.hoveredCell = null;
-      this.hoveredExistingTower = null;
-      localIsland.floorUniforms.uCursorPos.value.set(-99, -99);
-      for (const sr of localIsland.spireRigs) {
-        sr.targetHoverBoost = 0;
-      }
-      this.clearPreviewPathMesh();
-      if (this.cachedBaseEval) {
-        this.populateClapMarkers(
-          localIsland,
-          this.cachedBaseEval.clapLocations,
-          false
-        );
-        this.applySpireOverchargeVisuals(
-          localIsland,
-          this.cachedBaseEval.spireOverchargeTiers
-        );
-      }
-      this.onHoverStatusChange?.({
-        cell: null,
-        screenX: this.lastPointerScreen.x,
-        screenY: this.lastPointerScreen.y,
-        valid: false,
-      });
+      this.hideDesktopHoverVisuals();
       return;
     }
 
+    const focusPid = this.focusedPlayerId || this.localPlayerId;
+    if (!focusPid) {
+      this.hideDesktopHoverVisuals();
+      return;
+    }
+
+    const focusedIsland = this.islands.get(focusPid);
+    const focusedPlayer = this.currentRoomState.players.find(
+      (p) => p.id === focusPid
+    );
+    if (!focusedIsland || !focusedPlayer) {
+      this.hideDesktopHoverVisuals();
+      return;
+    }
+
+    if (forceRefresh) {
+      this.cachedHoverPreview = null;
+    }
+
+    this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera(this.mouseNDC, this.camera);
-    const hits = this.raycaster.intersectObject(localIsland.hitPlane);
-    if (hits.length === 0) {
-      this.mouseOverLocalGrass = false;
+    const round = this.currentRoomState.roundConfig;
+    const planeHit = this.intersectClampedBuildPlane(focusedIsland, round, 1.8);
+
+    const isBuildOnLocal =
+      this.currentRoomState.phase === 'BUILD' &&
+      focusPid === this.localPlayerId &&
+      this._activeTool !== 'PAN';
+
+    // Non-build phases (RUN, RESULTS) or Spectating or PAN mode -> Feature Inspection Only!
+    if (!isBuildOnLocal) {
       this.ghostGroup.visible = false;
-      this.ghostGroup.scale.set(1, 1, 1);
       this.ghostConnGroup.clear();
+      this.clearPreviewConduits();
+      this.hidePreviewPathMesh();
       this.hoveredCell = null;
       this.hoveredExistingTower = null;
-      localIsland.floorUniforms.uCursorPos.value.set(-99, -99);
-      for (const sr of localIsland.spireRigs) {
-        sr.targetHoverBoost = 0;
-      }
-      this.clearPreviewPathMesh();
-      if (this.cachedBaseEval) {
-        this.populateClapMarkers(
-          localIsland,
-          this.cachedBaseEval.clapLocations,
-          false
-        );
-        this.applySpireOverchargeVisuals(
-          localIsland,
-          this.cachedBaseEval.spireOverchargeTiers
-        );
-      }
-      this.onHoverStatusChange?.({
-        cell: null,
-        screenX: this.lastPointerScreen.x,
-        screenY: this.lastPointerScreen.y,
-        valid: false,
-      });
-      return;
-    }
+      this.lastHoverValid = false;
+      focusedIsland.floorUniforms.uReticleMode.value = 0;
 
-    this.mouseOverLocalGrass = true;
-    const localPt = hits[0].point;
-    const relX = localPt.x - localIsland.offsetX;
-    const relZ = localPt.z - localIsland.offsetZ;
-    localIsland.floorUniforms.uCursorPos.value.set(relX, relZ);
-
-    const round = this.currentRoomState.roundConfig;
-    const cellX = Math.floor(relX);
-    const cellY = Math.floor(relZ);
-
-    this.hoveredExistingTower =
-      localPlayer.towers.find(
-        (t) =>
-          cellX >= t.x &&
-          cellX < t.x + 2 &&
-          cellY >= t.y &&
-          cellY < t.y + 2
-      ) || null;
-
-    if (this.activeTool === 'SELL') {
-      this.ghostConnGroup.clear();
-      this.clearPreviewPathMesh();
-      for (const sr of localIsland.spireRigs) {
-        sr.targetHoverBoost = 0;
-      }
-      if (this.hoveredExistingTower) {
-        this.ghostGroup.visible = true;
-        this.ghostGroup.scale.set(1.05, 1.03, 1.05);
-        this.ghostGroup.position.set(
-          localIsland.offsetX + this.hoveredExistingTower.x + 1.0,
-          0,
-          localIsland.offsetZ + this.hoveredExistingTower.y + 1.0
-        );
-        this.setGhostTint(false);
-        this.onHoverStatusChange?.({
-          cell: { x: cellX, y: cellY },
-          screenX: this.lastPointerScreen.x,
-          screenY: this.lastPointerScreen.y,
-          valid: true,
-          reason: 'Refund Pillar',
-          existingTower: this.hoveredExistingTower,
-        });
-      } else {
-        this.ghostGroup.visible = false;
+      if (!planeHit) {
+        for (const sr of focusedIsland.spireRigs) sr.targetHoverBoost = 0;
         this.onHoverStatusChange?.({
           cell: null,
           screenX: this.lastPointerScreen.x,
           screenY: this.lastPointerScreen.y,
           valid: false,
         });
+        return;
       }
+
+      const inspected = this.detectInspectedWorldFeature(
+        focusedIsland,
+        focusedPlayer,
+        round,
+        planeHit.rawRelX,
+        planeHit.rawRelZ
+      );
+      focusedIsland.spireRigs.forEach((sr, idx) => {
+        sr.targetHoverBoost =
+          inspected?.kind === 'SPIRE' && inspected.spireIndex === idx
+            ? 1.0
+            : 0.0;
+      });
+
+      this.onHoverStatusChange?.({
+        cell: null,
+        screenX: this.lastPointerScreen.x,
+        screenY: this.lastPointerScreen.y,
+        valid: false,
+        inspectedFeature: inspected,
+      });
       return;
     }
 
-    const placeX = Math.max(
-      0,
-      Math.min(round.gridWidth - 2, Math.round(relX - 1))
-    );
-    const placeY = Math.max(
-      0,
-      Math.min(round.gridHeight - 2, Math.round(relZ - 1))
-    );
-    this.hoveredCell = { x: placeX, y: placeY };
+    // Local Island in BUILD Phase:
+    // 1. 3D Mesh-First Raycast for existing player Stone Walls (zero cap parallax miss!)
+    let existing = this.raycastExistingWallMesh(focusedIsland, focusedPlayer);
+    if (!existing && planeHit) {
+      const cx = Math.floor(planeHit.relX);
+      const cy = Math.floor(planeHit.relZ);
+      existing =
+        focusedPlayer.towers.find((t) => isCellIn2x2(cx, cy, t)) || null;
+    }
+    this.hoveredExistingTower = existing;
 
-    const preview = this.buildGhostAndPathPreview(
-      localIsland,
-      localPlayer,
+    if (existing) {
+      this.hoveredCell = { x: existing.x, y: existing.y };
+      this.lastHoverValid = false;
+      this.showRemoveBracketVisuals(focusedIsland, existing.x, existing.y);
+      this.onHoverStatusChange?.({
+        cell: { x: existing.x, y: existing.y },
+        screenX: this.lastPointerScreen.x,
+        screenY: this.lastPointerScreen.y,
+        valid: true,
+        reason: 'Remove (+1)',
+        existingTower: existing,
+      });
+      return;
+    }
+
+    if (!planeHit) {
+      this.hideDesktopHoverVisuals();
+      return;
+    }
+
+    // 2. Check if cursor is directly over a Spire, Keep, Gate, or Runner -> Inspect instead of flashing red 'Occupied'!
+    const inspected = this.detectInspectedWorldFeature(
+      focusedIsland,
+      focusedPlayer,
       round,
-      placeX,
-      placeY
+      planeHit.rawRelX,
+      planeHit.rawRelZ
     );
+    if (inspected) {
+      this.hoveredCell = null;
+      this.lastHoverValid = false;
+      this.ghostGroup.visible = false;
+      this.ghostConnGroup.clear();
+      this.clearPreviewConduits();
+      this.hidePreviewPathMesh();
+      focusedIsland.floorUniforms.uCursorPos.value.set(-99, -99);
+      focusedIsland.floorUniforms.uReticleMode.value = 0;
+      this.restoreIslandBaseSynergyVisuals(focusedIsland);
+
+      focusedIsland.spireRigs.forEach((sr, idx) => {
+        sr.targetHoverBoost =
+          inspected.kind === 'SPIRE' && inspected.spireIndex === idx
+            ? 1.0
+            : 0.0;
+      });
+
+      this.onHoverStatusChange?.({
+        cell: null,
+        screenX: this.lastPointerScreen.x,
+        screenY: this.lastPointerScreen.y,
+        valid: false,
+        inspectedFeature: inspected,
+      });
+      return;
+    }
+
+    if (this._activeTool === 'SELL') {
+      this.ghostGroup.visible = false;
+      this.ghostConnGroup.clear();
+      this.clearPreviewConduits();
+      this.hidePreviewPathMesh();
+      focusedIsland.floorUniforms.uCursorPos.value.set(
+        planeHit.relX,
+        planeHit.relZ
+      );
+      focusedIsland.floorUniforms.uReticleMode.value = 0;
+      for (const sr of focusedIsland.spireRigs) sr.targetHoverBoost = 0;
+      this.onHoverStatusChange?.({
+        cell: null,
+        screenX: this.lastPointerScreen.x,
+        screenY: this.lastPointerScreen.y,
+        valid: false,
+      });
+      return;
+    }
+
+    // 3. Smart 2x2 Obstacle-Aware Flush Snap (`mode: 'mouse'`) + Cell-Memoized Preview!
+    if (
+      planeHit.rawRelX < -0.45 ||
+      planeHit.rawRelX > round.gridWidth + 0.45 ||
+      planeHit.rawRelZ < -0.45 ||
+      planeHit.rawRelZ > round.gridHeight + 0.45
+    ) {
+      this.hideDesktopHoverVisuals();
+      return;
+    }
+
+    const smart = resolveSmart2x2Placement(
+      round,
+      focusedPlayer.towers,
+      planeHit.relX,
+      planeHit.relZ,
+      { mode: 'mouse', availableGold: focusedPlayer.gold }
+    );
+
+    this.hoveredCell = { x: smart.x, y: smart.y };
+    const preview = this.buildGhostAndPathPreview(
+      focusedIsland,
+      focusedPlayer,
+      round,
+      smart.x,
+      smart.y,
+      smart.snapped
+    );
+    this.lastHoverValid = preview.valid;
 
     this.onHoverStatusChange?.({
       cell: this.hoveredCell,
       screenX: this.lastPointerScreen.x,
       screenY: this.lastPointerScreen.y,
       valid: preview.valid,
+      snapped: preview.snapped,
       reason: preview.reason,
       deltaTime: preview.deltaTime,
       deltaClaps: preview.deltaClaps,
       deltaKeeps: preview.deltaKeeps,
       deltaOvercharge: preview.deltaOvercharge,
       previewTime: preview.previewTime,
-      existingTower: this.hoveredExistingTower,
+      existingTower: null,
     });
   }
 
-  private clearPreviewPathMesh() {
-    if (this.previewPathMesh) {
-      this.scene.remove(this.previewPathMesh);
-      this.previewPathMesh.geometry.dispose();
-      this.previewPathMesh = null;
-      this.previewPathMat = null;
-    }
-  }
+  // ==========================================================================
+  // BESPOKE SPIRE COMBAT VFX, RUNNER KINEMATICS & ZERO-THRASH WORLD LABELS
+  // ==========================================================================
 
   public updateRunners(
     states: Map<string, RunnerSimState>,
     events: SimEvent[]
-  ) {
+  ): void {
+    this.latestSimStates = states;
+
     for (const ev of events) {
       const island = this.islands.get(ev.playerId);
-      if (!island) continue;
+      if (!island || !island.root.visible) continue;
+
+      const sim = states.get(ev.playerId);
 
       if (ev.type === 'CLAP') {
         const spireType = ev.spireType || 'THUNDERCLAP';
-        const shockColor =
-          spireType === 'FROST_OBELISK'
-            ? '#38bdf8'
-            : spireType === 'CHRONO_SPIRE'
-            ? '#a855f7'
-            : '#f59e0b';
-        const burstColor =
-          spireType === 'FROST_OBELISK'
-            ? '#bae6fd'
-            : spireType === 'CHRONO_SPIRE'
-            ? '#e9d5ff'
-            : '#fde68a';
-        this.spawnShockwaveEffect(
-          island.offsetX + ev.x,
-          island.offsetZ + ev.y,
-          TOWER_SPECS[spireType].range,
-          shockColor,
-          island.offsetX + island.runner.root.position.x,
-          island.offsetZ + island.runner.root.position.z
-        );
-        this.spawnParticleBurst(
-          island.offsetX + ev.x,
-          1.4,
-          island.offsetZ + ev.y,
-          burstColor,
-          14
-        );
+        const tier = ev.overchargeTier || 0;
+        const simTower = ev.towerId ? sim?.towers[ev.towerId] : undefined;
+        const effectiveRange =
+          simTower?.effectiveRange ??
+          TOWER_SPECS[spireType].range + tier * 0.25;
+
+        const worldSpireX = island.offsetX + ev.x;
+        const worldSpireZ = island.offsetZ + ev.y;
+        const targetRunnerX =
+          island.offsetX + (ev.targetX ?? island.runner.root.position.x);
+        const targetRunnerZ =
+          island.offsetZ + (ev.targetY ?? island.runner.root.position.z);
+
+        const isFocused =
+          !this.arenaOverviewMode &&
+          ev.playerId === (this.focusedPlayerId || this.localPlayerId);
+
+        if (spireType === 'FROST_OBELISK') {
+          // 6-Lobed Crystalline Glacial Hex-Nova (ZERO lightning bolt!)
+          this.spawnFrostHexNovaEffect(
+            worldSpireX,
+            worldSpireZ,
+            effectiveRange
+          );
+          if (isFocused) {
+            this.spawnParticleBurst(
+              worldSpireX,
+              1.35,
+              worldSpireZ,
+              '#bae6fd',
+              6
+            );
+          }
+        } else if (spireType === 'CHRONO_SPIRE') {
+          // Violet Temporal Implosion-Expansion Wave + Golden-Violet CDR Relay to Sibling Spires!
+          this.spawnShockwaveEffect(
+            worldSpireX,
+            worldSpireZ,
+            effectiveRange,
+            '#c084fc'
+          );
+          for (const sibling of island.spireRigs) {
+            const dist = Math.hypot(
+              sibling.group.position.x - ev.x,
+              sibling.group.position.z - ev.y
+            );
+            if (dist > 0.6) {
+              sibling.cdrFlash = 1.0;
+              this.spawnChronoRelayArc(
+                worldSpireX,
+                1.95,
+                worldSpireZ,
+                island.offsetX + sibling.group.position.x,
+                1.35,
+                island.offsetZ + sibling.group.position.z
+              );
+            } else {
+              sibling.recoil = 1.0;
+            }
+          }
+          if (isFocused) {
+            this.spawnParticleBurst(
+              worldSpireX,
+              1.55,
+              worldSpireZ,
+              '#e9d5ff',
+              6
+            );
+          }
+        } else {
+          // THUNDERCLAP: Tapered Golden-Electric Ribbon Arc + Exact Effective-Range Shockwave!
+          this.spawnShockwaveEffect(
+            worldSpireX,
+            worldSpireZ,
+            effectiveRange,
+            '#f59e0b',
+            targetRunnerX,
+            targetRunnerZ
+          );
+          if (isFocused) {
+            this.spawnParticleBurst(
+              worldSpireX,
+              1.6,
+              worldSpireZ,
+              '#fde68a',
+              6
+            );
+          }
+        }
+
+        // Recoil triggering Spire
         for (const spireRig of island.spireRigs) {
           if (
             Math.hypot(
@@ -4414,19 +6581,32 @@ export class Arena3DRenderer {
             spireRig.recoil = 1.0;
           }
         }
+
+        // Iron Juggernaut Armor Deflect vs Overcharge Armor-Pierce Burst!
+        if (ev.armoredResisted) {
+          this.spawnShockwaveEffect(
+            targetRunnerX,
+            targetRunnerZ,
+            0.95,
+            '#94a3b8'
+          );
+        } else if (
+          tier >= 1 &&
+          island.runner.archetype === 'JUGGERNAUT'
+        ) {
+          this.spawnShockwaveEffect(
+            targetRunnerX,
+            targetRunnerZ,
+            1.15,
+            '#fbbf24'
+          );
+        }
       } else if (ev.type === 'CHECKPOINT') {
         this.spawnShockwaveEffect(
           island.offsetX + ev.x,
           island.offsetZ + ev.y,
           2.0,
           '#10b981'
-        );
-        this.spawnParticleBurst(
-          island.offsetX + ev.x,
-          0.9,
-          island.offsetZ + ev.y,
-          '#6ee7b7',
-          14
         );
       } else if (ev.type === 'WAYGATE') {
         this.spawnShockwaveEffect(
@@ -4435,27 +6615,25 @@ export class Arena3DRenderer {
           2.2,
           '#a855f7'
         );
-        this.spawnParticleBurst(
-          island.offsetX + ev.x,
-          0.9,
-          island.offsetZ + ev.y,
-          '#e9d5ff',
-          16
-        );
       } else if (ev.type === 'FINISH') {
         this.spawnShockwaveEffect(
           island.offsetX + ev.x,
           island.offsetZ + ev.y,
-          2.8,
+          2.6,
           '#38bdf8'
         );
-        this.spawnParticleBurst(
-          island.offsetX + ev.x,
-          1.0,
-          island.offsetZ + ev.y,
-          '#7dd3fc',
-          20
-        );
+        if (
+          !this.arenaOverviewMode &&
+          ev.playerId === (this.focusedPlayerId || this.localPlayerId)
+        ) {
+          this.spawnParticleBurst(
+            island.offsetX + ev.x,
+            1.0,
+            island.offsetZ + ev.y,
+            '#7dd3fc',
+            10
+          );
+        }
       }
     }
 
@@ -4473,75 +6651,91 @@ export class Arena3DRenderer {
       const moveDz = sim.y - prevZ;
       const distMoved = Math.hypot(moveDx, moveDz);
 
-      let targetYaw = r.currentYaw;
-      if (distMoved > 0.001) {
-        targetYaw = Math.atan2(moveDx, moveDz);
-      }
-      let diff = targetYaw - r.currentYaw;
-      while (diff > Math.PI) diff -= Math.PI * 2;
-      while (diff < -Math.PI) diff += Math.PI * 2;
-      r.currentYaw += diff * 0.25;
-      r.root.rotation.y = r.currentYaw;
-
-      const bankAngle = Math.max(-0.32, Math.min(0.32, -diff * 1.6));
-      r.pelvis.rotation.z = bankAngle;
-
       if (!sim.finished) {
-        r.walkPhase += 0.016 * sim.currentSpeed * 4.5;
+        let targetYaw = r.currentYaw;
+        if (distMoved > 0.0005) {
+          targetYaw = Math.atan2(moveDx, moveDz);
+        }
+        let diff = targetYaw - r.currentYaw;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        r.currentYaw += diff * 0.26;
+        r.root.rotation.y = r.currentYaw;
+
+        const bankAngle = Math.max(-0.3, Math.min(0.3, -diff * 1.5));
+        r.pelvis.rotation.z = bankAngle;
+
+        // Advance walk stride smoothly proportional to real spatial displacement
+        r.walkPhase += Math.min(0.45, distMoved * 4.4);
         const swing = Math.sin(r.walkPhase) * 0.62;
         r.leftLeg.rotation.x = swing;
         r.rightLeg.rotation.x = -swing;
+
         if (r.archetype === 'JUGGERNAUT') {
           r.leftArm.rotation.x = 0.28 - swing * 0.16;
-          r.rightArm.rotation.x = swing * 0.56;
+          r.rightArm.rotation.x = swing * 0.54;
         } else if (r.archetype === 'OUTRIDER') {
-          r.leftArm.rotation.x = -swing * 0.72;
+          r.leftArm.rotation.x = -swing * 0.7;
           r.rightArm.rotation.x = swing * 0.14;
+          if (r.pennantMesh) {
+            r.pennantMesh.rotation.y = Math.sin(r.walkPhase * 1.6) * 0.24;
+          }
         } else {
-          r.leftArm.rotation.x = -swing * 0.72;
+          r.leftArm.rotation.x = -swing * 0.7;
           r.rightArm.rotation.x = swing * 0.46;
         }
-        r.pelvis.position.y = 0.45 + Math.abs(Math.sin(r.walkPhase)) * 0.12;
-        r.pelvis.rotation.x = 0.12;
+
+        // Wind Herald dynamic wing flare during Tailwind Haste!
+        if (r.leftWing && r.rightWing) {
+          const haste = sim.hasTailwindMomentum;
+          r.leftWing.rotation.y = haste ? -0.82 : -0.42;
+          r.rightWing.rotation.y = haste ? 0.82 : 0.42;
+          r.leftWing.scale.setScalar(haste ? 1.22 : 1.0);
+          r.rightWing.scale.setScalar(haste ? 1.22 : 1.0);
+          const wMat = r.leftWing.material as THREE.MeshStandardMaterial;
+          wMat.emissiveIntensity = haste ? 0.75 : 0.28;
+        }
+
+        r.pelvis.position.y = 0.45 + Math.abs(Math.sin(r.walkPhase)) * 0.11;
+        r.pelvis.rotation.x = sim.hasTailwindMomentum ? 0.22 : 0.12;
       } else {
-        r.pelvis.position.y = 0.6;
+        // Calm victorious idle pose facing camera (zero dizzying endless spin!)
+        r.pelvis.position.y =
+          0.54 + Math.sin(performance.now() * 0.005) * 0.05;
         r.pelvis.rotation.x = 0;
         r.pelvis.rotation.z = 0;
-        r.root.rotation.y += 0.04;
+        r.leftLeg.rotation.x = 0;
+        r.rightLeg.rotation.x = 0;
+        r.currentYaw += (0 - r.currentYaw) * 0.15;
+        r.root.rotation.y = r.currentYaw;
       }
 
-      // Flat status ring under Runner's feet (replaces spinning wireframe snareCage!)
-      const hasModifier =
-        sim.clapSlowRemaining > 0 ||
-        sim.inPermafrostAura ||
-        sim.hasTailwindMomentum ||
-        sim.inFrostMire ||
-        sim.inHasteRift;
-      r.statusRing.visible = !sim.finished && hasModifier;
+      // Dual-Status Segmented Ground Ring (shows stacked Slow + Frost simultaneously!)
+      const activeColors: string[] = [];
+      if (sim.clapSlowRemaining > 0) activeColors.push('#f59e0b');
+      if (sim.inPermafrostAura || sim.inFrostMire) activeColors.push('#38bdf8');
+      if (sim.hasTailwindMomentum) activeColors.push('#34d399');
+      if (sim.inHasteRift) activeColors.push('#fb7185');
 
-      const ringMat = r.statusRing.material as THREE.MeshBasicMaterial;
-      const accentMat = r.accentMesh
-        ? (r.accentMesh.material as THREE.MeshBasicMaterial)
-        : null;
-      if (sim.clapSlowRemaining > 0) {
-        ringMat.color.set('#f59e0b');
-        accentMat?.color.set('#fbbf24');
-      } else if (sim.inPermafrostAura || sim.inFrostMire) {
-        ringMat.color.set('#38bdf8');
-        accentMat?.color.set('#38bdf8');
-      } else if (sim.hasTailwindMomentum) {
-        ringMat.color.set('#34d399');
-        accentMat?.color.set('#34d399');
-      } else if (sim.inHasteRift) {
-        ringMat.color.set('#fb7185');
-        accentMat?.color.set('#fb7185');
-      } else if (accentMat) {
+      r.statusRing.visible = !sim.finished && activeColors.length > 0;
+      if (activeColors.length > 0) {
+        r.statusRingMat.uniforms.uColorA.value.set(activeColors[0]);
+        r.statusRingMat.uniforms.uColorB.value.set(
+          activeColors[1] || activeColors[0]
+        );
+        r.statusRingMat.uniforms.uDual.value =
+          activeColors.length >= 2 ? 1.0 : 0.0;
+      }
+
+      if (r.accentMesh) {
+        const accentMat = r.accentMesh.material as THREE.MeshBasicMaterial;
         accentMat.color.set(
-          r.archetype === 'HERALD' ? '#34d399' : '#38bdf8'
+          activeColors[0] ||
+            (r.archetype === 'HERALD' ? '#34d399' : '#38bdf8')
         );
       }
 
-      // Drive compact radial base cooldown ring on each Spire
+      // Drive Spire base cooldown rings
       island.spireRigs.forEach((spireRig, idx) => {
         const tState = sim.towers[`spire_${idx}`];
         if (tState) {
@@ -4553,18 +6747,15 @@ export class Arena3DRenderer {
         }
       });
 
-      this.updateRunnerDOMBadge(playerId, sim);
+      this.syncRunnerAndOverviewBadges(playerId, island, sim);
     }
   }
 
-  /**
-   * Spawns 6 soft circular dust puffs around a placed/reclaimed pillar plinth.
-   */
   private spawnPlacementDustPuffs(
     worldX: number,
     worldZ: number,
     colorHex: string,
-    count = 6
+    count = 5
   ) {
     const geo = new THREE.BufferGeometry();
     const pos = new Float32Array(count * 3);
@@ -4572,14 +6763,14 @@ export class Arena3DRenderer {
 
     for (let i = 0; i < count; i++) {
       const ang = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
-      const startR = 0.65 + Math.random() * 0.16;
+      const startR = 0.68 + Math.random() * 0.14;
       pos[i * 3] = worldX + Math.cos(ang) * startR;
-      pos[i * 3 + 1] = 0.12 + Math.random() * 0.08;
+      pos[i * 3 + 1] = 0.12 + Math.random() * 0.06;
       pos[i * 3 + 2] = worldZ + Math.sin(ang) * startR;
 
-      const outSpeed = 1.15 + Math.random() * 0.55;
+      const outSpeed = 1.05 + Math.random() * 0.45;
       vels[i * 3] = Math.cos(ang) * outSpeed;
-      vels[i * 3 + 1] = 0.75 + Math.random() * 0.45;
+      vels[i * 3 + 1] = 0.65 + Math.random() * 0.35;
       vels[i * 3 + 2] = Math.sin(ang) * outSpeed;
     }
 
@@ -4587,9 +6778,9 @@ export class Arena3DRenderer {
     const mat = new THREE.PointsMaterial({
       color: colorHex,
       map: this.softCircleSpriteTex,
-      size: 0.44,
+      size: 0.42,
       transparent: true,
-      opacity: 0.72,
+      opacity: 0.68,
       alphaTest: 0.01,
       depthWrite: false,
     });
@@ -4600,10 +6791,10 @@ export class Arena3DRenderer {
     this.particleBursts.push({
       points,
       velocities: vels,
-      gravity: 1.6,
-      baseOpacity: 0.72,
+      gravity: 1.5,
+      baseOpacity: 0.68,
       age: 0,
-      maxAge: 0.42,
+      maxAge: 0.38,
     });
   }
 
@@ -4619,14 +6810,14 @@ export class Arena3DRenderer {
     const vels = new Float32Array(count * 3);
 
     for (let i = 0; i < count; i++) {
-      pos[i * 3] = worldX + (Math.random() - 0.5) * 0.35;
-      pos[i * 3 + 1] = worldY + Math.random() * 0.25;
-      pos[i * 3 + 2] = worldZ + (Math.random() - 0.5) * 0.35;
+      pos[i * 3] = worldX + (Math.random() - 0.5) * 0.3;
+      pos[i * 3 + 1] = worldY + Math.random() * 0.2;
+      pos[i * 3 + 2] = worldZ + (Math.random() - 0.5) * 0.3;
 
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 1.4 + Math.random() * 2.8;
+      const angle = (i / count) * Math.PI * 2 + Math.random() * 0.5;
+      const speed = 1.2 + Math.random() * 2.0;
       vels[i * 3] = Math.cos(angle) * speed;
-      vels[i * 3 + 1] = 1.8 + Math.random() * 2.4;
+      vels[i * 3 + 1] = 1.5 + Math.random() * 1.6;
       vels[i * 3 + 2] = Math.sin(angle) * speed;
     }
 
@@ -4634,9 +6825,9 @@ export class Arena3DRenderer {
     const mat = new THREE.PointsMaterial({
       color: colorHex,
       map: this.softCircleSpriteTex,
-      size: 0.32,
+      size: 0.3,
       transparent: true,
-      opacity: 0.9,
+      opacity: 0.88,
       alphaTest: 0.01,
       depthWrite: false,
     });
@@ -4647,28 +6838,25 @@ export class Arena3DRenderer {
     this.particleBursts.push({
       points,
       velocities: vels,
-      gravity: 6.8,
-      baseOpacity: 0.9,
+      gravity: 5.2,
+      baseOpacity: 0.88,
       age: 0,
-      maxAge: 0.55,
+      maxAge: 0.48,
     });
   }
 
-  /**
-   * Spawns a clean flat ground ripple ring (zero wireframe shockwave domes!).
-   */
   private spawnShockwaveEffect(
     worldX: number,
     worldZ: number,
     maxRadius: number,
     colorHex: string,
-    boltTargetX?: number,
-    boltTargetZ?: number
+    arcTargetX?: number,
+    arcTargetZ?: number
   ) {
     const ringMat = new THREE.MeshBasicMaterial({
       color: colorHex,
       transparent: true,
-      opacity: 0.78,
+      opacity: 0.8,
       side: THREE.DoubleSide,
       depthWrite: false,
     });
@@ -4677,39 +6865,98 @@ export class Arena3DRenderer {
     mesh.renderOrder = 9;
     this.scene.add(mesh);
 
-    let bolt: THREE.Line | undefined;
-    if (boltTargetX !== undefined && boltTargetZ !== undefined) {
-      const start = new THREE.Vector3(worldX, 2.15, worldZ);
-      const end = new THREE.Vector3(boltTargetX, 0.85, boltTargetZ);
-      const pts: THREE.Vector3[] = [start];
-      for (let s = 1; s <= 3; s++) {
-        const p = start.clone().lerp(end, s / 4);
-        p.x += (Math.random() - 0.5) * 0.32;
-        p.y += (Math.random() - 0.2) * 0.28;
-        p.z += (Math.random() - 0.5) * 0.32;
-        pts.push(p);
-      }
-      pts.push(end);
-
-      const boltGeo = new THREE.BufferGeometry().setFromPoints(pts);
-      const boltMat = new THREE.LineBasicMaterial({
-        color: colorHex,
+    let arcMesh: THREE.Mesh | undefined;
+    if (arcTargetX !== undefined && arcTargetZ !== undefined) {
+      const start = new THREE.Vector3(worldX, 2.18, worldZ);
+      const end = new THREE.Vector3(arcTargetX, 0.88, arcTargetZ);
+      const arcGeo = createTaperedArcRibbonGeometry(
+        start,
+        end,
+        0.22,
+        0.26,
+        6,
+        0.085,
+        0.025
+      );
+      const arcMat = new THREE.MeshBasicMaterial({
+        color: '#fef08a',
         transparent: true,
-        opacity: 0.85,
+        opacity: 0.92,
+        side: THREE.DoubleSide,
+        depthWrite: false,
       });
-      bolt = new THREE.Line(boltGeo, boltMat);
-      bolt.renderOrder = 9;
-      this.scene.add(bolt);
+      arcMesh = new THREE.Mesh(arcGeo, arcMat);
+      arcMesh.renderOrder = 10;
+      this.scene.add(arcMesh);
     }
 
     this.shockwaves.push({
       mesh,
-      bolt,
+      arcMesh,
       age: 0,
-      maxAge: 0.48,
+      maxAge: 0.46,
+      startRadius: 0.42,
       maxRadius,
+      isShaderMat: false,
     });
   }
+
+  private spawnFrostHexNovaEffect(
+    worldX: number,
+    worldZ: number,
+    maxRadius: number
+  ) {
+    const novaMat = createFrostHexNovaShader();
+    const mesh = new THREE.Mesh(this.sharedGeos.unitCirclePlane, novaMat);
+    mesh.position.set(worldX, 0.048, worldZ);
+    mesh.renderOrder = 9;
+    this.scene.add(mesh);
+
+    this.shockwaves.push({
+      mesh,
+      age: 0,
+      maxAge: 0.52,
+      startRadius: 0.5,
+      maxRadius,
+      isShaderMat: true,
+    });
+  }
+
+  private spawnChronoRelayArc(
+    sx: number,
+    sy: number,
+    sz: number,
+    tx: number,
+    ty: number,
+    tz: number
+  ) {
+    const start = new THREE.Vector3(sx, sy, sz);
+    const end = new THREE.Vector3(tx, ty, tz);
+    const geo = createTaperedArcRibbonGeometry(
+      start,
+      end,
+      1.35,
+      0.0,
+      12,
+      0.07,
+      0.035
+    );
+    const mat = new THREE.MeshBasicMaterial({
+      color: '#e9d5ff',
+      transparent: true,
+      opacity: 0.88,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = 10;
+    this.scene.add(mesh);
+    this.relayArcs.push({ mesh, age: 0, maxAge: 0.38 });
+  }
+
+  // ==========================================================================
+  // ZERO-THRASH PERSISTENT DOM BADGES (`#world-labels`)
+  // ==========================================================================
 
   private createIslandDOMElements(player: PlayerState) {
     const header = document.createElement('div');
@@ -4717,33 +6964,7 @@ export class Arena3DRenderer {
     header.style.setProperty('--player-color', player.color);
     header.style.pointerEvents = 'auto';
     header.style.cursor = 'pointer';
-    header.addEventListener('pointerdown', (e) => {
-      e.stopPropagation();
-    });
-    header.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (this.dismissTransientUI?.()) return;
-      this.doClearTouchPreview();
-      this.focusOnPlayerIsland(player.id);
-      this.onFocusChange?.();
-    });
-    this.labelLayer.appendChild(header);
-    this.labelElements.set(player.id, header);
-
-    const runnerBadge = document.createElement('div');
-    runnerBadge.className = 'runner-3d-badge';
-    runnerBadge.style.setProperty('--player-color', player.color);
-    this.labelLayer.appendChild(runnerBadge);
-    this.runnerLabels.set(player.id, runnerBadge);
-  }
-
-  /**
-   * Clean emoji-free `.island-3d-badge` DOM badge.
-   */
-  private updateIslandHeaderBadge(player: PlayerState) {
-    const el = this.labelElements.get(player.id);
-    if (!el) return;
-    el.innerHTML = '';
+    header.style.display = 'none';
 
     const dot = document.createElement('span');
     dot.className = 'badge-dot';
@@ -4754,29 +6975,113 @@ export class Arena3DRenderer {
 
     const meta = document.createElement('span');
     meta.className = 'badge-meta';
-    meta.textContent = `${player.pathDistance.toFixed(0)}m`;
 
-    el.append(dot, nameStrong, meta);
+    header.append(dot, nameStrong, meta);
+
+    header.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+    });
+    header.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (this.dismissTransientUI?.()) return;
+      this.cancelTouchGhost();
+      this.focusOnPlayerIsland(player.id);
+      this.onFocusChange?.();
+    });
+    this.labelLayer.appendChild(header);
+    this.islandBadges.set(player.id, {
+      root: header,
+      dot,
+      name: nameStrong,
+      meta,
+      lastColor: player.color,
+      lastName: player.name,
+      lastMeta: '',
+      visible: false,
+    });
+
+    const runnerRoot = document.createElement('div');
+    runnerRoot.className = 'runner-3d-badge';
+    runnerRoot.style.setProperty('--player-color', player.color);
+    runnerRoot.style.display = 'none';
+
+    const rDot = document.createElement('span');
+    rDot.className = 'badge-dot';
+
+    const rTag = document.createElement('span');
+    rTag.style.marginRight = '4px';
+    rTag.style.opacity = '0.92';
+
+    const rTime = document.createElement('span');
+    runnerRoot.append(rDot, rTag, rTime);
+
+    this.labelLayer.appendChild(runnerRoot);
+    this.runnerBadges.set(player.id, {
+      root: runnerRoot,
+      dot: rDot,
+      tag: rTag,
+      time: rTime,
+      lastDotColor: '',
+      lastTag: '',
+      lastTime: '',
+      visible: false,
+    });
+  }
+
+  private updateIslandHeaderBadge(player: PlayerState, island: IslandVisuals) {
+    const refs = this.islandBadges.get(player.id);
+    if (!refs) return;
+
+    if (refs.lastColor !== player.color) {
+      refs.lastColor = player.color;
+      refs.root.style.setProperty('--player-color', player.color);
+      refs.dot.style.background = player.color;
+    }
+
+    const displayName = player.isBot ? `${player.name} · BOT` : player.name;
+    if (refs.lastName !== displayName) {
+      refs.lastName = displayName;
+      refs.name.textContent = displayName;
+    }
+
+    let metaText: string;
+    if (this.currentRoomState?.phase === 'RUN' && island.lastSimTimeText) {
+      metaText = island.lastSimStatus
+        ? `${island.lastSimTimeText} · ${island.lastSimStatus}`
+        : island.lastSimTimeText;
+    } else if (player.fogMasked) {
+      metaText = player.ready ? 'Hidden · Ready' : 'Hidden';
+    } else {
+      const distStr = `${player.pathDistance.toFixed(0)}m`;
+      metaText =
+        this.currentRoomState?.phase === 'BUILD' && player.ready
+          ? `${distStr} · Ready`
+          : distStr;
+    }
+
+    if (refs.lastMeta !== metaText) {
+      refs.lastMeta = metaText;
+      refs.meta.textContent = metaText;
+    }
   }
 
   /**
-   * Clean emoji-free `.runner-3d-badge` DOM badge (`6.4s`, `Slow`, `Frost`, `Haste`)
-   * driven by real `sim.elapsedSeconds` so Slow/Frost/Haste modifiers reflect accurately!
+   * Dirty-checked Runner status tag (`0` innerHTML wipes, `0` floating `x4` confusion!).
+   * In `arenaOverviewMode`, folds live runner status into `.island-3d-badge` so 12 pills never collide!
    */
-  private updateRunnerDOMBadge(playerId: string, sim: RunnerSimState) {
-    const el = this.runnerLabels.get(playerId);
-    if (!el || !this.currentRoomState) return;
-    if (this.currentRoomState.phase !== 'RUN') {
-      el.style.display = 'none';
-      return;
-    }
-    el.style.display = 'flex';
-
+  private syncRunnerAndOverviewBadges(
+    playerId: string,
+    island: IslandVisuals,
+    sim: RunnerSimState
+  ) {
     let statusText = '';
     let dotColor = '';
     if (sim.finished) {
       statusText = 'Done';
       dotColor = '#34d399';
+    } else if (sim.clapSlowRemaining > 0 && sim.inPermafrostAura) {
+      statusText = 'Slow + Frost';
+      dotColor = '#38bdf8';
     } else if (sim.clapSlowRemaining > 0) {
       statusText = 'Slow';
       dotColor = '#f59e0b';
@@ -4788,55 +7093,132 @@ export class Arena3DRenderer {
       dotColor = '#34d399';
     }
 
-    const stackSuffix = sim.exposureStacks > 1 ? ` x${sim.exposureStacks}` : '';
     const liveSec = sim.elapsedSeconds ?? sim.distanceTraveled / sim.baseSpeed;
     const timeVal = sim.finished
       ? `${sim.finishTimeSeconds.toFixed(2)}s`
-      : `${liveSec.toFixed(1)}s${stackSuffix}`;
+      : `${liveSec.toFixed(1)}s`;
 
-    el.innerHTML = '';
-    if (statusText) {
-      const dot = document.createElement('span');
-      dot.className = 'badge-dot';
-      dot.style.background = dotColor;
-      const tag = document.createElement('span');
-      tag.textContent = statusText;
-      tag.style.marginRight = '4px';
-      tag.style.opacity = '0.9';
-      el.append(dot, tag);
+    island.lastSimStatus = statusText;
+    island.lastSimTimeText = timeVal;
+
+    const player = this.currentRoomState?.players.find(
+      (p) => p.id === playerId
+    );
+    if (player && this.arenaOverviewMode) {
+      this.updateIslandHeaderBadge(player, island);
     }
-    const timeSpan = document.createElement('span');
-    timeSpan.textContent = timeVal;
-    el.appendChild(timeSpan);
+
+    const refs = this.runnerBadges.get(playerId);
+    if (!refs) return;
+
+    if (refs.lastTag !== statusText) {
+      refs.lastTag = statusText;
+      refs.tag.textContent = statusText;
+      refs.dot.style.display = statusText ? 'inline-block' : 'none';
+      refs.tag.style.display = statusText ? 'inline' : 'none';
+    }
+    if (dotColor && refs.lastDotColor !== dotColor) {
+      refs.lastDotColor = dotColor;
+      refs.dot.style.background = dotColor;
+    }
+    if (refs.lastTime !== timeVal) {
+      refs.lastTime = timeVal;
+      refs.time.textContent = timeVal;
+    }
   }
 
-  public renderFrame(dt: number) {
+  private setBadgeScreenTransform(
+    worldX: number,
+    worldY: number,
+    worldZ: number,
+    el: HTMLElement,
+    wasVisible: boolean
+  ): boolean {
+    this._tmpProj.set(worldX, worldY, worldZ).project(this.camera);
+    if (this._tmpProj.z > 1) {
+      if (wasVisible) el.style.display = 'none';
+      return false;
+    }
+    const x = this.viewportLeft + (this._tmpProj.x * 0.5 + 0.5) * this.viewportW;
+    const y = this.viewportTop + (-this._tmpProj.y * 0.5 + 0.5) * this.viewportH;
+    if (!wasVisible) el.style.display = 'flex';
+    el.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) translate(-50%, -50%)`;
+    return true;
+  }
+
+  // ==========================================================================
+  // 60FPS RENDER LOOP (ISLAND CULLING, ROLLING DPR GOVERNOR & EDGE AUTO-PAN)
+  // ==========================================================================
+
+  public renderFrame(dt: number): void {
+    const safeDt = Math.min(0.1, Math.max(0.0001, dt));
     const now = performance.now();
     const uTimeVal = now * 0.001;
     const isBuildPhase = this.currentRoomState?.phase === 'BUILD';
     const isRunPhase = this.currentRoomState?.phase === 'RUN';
 
-    this.voidSeaMat.uniforms.uTime.value = uTimeVal;
-
-    // Keyboard camera panning: WASD + Arrow keys (oriented cleanly with camAzimuth)
-    const moveForward =
-      (this.keysDown.has('arrowup') || this.keysDown.has('w') ? 1 : 0) -
-      (this.keysDown.has('arrowdown') || this.keysDown.has('s') ? 1 : 0);
-    const moveRight =
-      (this.keysDown.has('arrowright') || this.keysDown.has('d') ? 1 : 0) -
-      (this.keysDown.has('arrowleft') || this.keysDown.has('a') ? 1 : 0);
-    if (moveForward !== 0 || moveRight !== 0) {
-      const panSpeed = 24 * dt;
-      const sinAz = Math.sin(this.camAzimuth);
-      const cosAz = Math.cos(this.camAzimuth);
-      this.camGoalTarget.x +=
-        (-sinAz * moveForward + cosAz * moveRight) * panSpeed;
-      this.camGoalTarget.z +=
-        (-cosAz * moveForward - sinAz * moveRight) * panSpeed;
-      this.clampCameraTarget();
+    // Rolling 90-frame FPS governor: step DPR down gracefully if sustained frame > 21ms
+    this.fpsAccumDt += safeDt;
+    this.fpsFrameCount++;
+    if (this.fpsFrameCount >= 90) {
+      const avgMs = (this.fpsAccumDt / this.fpsFrameCount) * 1000;
+      if (avgMs > 21.5 && this.dprScaleCap > 0.72) {
+        this.dprScaleCap = Math.max(0.7, this.dprScaleCap - 0.15);
+        this.renderer.setPixelRatio(this.computeAdaptivePixelRatio());
+      }
+      this.fpsAccumDt = 0;
+      this.fpsFrameCount = 0;
     }
 
-    const lerpFactor = Math.min(1, dt * 9.5);
+    this.voidSeaMat.uniforms.uTime.value = uTimeVal;
+    this.reticlePadMat.uniforms.uTime.value = uTimeVal;
+    this.previewPathMat.uniforms.uTime.value = uTimeVal;
+    this.previewConduitMat.uniforms.uTime.value = uTimeVal;
+
+    // Keyboard camera panning (disabled cleanly when `modalOpen === true`)
+    if (!this._modalOpen && this.keysDown.size > 0) {
+      const moveForward =
+        (this.keysDown.has('arrowup') || this.keysDown.has('w') ? 1 : 0) -
+        (this.keysDown.has('arrowdown') || this.keysDown.has('s') ? 1 : 0);
+      const moveRight =
+        (this.keysDown.has('arrowright') || this.keysDown.has('d') ? 1 : 0) -
+        (this.keysDown.has('arrowleft') || this.keysDown.has('a') ? 1 : 0);
+      if (moveForward !== 0 || moveRight !== 0) {
+        const panSpeed = 24 * safeDt;
+        const sinAz = Math.sin(this.camAzimuth);
+        const cosAz = Math.cos(this.camAzimuth);
+        this.camGoalTarget.x +=
+          (-sinAz * moveForward + cosAz * moveRight) * panSpeed;
+        this.camGoalTarget.z +=
+          (-cosAz * moveForward - sinAz * moveRight) * panSpeed;
+        this.clampCameraTarget();
+      }
+    }
+
+    // Viewport-Edge Auto-Pan during Mobile Loupe Ghost Drag!
+    if (this.isLoupeDragging && this.activeTouches.size === 1) {
+      const touch = Array.from(this.activeTouches.values())[0];
+      const edgeZone = 44;
+      let edgeVx = 0;
+      let edgeVz = 0;
+      if (touch.x < edgeZone) edgeVx = -1;
+      else if (touch.x > this.viewportW - edgeZone) edgeVx = 1;
+
+      const topEdge = this.hudSafeTopPx + 36;
+      const botEdge = this.viewportH - this.hudSafeBottomPx - 42;
+      if (touch.y < topEdge) edgeVz = -1;
+      else if (touch.y > botEdge) edgeVz = 1;
+
+      if ((edgeVx !== 0 || edgeVz !== 0) && this.camRadius < 74) {
+        const speed = 10.5 * safeDt;
+        this.camGoalTarget.x += edgeVx * speed;
+        this.camGoalTarget.z += edgeVz * speed;
+        this.clampCameraTarget();
+        this.updateLoupeDragAtScreen(touch.x, touch.y, false);
+      }
+    }
+
+    const lerpFactor = Math.min(1, safeDt * 9.5);
     this.camTarget.lerp(this.camGoalTarget, lerpFactor);
     this.camRadius += (this.camGoalRadius - this.camRadius) * lerpFactor;
     this.camPolar += (this.camGoalPolar - this.camPolar) * lerpFactor;
@@ -4847,7 +7229,7 @@ export class Arena3DRenderer {
     if (this.cameraShake > 0.001) {
       shakeX = (Math.random() - 0.5) * this.cameraShake;
       shakeY = (Math.random() - 0.5) * this.cameraShake;
-      this.cameraShake = Math.max(0, this.cameraShake - dt * 0.9);
+      this.cameraShake = Math.max(0, this.cameraShake - safeDt * 0.9);
     }
 
     const camX =
@@ -4861,64 +7243,102 @@ export class Arena3DRenderer {
 
     this.camera.position.set(camX, camY, camZ);
     this.camera.lookAt(this.camTarget);
+    this.camera.updateMatrixWorld();
 
-    // Dynamically keep Sun shadow frustum tight & sharp around camTarget
     this.updateSunShadowFrustum();
 
-    // Keep touch preview tooltip anchored smoothly above 3D ghost during pan/zoom & track offscreen/gesture state
+    // Keep mobile touch micro-tag anchored smoothly above/below 3D ghost during pan/zoom
     if (this.activeTouchHoverInfo && isBuildPhase) {
       const proj = this.projectWorldToScreen(this.touchWorldAnchor);
       const isGestureMoving =
-        this.activeTouches.size > 0 && this.touchGestureMoved;
+        this.activeTouches.size > 0 &&
+        this.touchGestureMoved &&
+        !this.isLoupeDragging;
       const offscreen = this.isTouchProjectionOffscreen(proj);
+      const cellY = this.activeTouchHoverInfo.cell?.y ?? 10;
+      const placeNearTopEdge =
+        proj.y < this.hudSafeTopPx + 108 || cellY <= 3;
+
       if (
         Math.hypot(
           proj.x - this.activeTouchHoverInfo.screenX,
           proj.y - this.activeTouchHoverInfo.screenY
-        ) > 1.5 ||
+        ) > 1.2 ||
         this.activeTouchHoverInfo.isGestureMoving !== isGestureMoving ||
-        this.activeTouchHoverInfo.offscreen !== offscreen
+        this.activeTouchHoverInfo.isLoupeDragging !== this.isLoupeDragging ||
+        this.activeTouchHoverInfo.offscreen !== offscreen ||
+        this.activeTouchHoverInfo.placeNearTopEdge !== placeNearTopEdge
       ) {
         this.activeTouchHoverInfo.screenX = proj.x;
         this.activeTouchHoverInfo.screenY = proj.y;
         this.activeTouchHoverInfo.isGestureMoving = isGestureMoving;
+        this.activeTouchHoverInfo.isLoupeDragging = this.isLoupeDragging;
         this.activeTouchHoverInfo.offscreen = offscreen;
+        this.activeTouchHoverInfo.placeNearTopEdge = placeNearTopEdge;
         this.onHoverStatusChange?.(this.activeTouchHoverInfo);
       }
     }
 
-    if (this.previewPathMat) {
-      this.previewPathMat.uniforms.uTime.value = uTimeVal;
-    }
-
-    const goalBuildAlpha = isBuildPhase ? 1.0 : 0.0;
+    const gw = this.currentRoomState?.roundConfig.gridWidth || 20;
+    const gh = this.currentRoomState?.roundConfig.gridHeight || 26;
+    const focusedPid = this.focusedPlayerId || this.localPlayerId;
 
     for (const island of this.islands.values()) {
+      // Off-screen rival island culling when focused (`!arenaOverviewMode`): cuts traversal & draw calls by ~80%!
+      const islCenterX = island.offsetX + gw * 0.5;
+      const islCenterZ = island.offsetZ + gh * 0.5;
+      const distToCamTarget = Math.hypot(
+        islCenterX - this.camTarget.x,
+        islCenterZ - this.camTarget.z
+      );
+      const shouldBeVisible =
+        this.arenaOverviewMode ||
+        island.playerId === focusedPid ||
+        distToCamTarget < 34;
+
+      island.root.visible = shouldBeVisible;
+
+      const iBadge = this.islandBadges.get(island.playerId);
+      const rBadge = this.runnerBadges.get(island.playerId);
+
+      if (!shouldBeVisible) {
+        if (iBadge && iBadge.visible) {
+          iBadge.root.style.display = 'none';
+          iBadge.visible = false;
+        }
+        if (rBadge && rBadge.visible) {
+          rBadge.root.style.display = 'none';
+          rBadge.visible = false;
+        }
+        continue;
+      }
+
       island.floorUniforms.uTime.value = uTimeVal;
+      const isFogged = island.fogVeilMesh.visible;
+      const goalBuildAlpha = isBuildPhase && !isFogged ? 1.0 : 0.0;
       const currBuildAlpha = island.floorUniforms.uBuildAlpha.value;
       island.floorUniforms.uBuildAlpha.value =
         currBuildAlpha +
-        (goalBuildAlpha - currBuildAlpha) * Math.min(1, dt * 6.5);
+        (goalBuildAlpha - currBuildAlpha) * Math.min(1, safeDt * 6.5);
 
       island.foamMat.uniforms.uTime.value = uTimeVal;
+      island.conduitMat.uniforms.uTime.value = uTimeVal;
 
-      // Stepping-stone path opacity: 0.58 in BUILD (dimmed to 0.12 when previewPathMesh is active!), 0.22 in RUN
-      if (island.pathMat) {
+      if (island.pathMesh && !isFogged) {
         island.pathMat.uniforms.uTime.value = uTimeVal;
         const targetPathOpacity = isBuildPhase
           ? island.playerId === this.localPlayerId &&
             this.previewPathMesh !== null
-            ? 0.12
-            : 0.58
-          : 0.22;
+            ? 0.14
+            : 0.66
+          : 0.24;
         const currOp = island.pathMat.uniforms.uOpacity.value;
         island.pathMat.uniforms.uOpacity.value =
-          currOp + (targetPathOpacity - currOp) * Math.min(1, dt * 10.0);
+          currOp + (targetPathOpacity - currOp) * Math.min(1, safeDt * 10.0);
       }
 
-      island.clapMarkerGroup.visible = isBuildPhase;
+      island.clapMarkerGroup.visible = Boolean(isBuildPhase && !isFogged);
 
-      // Toy-Box Spring Pop Animation (0.26s elastic squash-and-stretch) on newly placed Castle Pillars & Curtain Bridges
       for (const entry of island.towerMeshes.values()) {
         const ageSec = (now - entry.born) / 1000;
         if (ageSec < 0.26) {
@@ -4939,104 +7359,146 @@ export class Arena3DRenderer {
         }
       }
 
-      // Elemental Spires: crisp hairline alpha & compact base cooldown ring
       for (const spireRig of island.spireRigs) {
         const targetRingAlpha = isBuildPhase
-          ? 0.24 + spireRig.targetHoverBoost * 0.34 // 0.24 -> 0.58 near hover/ghost
-          : 0.13;
+          ? 0.28 + spireRig.targetHoverBoost * 0.36
+          : 0.16;
         const currRingAlpha = spireRig.aoeMat.uniforms.uRingAlpha.value;
         spireRig.aoeMat.uniforms.uRingAlpha.value =
-          currRingAlpha + (targetRingAlpha - currRingAlpha) * Math.min(1, dt * 10.0);
+          currRingAlpha +
+          (targetRingAlpha - currRingAlpha) * Math.min(1, safeDt * 10.0);
 
-        spireRig.cooldownRingMesh.visible = isRunPhase;
+        spireRig.cooldownRingMesh.visible = Boolean(isRunPhase);
 
         if (spireRig.recoil > 0) {
-          spireRig.recoil = Math.max(0, spireRig.recoil - dt * 3.0);
+          spireRig.recoil = Math.max(0, spireRig.recoil - safeDt * 3.0);
         }
+        if (spireRig.cdrFlash > 0) {
+          spireRig.cdrFlash = Math.max(0, spireRig.cdrFlash - safeDt * 2.4);
+          spireRig.cooldownRingMat.uniforms.uCdrFlash.value = spireRig.cdrFlash;
+        }
+
         if (spireRig.spireType === 'CHRONO_SPIRE') {
           spireRig.upperCore.position.y =
             spireRig.baseCoreY +
-            Math.sin(uTimeVal * 2.4) * 0.045 -
+            Math.sin(uTimeVal * 2.3) * 0.05 -
             spireRig.recoil * 0.16;
+          spireRig.upperCore.rotation.y = uTimeVal * 0.45;
         } else {
           spireRig.upperCore.position.y =
             spireRig.baseCoreY - spireRig.recoil * 0.12;
         }
       }
 
-      // Subtle idle breathing for Runner at North Gate during BUILD
       if (isBuildPhase) {
         island.runner.pelvis.position.y =
-          0.45 + Math.sin(uTimeVal * 2.8) * 0.04;
+          0.45 + Math.sin(uTimeVal * 2.6) * 0.035;
         island.runner.statusRing.visible = false;
       }
 
-      // Hide island 3D badge on focused island during BUILD to prevent HUD clutter
-      const headerEl = this.labelElements.get(island.playerId);
-      if (headerEl) {
-        const isFocusedBuild =
-          !this.arenaOverviewMode &&
-          isBuildPhase &&
-          island.playerId === (this.focusedPlayerId || this.localPlayerId);
-        if (isFocusedBuild) {
-          headerEl.style.display = 'none';
+      // Island Header Badge: hidden on focused island in BUILD/RUN to keep field clean; shown in Overview!
+      if (iBadge) {
+        const showIslandHeader =
+          this.arenaOverviewMode || island.playerId !== focusedPid;
+        if (!showIslandHeader) {
+          if (iBadge.visible) {
+            iBadge.root.style.display = 'none';
+            iBadge.visible = false;
+          }
         } else {
-          const gw = this.currentRoomState?.roundConfig.gridWidth || 20;
-          const worldPos = new THREE.Vector3(
-            island.offsetX + gw / 2,
-            2.1,
-            island.offsetZ - 1.2
+          iBadge.visible = this.setBadgeScreenTransform(
+            islCenterX,
+            2.15,
+            island.offsetZ - 1.35,
+            iBadge.root,
+            iBadge.visible
           );
-          this.projectToDOM(worldPos, headerEl);
         }
       }
 
-      const runnerEl = this.runnerLabels.get(island.playerId);
-      if (runnerEl && isRunPhase) {
-        const rPos = new THREE.Vector3(
-          island.offsetX + island.runner.root.position.x,
-          1.82,
-          island.offsetZ + island.runner.root.position.z
-        );
-        this.projectToDOM(rPos, runnerEl);
-      } else if (runnerEl) {
-        runnerEl.style.display = 'none';
+      // Runner Badge: shown ONLY on the focused island during RUN (Overview folds status into `.island-3d-badge`!)
+      if (rBadge) {
+        const showRunnerBadge =
+          Boolean(isRunPhase) &&
+          !this.arenaOverviewMode &&
+          island.playerId === focusedPid &&
+          Boolean(island.lastSimStatus || island.runner.statusRing.visible === false);
+        const shouldShowCompact =
+          showRunnerBadge &&
+          (island.lastSimStatus !== '' ||
+            this.latestSimStates.get(island.playerId)?.finished === true);
+
+        if (!shouldShowCompact) {
+          if (rBadge.visible) {
+            rBadge.root.style.display = 'none';
+            rBadge.visible = false;
+          }
+        } else {
+          rBadge.visible = this.setBadgeScreenTransform(
+            island.offsetX + island.runner.root.position.x,
+            1.92,
+            island.offsetZ + island.runner.root.position.z,
+            rBadge.root,
+            rBadge.visible
+          );
+        }
       }
     }
 
-    // Update Clean Ground Shockwaves
+    // Update Ground Shockwaves, Frost Hex-Novas & Electric Arc Ribbons
     for (let i = this.shockwaves.length - 1; i >= 0; i--) {
       const sw = this.shockwaves[i];
-      sw.age += dt;
+      sw.age += safeDt;
       if (sw.age >= sw.maxAge) {
         this.scene.remove(sw.mesh);
         (sw.mesh.material as THREE.Material).dispose();
-        if (sw.bolt) {
-          this.scene.remove(sw.bolt);
-          sw.bolt.geometry.dispose();
-          (sw.bolt.material as THREE.Material).dispose();
+        if (sw.arcMesh) {
+          this.scene.remove(sw.arcMesh);
+          sw.arcMesh.geometry.dispose();
+          (sw.arcMesh.material as THREE.Material).dispose();
         }
         this.shockwaves.splice(i, 1);
       } else {
         const t = sw.age / sw.maxAge;
         const ease = 1 - Math.pow(1 - t, 3);
-        const rad = 0.45 + ease * (sw.maxRadius - 0.45);
+        const rad = sw.startRadius + ease * (sw.maxRadius - sw.startRadius);
         sw.mesh.scale.set(rad, 1, rad);
-        (sw.mesh.material as THREE.MeshBasicMaterial).opacity =
-          (1 - t) * 0.76;
-        if (sw.bolt) {
-          (sw.bolt.material as THREE.LineBasicMaterial).opacity = Math.max(
+        if (sw.isShaderMat) {
+          (sw.mesh.material as THREE.ShaderMaterial).uniforms.uOpacity.value =
+            (1 - t) * 0.86;
+        } else {
+          (sw.mesh.material as THREE.MeshBasicMaterial).opacity =
+            (1 - t) * 0.78;
+        }
+        if (sw.arcMesh) {
+          (sw.arcMesh.material as THREE.MeshBasicMaterial).opacity = Math.max(
             0,
-            1 - t * 2.4
+            1 - t * 2.2
           );
         }
       }
     }
 
-    // Update Soft Circular Sprite Particle Bursts
+    // Update Chrono Spire Sibling CDR Relay Arcs
+    for (let i = this.relayArcs.length - 1; i >= 0; i--) {
+      const ra = this.relayArcs[i];
+      ra.age += safeDt;
+      if (ra.age >= ra.maxAge) {
+        this.scene.remove(ra.mesh);
+        ra.mesh.geometry.dispose();
+        (ra.mesh.material as THREE.Material).dispose();
+        this.relayArcs.splice(i, 1);
+      } else {
+        const t = ra.age / ra.maxAge;
+        (ra.mesh.material as THREE.MeshBasicMaterial).opacity =
+          Math.sin(t * Math.PI) * 0.88;
+      }
+    }
+
+    // Update Calm Circular Sprite Particle Bursts
     for (let i = this.particleBursts.length - 1; i >= 0; i--) {
       const pb = this.particleBursts[i];
-      pb.age += dt;
+      pb.age += safeDt;
       if (pb.age >= pb.maxAge) {
         this.scene.remove(pb.points);
         pb.points.geometry.dispose();
@@ -5048,10 +7510,10 @@ export class Arena3DRenderer {
         ) as THREE.BufferAttribute;
         const arr = posAttr.array as Float32Array;
         for (let j = 0; j < arr.length; j += 3) {
-          arr[j] += pb.velocities[j] * dt;
-          arr[j + 1] += pb.velocities[j + 1] * dt;
-          arr[j + 2] += pb.velocities[j + 2] * dt;
-          pb.velocities[j + 1] -= pb.gravity * dt;
+          arr[j] += pb.velocities[j] * safeDt;
+          arr[j + 1] += pb.velocities[j + 1] * safeDt;
+          arr[j + 2] += pb.velocities[j + 2] * safeDt;
+          pb.velocities[j + 1] -= pb.gravity * safeDt;
         }
         posAttr.needsUpdate = true;
         (pb.points.material as THREE.PointsMaterial).opacity =
@@ -5059,22 +7521,6 @@ export class Arena3DRenderer {
       }
     }
 
-    // Hardware MSAA direct render!
     this.renderer.render(this.scene, this.camera);
-  }
-
-  private projectToDOM(worldVec: THREE.Vector3, el: HTMLElement) {
-    const projected = worldVec.clone().project(this.camera);
-    if (projected.z > 1) {
-      el.style.display = 'none';
-      return;
-    }
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const w = rect.width || window.innerWidth;
-    const h = rect.height || window.innerHeight;
-    const x = rect.left + (projected.x * 0.5 + 0.5) * w;
-    const y = rect.top + (-projected.y * 0.5 + 0.5) * h;
-    el.style.display = 'flex';
-    el.style.transform = `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%)`;
   }
 }

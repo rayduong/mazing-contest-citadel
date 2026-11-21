@@ -1,6 +1,8 @@
 export type SpireType = 'THUNDERCLAP' | 'FROST_OBELISK' | 'CHRONO_SPIRE';
 export type TowerType = 'BLOCK' | SpireType;
+export type ActiveBuildTool = 'BLOCK' | 'SELL' | 'PAN';
 export type RunnerArchetype = 'SCOUT' | 'OUTRIDER' | 'JUGGERNAUT' | 'HERALD';
+export type GamePhase = 'LOBBY' | 'BUILD' | 'RUN' | 'ROUND_RESULTS' | 'GAME_OVER';
 
 export interface GridPoint {
   x: number;
@@ -31,7 +33,7 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
     slowDurationMult: 1.0,
     slowResist: 0.0,
     hasMomentum: false,
-    traitSummary: 'Balanced speed (3.5m/s) · Standard Spire slow vulnerability',
+    traitSummary: '3.5 m/s · Standard slow duration',
   },
   OUTRIDER: {
     type: 'OUTRIDER',
@@ -41,7 +43,7 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
     slowDurationMult: 1.25,
     slowResist: 0.0,
     hasMomentum: false,
-    traitSummary: 'Fast sprinting (3.85m/s), but suffers +25% longer Spire slow durations',
+    traitSummary: '3.85 m/s · Slows last 25% longer',
   },
   JUGGERNAUT: {
     type: 'JUGGERNAUT',
@@ -51,7 +53,7 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
     slowDurationMult: 1.0,
     slowResist: 0.2,
     hasMomentum: false,
-    traitSummary: 'Heavy armor (20% slow resist) — Overcharged Spires (linked to Crimson Keeps) pierce its armor',
+    traitSummary: '3.25 m/s · Resists 20% of slows unless Spire is Overcharged',
   },
   HERALD: {
     type: 'HERALD',
@@ -61,7 +63,7 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
     slowDurationMult: 1.05,
     slowResist: 0.0,
     hasMomentum: true,
-    traitSummary: 'Gains +28% Tailwind Haste after 3.2s outside Spire range — space your Spire passes evenly',
+    traitSummary: '3.55 m/s · Gains +28% speed after 3.2s un-slowed outside Spires',
   },
 };
 
@@ -85,7 +87,7 @@ export interface TowerSpec {
 export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
   BLOCK: {
     type: 'BLOCK',
-    name: 'Stone Pillar',
+    name: 'Stone Wall',
     hotkey: 'Q',
     goldCost: 5,
     footprint: 2,
@@ -95,7 +97,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowPercent: 0,
     slowDuration: 0,
     description:
-      '2x2 Stone Pillar. Connects in all directions and links Crimson Keeps to Overcharge nearby Spires.',
+      '2×2 stone wall. Connects to nearby walls and links Crimson Keeps to Overcharge Spires.',
     accentColor: '#38bdf8',
   },
   THUNDERCLAP: {
@@ -110,7 +112,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowPercent: 0.5,
     slowDuration: 2.4,
     description:
-      'Unleashes an electric Thunderclap every 3.0s, slowing movement by 50% for 2.4s. Best for multi-pass switchbacks.',
+      'Pulses every 3.0s, slowing runners by 50% for 2.4s. Strongest on multi-pass switchbacks.',
     accentColor: '#f59e0b',
   },
   FROST_OBELISK: {
@@ -126,7 +128,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowDuration: 2.2,
     auraSlowPercent: 0.22,
     description:
-      'Radiates a continuous -22% Permafrost Aura inside its ring and pulses a 45% Glacial Nova every 3.4s. Best for tight 360° spirals!',
+      'Chills runners by 22% inside its ring and bursts for a 45% slow every 3.4s. Rewards tight spirals.',
     accentColor: '#38bdf8',
   },
   CHRONO_SPIRE: {
@@ -142,7 +144,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowDuration: 2.0,
     cdrPulseSeconds: 1.2,
     description:
-      'Fires a 55% Temporal Warp every 3.8s and reduces all other Spires’ cooldowns by 1.2s! Best for Spire combo chains.',
+      'Slows runners by 55% every 3.8s and cuts 1.2s off every other Spire cooldown.',
     accentColor: '#c084fc',
   },
 };
@@ -165,6 +167,7 @@ export interface RoundConfig {
   title: string;
   subtitle: string;
   hint: string;
+  seed?: number;
   runnerType?: RunnerArchetype;
   gridWidth: number;
   gridHeight: number;
@@ -178,8 +181,8 @@ export interface RoundConfig {
   frostMireCount: number;
   hasteRiftCount: number;
   hasWaygate?: boolean;
-  obstacles: GridPoint[];       // 2x2 pre-placed Red Keep Pillars
-  preplacedSpires: SpirePoint[]; // 2x2 pre-placed Map Spires (Storm, Frost, Chrono)
+  obstacles: GridPoint[];       // 2x2 pre-placed Crimson Keeps
+  preplacedSpires: SpirePoint[]; // 2x2 pre-placed Elemental Spires (Storm, Frost, Chrono)
   frostMires: GridPoint[];
   hasteRifts: GridPoint[];
   waygate?: WaygatePair;
@@ -210,6 +213,8 @@ export interface SimEvent {
   towerId?: string;
   spireType?: SpireType;
   overchargeTier?: number;
+  cdrAppliedSeconds?: number;
+  armoredResisted?: boolean;
   checkpointIndex?: number;
   timeSeconds: number;
 }
@@ -222,7 +227,7 @@ export interface TowerSimState {
   overchargeTier: number;
   effectiveRange: number;
   effectiveCooldown: number;
-   cooldownRemaining: number;
+  cooldownRemaining: number;
   triggeredCount: number;
 }
 
@@ -237,6 +242,9 @@ export interface RunnerSimState {
   currentSpeed: number;
   clapSlowRemaining: number;
   activeSlowPercent: number;
+  strongSlowRemaining?: number;
+  strongSlowPercent?: number;
+  armoredHitRemaining?: number;
   exposureStacks: number;
   timeSinceLastSpireSec: number;
   inPermafrostAura: boolean;
@@ -288,6 +296,9 @@ export interface PlayerState {
   gold: number;
   towers: PlacedTower[];
   pathDistance: number;
+  fogMasked?: boolean;
+  usedSampleMaze?: boolean;
+  connected?: boolean;
   totalScore: number;
   lastRoundTime: number | null;
   lastRoundPoints: number;
@@ -299,14 +310,12 @@ export interface PlayerState {
   roundHistory: RoundScoreEntry[];
 }
 
-export type GamePhase = 'LOBBY' | 'BUILD' | 'RUN' | 'ROUND_RESULTS' | 'GAME_OVER';
-
 export interface RoomSettings {
   roomName: string;
   isPublic: boolean;
   totalRounds: number;
-  buildTimeSeconds: number; // 0 = Round Default, or custom override (e.g. 45, 60, 90, 120)
-  goldMultiplier: number;   // 0.8 (Ironman), 1.0 (Standard), 1.25 (Rich)
+  buildTimeSeconds: number; // 0 = Round Default, or custom override (e.g. 45, 60, 90, 120, 999)
+  goldMultiplier: number;   // 0.8 (80%), 1.0 (Normal), 1.25 (125%)
   botCount: number;         // 0..5
   botDifficulty: 'NOVICE' | 'ARCHITECT' | 'GRANDMASTER';
   fogOfWar: boolean;
@@ -381,6 +390,7 @@ export interface RoomState {
   roundsCompleted?: number;
   roundConfig: RoundConfig;
   phaseTimeRemaining: number;
+  runElapsed?: number;
   simSpeedMultiplier: 1 | 2 | 4;
   players: PlayerState[];
   chat: ChatMessage[];
@@ -392,17 +402,20 @@ export type ClientToServerMessage =
       type: 'JOIN_ROOM';
       roomCode: string;
       playerName: string;
+      sessionId?: string;
       createSettings?: Partial<RoomSettings>;
     }
   | {
       type: 'CREATE_ROOM';
       roomCode?: string;
       playerName: string;
+      sessionId?: string;
       settings: Partial<RoomSettings>;
     }
   | { type: 'SET_NAME'; playerName: string }
-  | { type: 'PLACE_TOWER'; x: number; y: number }
-  | { type: 'SELL_TOWER'; towerId: string }
+  | { type: 'PLACE_TOWER'; x: number; y: number; clientId?: string }
+  | { type: 'SELL_TOWER'; towerId: string; x?: number; y?: number }
+  | { type: 'RESTORE_TOWERS'; towers: GridPoint[] }
   | { type: 'CLEAR_TOWERS' }
   | { type: 'LOAD_PRESET_DEMO' }
   | { type: 'REROLL_MAP' }
@@ -419,11 +432,15 @@ export type ClientToServerMessage =
   | { type: 'CHAT'; text: string };
 
 export type ServerToClientMessage =
-  | { type: 'WELCOME'; playerId: string; state: RoomState }
+  | { type: 'WELCOME'; playerId: string; sessionId?: string; state: RoomState }
   | { type: 'ROOM_STATE'; state: RoomState }
-  | { type: 'TIMER_TICK'; phaseTimeRemaining: number }
+  | {
+      type: 'TIMER_TICK';
+      phaseTimeRemaining: number;
+      phase?: GamePhase;
+      runElapsed?: number;
+    }
   | { type: 'LOBBY_LIST'; rooms: LobbyRoomSummary[] }
   | { type: 'LEADERBOARD_DATA'; leaderboard: LeaderboardPayload }
   | { type: 'CHAT_MESSAGE'; message: ChatMessage }
   | { type: 'ERROR_TOAST'; message: string };
-

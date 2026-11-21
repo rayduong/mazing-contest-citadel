@@ -1,13 +1,16 @@
-import { ROUNDS } from '../shared/rounds.js';
 import {
-  evaluateMazeRunTime,
-  MazeRunnerSimulator,
-  SIM_DT,
-} from '../shared/simulation.js';
+  computeCitadelCircuitry,
+  validateTowerPlacement,
+} from '../shared/pathfinding.js';
+import { computeEffectivePar, ROUNDS } from '../shared/rounds.js';
+import { MazeRunnerSimulator, SIM_DT } from '../shared/simulation.js';
 import {
+  ActiveBuildTool,
   ClientToServerMessage,
+  GridPoint,
   LeaderboardPayload,
   LobbyRoomSummary,
+  PlayerState,
   RoomSettings,
   RoomState,
   RUNNER_ARCHETYPES,
@@ -20,36 +23,30 @@ import { soundEngine } from './audio.js';
 import {
   getMedalBadge,
   getRunnerIcon,
+  getSpireIcon,
   hydrateStaticIcons,
   icon,
+  IconName,
 } from './icons.js';
-import { Arena3DRenderer } from './renderer3d.js';
+import {
+  Arena3DRenderer,
+  HoverStatusInfo,
+  InspectedWorldFeature,
+} from './renderer3d.js';
 
-interface ExtendedArena3DRenderer extends Arena3DRenderer {
-  clearTouchPreview?: () => void;
-  resetCameraView?: () => void;
-  dismissTransientUI?: () => boolean;
-  onFocusChange?: () => void;
+type UndoEntry =
+  | { kind: 'PLACE'; x: number; y: number; clientId: string }
+  | { kind: 'SELL'; x: number; y: number }
+  | { kind: 'BATCH_REPLACE'; previousTowers: GridPoint[] };
+
+interface ArmedButtonEntry {
+  timer: number;
+  restoreHtml: string;
 }
 
-interface ExtendedHoverInfo {
-  cell: { x: number; y: number } | null;
-  screenX: number;
-  screenY: number;
-  valid: boolean;
-  reason?: string;
-  deltaTime?: number;
-  deltaClaps?: number;
-  deltaKeeps?: number;
-  deltaOvercharge?: number;
-  previewTime?: number;
-  existingTower?: { id: string; x: number; y: number } | null;
-  isTouchPreview?: boolean;
-  offscreen?: boolean;
-  isGestureMoving?: boolean;
-  onConfirmTouchAction?: () => void;
-  onCancelTouchAction?: () => void;
-}
+const NAME_STORAGE_KEY = 'mc2026_player_name';
+const SESSION_STORAGE_KEY = 'mc2026_session_id';
+const SESSION_LEGACY_KEY = 'mc2026_session';
 
 function escapeHtml(raw: string): string {
   return raw
@@ -67,10 +64,61 @@ function formatOrdinal(rank: number): string {
   return `${rank}th`;
 }
 
+function readOrCreateSessionId(): string {
+  try {
+    const existing =
+      localStorage.getItem(SESSION_STORAGE_KEY) ||
+      localStorage.getItem(SESSION_LEGACY_KEY);
+    if (existing && existing.trim().length >= 8) {
+      const clean = existing.trim();
+      localStorage.setItem(SESSION_STORAGE_KEY, clean);
+      localStorage.setItem(SESSION_LEGACY_KEY, clean);
+      return clean;
+    }
+    const generated = `sess_${Date.now().toString(36)}_${Math.random()
+      .toString(36)
+      .slice(2, 10)}`;
+    localStorage.setItem(SESSION_STORAGE_KEY, generated);
+    localStorage.setItem(SESSION_LEGACY_KEY, generated);
+    return generated;
+  } catch {
+    return `sess_${Math.random().toString(36).slice(2, 12)}`;
+  }
+}
+
+function readOrCreatePlayerName(): string {
+  const fallback = `Player ${Math.floor(100 + Math.random() * 900)}`;
+  try {
+    const stored = (localStorage.getItem(NAME_STORAGE_KEY) || '').trim();
+    if (!stored || /^Architect-\d+$/i.test(stored)) {
+      localStorage.setItem(NAME_STORAGE_KEY, fallback);
+      return fallback;
+    }
+    return stored.slice(0, 18);
+  } catch {
+    return fallback;
+  }
+}
+
+function formatWallSupplyLabel(mult?: number): string {
+  const m = mult ?? 1;
+  if (Math.abs(m - 1) < 0.01) return 'Normal';
+  return `${Math.round(m * 100)}%`;
+}
+
+function formatBotSkillLabel(
+  diff?: 'NOVICE' | 'ARCHITECT' | 'GRANDMASTER'
+): string {
+  if (diff === 'NOVICE') return 'Easy';
+  if (diff === 'GRANDMASTER') return 'Hard';
+  return 'Normal';
+}
+
 class MazingContestClient {
-  private renderer3d: ExtendedArena3DRenderer;
+  private renderer3d: Arena3DRenderer;
   private ws: WebSocket | null = null;
   private localPlayerId: string | null = null;
+  private sessionId: string;
   private roomState: RoomState | null = null;
   private roomCode: string;
   private playerName: string;
@@ -85,26 +133,42 @@ class MazingContestClient {
   private simAccumulator = 0;
   private runPhaseActive = false;
 
-  private touchConfirmAction: (() => void) | null = null;
-  private touchCancelAction: (() => void) | null = null;
+  private undoStack: UndoEntry[] = [];
+  private optSeq = 0;
+  private lastUndoRoundSignature = '';
+  private sortedStandingsIds: string[] = [];
+
+  private armedTimers = new Map<HTMLElement, ArmedButtonEntry>();
   private lastPillSignature = '';
+  private lastTraySignature = '';
+
+  private lastBriefRoundSignature = '';
+  private pendingRoundBrief = false;
+  private briefDismissTimer: number | null = null;
+  private lastCountdownTickSec = -1;
+
+  private cachedTopHudBottom = 56;
+  private cachedBottomHudInset = 84;
+  private insetRafPending = false;
 
   constructor() {
+    this.hydrateSingleSourceGuide();
     hydrateStaticIcons();
+    this.initInputModeTracking();
 
     const viewport = document.getElementById('viewport-container')!;
     const labels = document.getElementById('world-labels')!;
-    this.renderer3d = new Arena3DRenderer(
-      viewport,
-      labels
-    ) as ExtendedArena3DRenderer;
+    this.renderer3d = new Arena3DRenderer(viewport, labels);
+
+    this.sessionId = readOrCreateSessionId();
+    this.playerName = readOrCreatePlayerName();
 
     const urlParams = new URLSearchParams(window.location.search);
     const urlRoom = urlParams.get('room');
-    this.roomCode = (urlRoom || 'ARENA1').toUpperCase().slice(0, 8);
-    this.playerName =
-      localStorage.getItem('mc2026_player_name') ||
-      `Architect-${Math.floor(100 + Math.random() * 899)}`;
+    this.roomCode = (urlRoom || 'ARENA1')
+      .toUpperCase()
+      .replace(/[^A-Z0-9-]/g, '')
+      .slice(0, 8) || 'ARENA1';
 
     const nameInput = document.getElementById(
       'player-name-input'
@@ -116,16 +180,20 @@ class MazingContestClient {
     ) as HTMLInputElement | null;
     if (hubNameInput) hubNameInput.value = this.playerName;
 
-    // Direct ?room= invite links enter the sunlit 3D arena immediately
+    // Direct ?room= invite links enter the sunlit 3D island immediately
     if (urlRoom) {
       document.getElementById('home-hub-modal')?.classList.add('hidden');
     }
 
+    this.syncAudioMuteButtons();
+    this.setupVisualViewportAndInsets();
     this.setupRendererCallbacks();
     this.setupUIEvents();
     this.setupHubEvents();
     this.renderRoundSelectorPills();
     this.renderLeaderboardRoundPills();
+    this.syncModalOpenState();
+    this.scheduleHudSafeInsetsSync();
     this.connectWebSocket();
     this.fetchInitialHubData();
 
@@ -140,6 +208,232 @@ class MazingContestClient {
     };
     requestAnimationFrame(animate);
   }
+
+  /**
+   * Clones the single-source How to Play markup (`#codex-guide-content`)
+   * into `#help-guide-content` before static SVG icon hydration.
+   */
+  private hydrateSingleSourceGuide() {
+    const source = document.getElementById('codex-guide-content');
+    const target = document.getElementById('help-guide-content');
+    if (source && target) {
+      target.innerHTML = source.innerHTML;
+    }
+  }
+
+  private initInputModeTracking() {
+    const coarse =
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches;
+    document.body.dataset.input = coarse ? 'touch' : 'mouse';
+
+    window.addEventListener(
+      'pointerdown',
+      (e) => {
+        const nextMode = e.pointerType === 'touch' ? 'touch' : 'mouse';
+        if (document.body.dataset.input !== nextMode) {
+          document.body.dataset.input = nextMode;
+          if (nextMode === 'mouse' && this.renderer3d?.activeTool === 'PAN') {
+            this.selectTool('BLOCK');
+          }
+          this.scheduleHudSafeInsetsSync();
+        }
+      },
+      { passive: true, capture: true }
+    );
+  }
+
+  private setupVisualViewportAndInsets() {
+    const updateViewportVars = () => {
+      const vv = window.visualViewport;
+      const vvh = vv ? vv.height : window.innerHeight;
+      const offsetTop = vv ? vv.offsetTop : 0;
+      document.documentElement.style.setProperty(
+        '--vvh',
+        `${Math.round(vvh)}px`
+      );
+      document.documentElement.style.setProperty(
+        '--vv-offset-top',
+        `${Math.round(offsetTop)}px`
+      );
+      const keyboardOpen = window.innerHeight - vvh > 140;
+      document.body.classList.toggle('keyboard-open', keyboardOpen);
+      this.scheduleHudSafeInsetsSync();
+    };
+
+    updateViewportVars();
+    window.addEventListener('resize', updateViewportVars, { passive: true });
+    window.visualViewport?.addEventListener('resize', updateViewportVars, {
+      passive: true,
+    });
+    window.visualViewport?.addEventListener('scroll', updateViewportVars, {
+      passive: true,
+    });
+  }
+
+  private scheduleHudSafeInsetsSync() {
+    if (this.insetRafPending) return;
+    this.insetRafPending = true;
+    requestAnimationFrame(() => {
+      this.insetRafPending = false;
+      const h = window.innerHeight || 720;
+
+      const topBar = document.getElementById('hud-top-bar');
+      let topPx = 56;
+      if (topBar) {
+        const rect = topBar.getBoundingClientRect();
+        if (rect.height > 0) {
+          topPx = Math.max(36, Math.round(rect.bottom));
+        }
+      }
+
+      let minBottomTop = h - 16;
+      const bottomCandidates = [
+        document.getElementById('hud-bottom-dock'),
+        document.getElementById('touch-precision-tray'),
+        document.getElementById('spectator-bar'),
+        document.getElementById('hud-run-dock'),
+      ];
+
+      for (const el of bottomCandidates) {
+        if (!el || el.classList.contains('hidden')) continue;
+        if (
+          el.id === 'hud-bottom-dock' &&
+          (el.classList.contains('dock-hidden') || this.isSpectatingRival())
+        ) {
+          continue;
+        }
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.opacity === '0') continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.height > 0 && rect.top < h && rect.bottom > h * 0.45) {
+          minBottomTop = Math.min(minBottomTop, rect.top);
+        }
+      }
+
+      const bottomPx = Math.max(16, Math.round(h - minBottomTop + 6));
+      this.cachedTopHudBottom = topPx;
+      this.cachedBottomHudInset = bottomPx;
+      this.renderer3d.setHudSafeInsets(topPx, bottomPx);
+    });
+  }
+
+  private isHubOpen(): boolean {
+    const hub = document.getElementById('home-hub-modal');
+    return Boolean(hub && !hub.classList.contains('hidden'));
+  }
+
+  private isHelpOpen(): boolean {
+    const help = document.getElementById('help-modal');
+    return Boolean(help && !help.classList.contains('hidden'));
+  }
+
+  private isResultsBlocking(): boolean {
+    const results = document.getElementById('results-modal');
+    return Boolean(
+      results &&
+        !results.classList.contains('hidden') &&
+        !results.classList.contains('peek-minimized')
+    );
+  }
+
+  private syncModalOpenState() {
+    const blocking =
+      this.isHubOpen() || this.isHelpOpen() || this.isResultsBlocking();
+    this.renderer3d.modalOpen = blocking;
+    if (blocking) {
+      this.hideCursorPill();
+      this.hideTouchPrecisionTray();
+    }
+  }
+
+  private isSpectatingRival(): boolean {
+    return (
+      !this.renderer3d.arenaOverviewMode &&
+      this.renderer3d.focusedPlayerId !== null &&
+      this.renderer3d.focusedPlayerId !== this.localPlayerId
+    );
+  }
+
+  private getLocalPlayer(): PlayerState | undefined {
+    if (!this.roomState || !this.localPlayerId) return undefined;
+    return this.roomState.players.find((p) => p.id === this.localPlayerId);
+  }
+
+  private getHumanCount(): number {
+    if (!this.roomState) return 1;
+    return Math.max(
+      1,
+      this.roomState.players.filter((p) => !p.isBot && p.connected !== false)
+        .length
+    );
+  }
+
+  private canControlRoomRules(): boolean {
+    const me = this.getLocalPlayer();
+    if (!me) return true;
+    return me.isHost || this.getHumanCount() <= 1;
+  }
+
+  // ==========================================================================
+  // TWO-TAP DESTRUCTIVE-ACTION SAFETY (`3.5s` ARMED WINDOW)
+  // ==========================================================================
+
+  private disarmButton(btn: HTMLElement | null) {
+    if (!btn) return;
+    const entry = this.armedTimers.get(btn);
+    if (!entry) return;
+    window.clearTimeout(entry.timer);
+    btn.classList.remove('armed-confirm');
+    delete btn.dataset.armed;
+    btn.innerHTML = entry.restoreHtml;
+    this.armedTimers.delete(btn);
+  }
+
+  private disarmAllButtons() {
+    for (const btn of Array.from(this.armedTimers.keys())) {
+      this.disarmButton(btn);
+    }
+  }
+
+  private armDestructiveButton(
+    btn: HTMLElement,
+    shouldGuard: boolean,
+    confirmLabel: string,
+    confirmIcon: IconName,
+    onConfirm: () => void
+  ) {
+    if (!shouldGuard) {
+      this.disarmButton(btn);
+      onConfirm();
+      return;
+    }
+
+    if (this.armedTimers.has(btn)) {
+      this.disarmButton(btn);
+      onConfirm();
+      return;
+    }
+
+    this.disarmAllButtons();
+    const restoreHtml = btn.innerHTML;
+    btn.classList.add('armed-confirm');
+    btn.dataset.armed = 'true';
+    btn.innerHTML = `${icon(confirmIcon, 15)}<span>${escapeHtml(
+      confirmLabel
+    )}</span>`;
+    soundEngine.playUiClick();
+    soundEngine.haptic('snap');
+
+    const timer = window.setTimeout(() => {
+      this.disarmButton(btn);
+    }, 3500);
+    this.armedTimers.set(btn, { timer, restoreHtml });
+  }
+
+  // ==========================================================================
+  // NETWORKING & LIFECYCLE
+  // ==========================================================================
 
   private async fetchInitialHubData() {
     try {
@@ -173,6 +467,7 @@ class MazingContestClient {
         type: 'JOIN_ROOM',
         roomCode: this.roomCode,
         playerName: this.playerName,
+        sessionId: this.sessionId,
       });
     });
 
@@ -186,17 +481,34 @@ class MazingContestClient {
 
       if (msg.type === 'WELCOME') {
         this.localPlayerId = msg.playerId;
+        if (msg.sessionId) {
+          this.sessionId = msg.sessionId;
+          try {
+            localStorage.setItem(SESSION_STORAGE_KEY, msg.sessionId);
+            localStorage.setItem(SESSION_LEGACY_KEY, msg.sessionId);
+          } catch {
+            // ignore
+          }
+        }
         this.roomCode = msg.state.roomCode;
         this.syncUrlRoomCode(this.roomCode);
         this.applyRoomState(msg.state);
         this.syncConfigFormFromSettings(msg.state.settings);
       } else if (msg.type === 'ROOM_STATE') {
         this.roomCode = msg.state.roomCode;
+        this.syncUrlRoomCode(this.roomCode);
         this.applyRoomState(msg.state);
       } else if (msg.type === 'TIMER_TICK') {
         if (this.roomState) {
           this.roomState.phaseTimeRemaining = msg.phaseTimeRemaining;
-          this.updateTimerDOM();
+          if (typeof msg.runElapsed === 'number') {
+            this.roomState.runElapsed = msg.runElapsed;
+            this.reconcileRunDrift(msg.runElapsed);
+          }
+          this.updateTimerDOM(true);
+          if (this.roomState.phase === 'ROUND_RESULTS') {
+            this.updateResultsCountdownDOM();
+          }
         }
       } else if (msg.type === 'LOBBY_LIST') {
         this.lobbies = msg.rooms;
@@ -211,6 +523,7 @@ class MazingContestClient {
         }
       } else if (msg.type === 'ERROR_TOAST') {
         soundEngine.playError();
+        soundEngine.haptic('error');
         this.showToast(msg.message);
       }
     });
@@ -223,8 +536,10 @@ class MazingContestClient {
   private syncUrlRoomCode(code: string) {
     try {
       const url = new URL(window.location.href);
-      url.searchParams.set('room', code);
-      window.history.replaceState({}, '', url.toString());
+      if (url.searchParams.get('room') !== code) {
+        url.searchParams.set('room', code);
+        window.history.replaceState({}, '', url.toString());
+      }
     } catch {
       // ignore
     }
@@ -236,10 +551,13 @@ class MazingContestClient {
     }
   }
 
-  /**
-   * Closes any open transient dropdowns/drawers and returns true if any was open.
-   */
+  // ==========================================================================
+  // TRANSIENT POPOVERS, CURSOR PILL & TOUCH PRECISION TRAY
+  // ==========================================================================
+
   private dismissAllTransientOverlays(): boolean {
+    this.disarmAllButtons();
+
     const roundDropdown = document.getElementById('round-dropdown');
     const standingsDropdown = document.getElementById('standings-dropdown');
     const dockToolsPopover = document.getElementById('dock-tools-popover');
@@ -268,6 +586,7 @@ class MazingContestClient {
   }
 
   private hideTransientPopovers() {
+    this.disarmAllButtons();
     document.getElementById('round-dropdown')?.classList.add('hidden');
     document.getElementById('standings-dropdown')?.classList.add('hidden');
     document.getElementById('btn-standings-toggle')?.classList.remove('active');
@@ -277,66 +596,180 @@ class MazingContestClient {
 
   private hideCursorPill() {
     const pill = document.getElementById('cursor-telemetry-pill');
-    if (pill) {
+    if (pill && !pill.classList.contains('hidden')) {
       pill.classList.add('hidden');
-      pill.classList.remove('touch-interactive');
-      pill.style.pointerEvents = '';
       pill.style.opacity = '';
     }
-    this.touchConfirmAction = null;
-    this.touchCancelAction = null;
     this.lastPillSignature = '';
   }
+
+  private hideTouchPrecisionTray() {
+    const tray = document.getElementById('touch-precision-tray');
+    if (tray && !tray.classList.contains('hidden')) {
+      tray.classList.add('hidden');
+      this.lastTraySignature = '';
+      this.scheduleHudSafeInsetsSync();
+    }
+  }
+
+  private dismissRoundBrief() {
+    if (this.briefDismissTimer !== null) {
+      window.clearTimeout(this.briefDismissTimer);
+      this.briefDismissTimer = null;
+    }
+    document.getElementById('round-brief-banner')?.classList.add('hidden');
+  }
+
+  private triggerRoundBriefBanner() {
+    if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    if (this.isHubOpen()) {
+      this.pendingRoundBrief = true;
+      return;
+    }
+
+    this.pendingRoundBrief = false;
+    const round = this.roomState.roundConfig;
+    const archKey = round.runnerType || 'SCOUT';
+    const arch = RUNNER_ARCHETYPES[archKey];
+    const banner = document.getElementById('round-brief-banner');
+    const textEl = document.getElementById('round-brief-text');
+    if (!banner || !textEl) return;
+
+    textEl.innerHTML = `${getRunnerIcon(archKey, 14)} <strong>${escapeHtml(
+      arch.name
+    )}:</strong> <span>${escapeHtml(arch.traitSummary)}</span>`;
+    banner.classList.remove('hidden');
+
+    if (this.briefDismissTimer !== null) {
+      window.clearTimeout(this.briefDismissTimer);
+    }
+    this.briefDismissTimer = window.setTimeout(() => {
+      banner.classList.add('hidden');
+      this.briefDismissTimer = null;
+    }, 4500);
+  }
+
+  // ==========================================================================
+  // ROOM STATE APPLICATION & RUN SIMULATION
+  // ==========================================================================
 
   private applyRoomState(state: RoomState) {
     const prevPhase = this.roomState?.phase;
     this.roomState = state;
     document.body.dataset.phase = state.phase;
 
+    const undoSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
+      state.roundConfig.seed ?? ''
+    }`;
+    if (state.phase !== 'BUILD' || undoSig !== this.lastUndoRoundSignature) {
+      this.undoStack = [];
+      this.lastUndoRoundSignature = undoSig;
+      this.lastCountdownTickSec = -1;
+    }
+
     this.renderer3d.syncRoomState(state, this.localPlayerId);
 
-    if (state.phase === 'RUN' && prevPhase !== 'RUN') {
-      this.startClientRunPhase(state);
-    } else if (state.phase !== 'RUN') {
+    if (state.phase === 'RUN') {
+      if (prevPhase !== 'RUN' || !this.runPhaseActive) {
+        this.startClientRunPhase(state);
+      } else if (typeof state.runElapsed === 'number') {
+        this.reconcileRunDrift(state.runElapsed);
+      }
+    } else {
       this.runPhaseActive = false;
     }
 
-    // Auto-hide bottom dock and cursor pill when outside BUILD phase
+    // Trigger 4.5s Round Brief at start of each round's BUILD phase
+    if (state.phase === 'BUILD') {
+      const briefSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
+        state.roundConfig.seed ?? ''
+      }`;
+      if (briefSig !== this.lastBriefRoundSignature) {
+        this.lastBriefRoundSignature = briefSig;
+        this.triggerRoundBriefBanner();
+      }
+    } else {
+      this.dismissRoundBrief();
+    }
+
+    // Bottom Build Dock, Run Dock & Touch Precision Tray visibility
     const bottomDock = document.getElementById('hud-bottom-dock')!;
+    const runDock = document.getElementById('hud-run-dock');
     if (state.phase === 'BUILD') {
       bottomDock.classList.remove('dock-hidden');
+      runDock?.classList.add('hidden');
+      if (!this.renderer3d.hasActiveTouchGhost()) {
+        this.hideTouchPrecisionTray();
+      }
     } else {
       bottomDock.classList.add('dock-hidden');
       document.getElementById('dock-tools-popover')?.classList.add('hidden');
       document.getElementById('btn-dock-tools')?.classList.remove('active');
-      this.hideCursorPill();
+      this.hideTouchPrecisionTray();
+      if (state.phase !== 'RUN') {
+        this.hideCursorPill();
+      }
+      if (state.phase === 'RUN') {
+        runDock?.classList.remove('hidden');
+      } else {
+        runDock?.classList.add('hidden');
+      }
     }
 
     const resultsModal = document.getElementById('results-modal')!;
     if (state.phase === 'ROUND_RESULTS' || state.phase === 'GAME_OVER') {
-      if (prevPhase !== 'ROUND_RESULTS' && prevPhase !== 'GAME_OVER') {
+      if (prevPhase !== state.phase) {
         soundEngine.playFinish();
+        resultsModal.classList.remove('peek-minimized');
+        this.syncPeekMazesButton(false);
       }
       this.renderRoundResultsModal(state);
       resultsModal.classList.remove('hidden');
     } else {
       resultsModal.classList.add('hidden');
+      resultsModal.classList.remove('peek-minimized');
+      this.syncPeekMazesButton(false);
     }
 
+    this.syncModalOpenState();
+    this.syncSpectatorStateDOM();
+    this.updateUndoAndToolAvailability();
     this.updateTopBarAndResources();
     this.updateScoreboardDOM();
+    this.updateHubHeroStatus();
     this.renderChat();
     this.renderLobbyBrowser();
+    this.scheduleHudSafeInsetsSync();
   }
 
   private startClientRunPhase(state: RoomState) {
     this.simulators.clear();
+    const initialElapsed = Math.max(0, state.runElapsed || 0);
     for (const p of state.players) {
       const sim = new MazeRunnerSimulator(p.id, state.roundConfig, p.towers);
+      if (initialElapsed > 0.04) {
+        sim.fastForwardTo(initialElapsed);
+      }
       this.simulators.set(p.id, sim);
     }
     this.simAccumulator = 0;
     this.runPhaseActive = true;
+
+    const stateMap = new Map<string, RunnerSimState>();
+    for (const [pid, sim] of this.simulators.entries()) {
+      stateMap.set(pid, sim.state);
+    }
+    this.renderer3d.updateRunners(stateMap, []);
+    this.updateLiveRunScoreboard();
+  }
+
+  private reconcileRunDrift(serverElapsed: number) {
+    if (!this.runPhaseActive || serverElapsed <= 0) return;
+    for (const sim of this.simulators.values()) {
+      if (!sim.state.finished && serverElapsed - sim.elapsedSeconds > 1.25) {
+        sim.fastForwardTo(serverElapsed);
+      }
+    }
   }
 
   private stepRunSimulation(dt: number) {
@@ -367,10 +800,18 @@ class MazingContestClient {
         ev.playerId ===
         (this.renderer3d.focusedPlayerId || this.localPlayerId);
       if (isFocused || this.renderer3d.arenaOverviewMode) {
-        if (ev.type === 'CLAP') soundEngine.playThunderclap();
-        else if (ev.type === 'WAYGATE') soundEngine.playChronoWarp();
-        else if (ev.type === 'CHECKPOINT') soundEngine.playCheckpoint();
-        else if (ev.type === 'FINISH') soundEngine.playFinish();
+        if (ev.type === 'CLAP') {
+          soundEngine.playSpirePulse(
+            ev.spireType || 'THUNDERCLAP',
+            ev.overchargeTier || 0
+          );
+        } else if (ev.type === 'WAYGATE') {
+          soundEngine.playChronoWarp();
+        } else if (ev.type === 'CHECKPOINT') {
+          soundEngine.playCheckpoint();
+        } else if (ev.type === 'FINISH') {
+          soundEngine.playFinish();
+        }
       }
     }
 
@@ -383,28 +824,297 @@ class MazingContestClient {
     this.updateLiveRunScoreboard();
   }
 
+  // ==========================================================================
+  // OPTIMISTIC `<1ms` BUILD / REMOVE & DETERMINISTIC UNDO STACK
+  // ==========================================================================
+
+  private handleOptimisticPlaceTower(x: number, y: number) {
+    if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    const wallCost = TOWER_SPECS.BLOCK.goldCost;
+    if (me.gold < wallCost) {
+      soundEngine.playError();
+      soundEngine.haptic('error');
+      this.showToast('No walls left. Remove a wall first.');
+      return;
+    }
+
+    const validation = validateTowerPlacement(
+      this.roomState.roundConfig,
+      me.towers,
+      x,
+      y
+    );
+    if (!validation.valid || !validation.pathResult) {
+      soundEngine.playError();
+      soundEngine.haptic('error');
+      if (validation.reason) {
+        this.showToast(validation.reason);
+      }
+      return;
+    }
+
+    const prevOvercharge =
+      this.renderer3d.getLocalMazeEval()?.overchargedSpires ??
+      computeCitadelCircuitry(this.roomState.roundConfig, me.towers)
+        .overchargedSpires;
+
+    const clientId = `opt_${++this.optSeq}`;
+    me.towers.push({
+      id: clientId,
+      type: 'BLOCK',
+      x,
+      y,
+      createdAt: Date.now(),
+    });
+    me.gold = Math.max(0, me.gold - wallCost);
+    me.pathDistance = Number(validation.pathResult.totalDistance.toFixed(1));
+    me.ready = false;
+
+    this.pushUndo({ kind: 'PLACE', x, y, clientId });
+
+    this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+    const nextOvercharge =
+      this.renderer3d.getLocalMazeEval()?.overchargedSpires ?? prevOvercharge;
+    const gainedOvercharge = Math.max(0, nextOvercharge - prevOvercharge);
+
+    soundEngine.playBuild('BLOCK', gainedOvercharge);
+    soundEngine.haptic('build');
+
+    this.updateUndoAndToolAvailability();
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+
+    this.send({ type: 'PLACE_TOWER', x, y, clientId });
+  }
+
+  private handleOptimisticSellTower(
+    towerId: string,
+    x?: number,
+    y?: number
+  ) {
+    if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    const idx = me.towers.findIndex(
+      (t) =>
+        t.id === towerId ||
+        (x !== undefined && y !== undefined && t.x === x && t.y === y)
+    );
+    if (idx === -1) return;
+
+    const [removed] = me.towers.splice(idx, 1);
+    me.gold += TOWER_SPECS.BLOCK.goldCost;
+    me.ready = false;
+
+    this.pushUndo({ kind: 'SELL', x: removed.x, y: removed.y });
+
+    this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+    const evalRes = this.renderer3d.getLocalMazeEval();
+    if (evalRes) {
+      me.pathDistance = Number(evalRes.distance.toFixed(1));
+    }
+
+    soundEngine.playSell();
+    soundEngine.haptic('sell');
+
+    this.updateUndoAndToolAvailability();
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+
+    this.send({
+      type: 'SELL_TOWER',
+      towerId: removed.id,
+      x: removed.x,
+      y: removed.y,
+    });
+  }
+
+  private pushUndo(entry: UndoEntry) {
+    this.undoStack.push(entry);
+    if (this.undoStack.length > 64) {
+      this.undoStack.shift();
+    }
+  }
+
+  private performUndo() {
+    if (
+      !this.roomState ||
+      this.roomState.phase !== 'BUILD' ||
+      this.isSpectatingRival() ||
+      this.renderer3d.arenaOverviewMode ||
+      this.undoStack.length === 0
+    ) {
+      return;
+    }
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
+    this.disarmAllButtons();
+
+    const entry = this.undoStack.pop()!;
+    const wallCost = TOWER_SPECS.BLOCK.goldCost;
+
+    if (entry.kind === 'PLACE') {
+      const idx = me.towers.findIndex(
+        (t) =>
+          t.id === entry.clientId || (t.x === entry.x && t.y === entry.y)
+      );
+      const removedId = idx !== -1 ? me.towers[idx].id : entry.clientId;
+      if (idx !== -1) {
+        me.towers.splice(idx, 1);
+        me.gold += wallCost;
+        me.ready = false;
+      }
+      this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+      const evalRes = this.renderer3d.getLocalMazeEval();
+      if (evalRes) {
+        me.pathDistance = Number(evalRes.distance.toFixed(1));
+      }
+      soundEngine.playSell();
+      soundEngine.haptic('undo');
+      this.send({
+        type: 'SELL_TOWER',
+        towerId: removedId,
+        x: entry.x,
+        y: entry.y,
+      });
+    } else if (entry.kind === 'SELL') {
+      if (me.gold >= wallCost) {
+        const validation = validateTowerPlacement(
+          this.roomState.roundConfig,
+          me.towers,
+          entry.x,
+          entry.y
+        );
+        if (validation.valid && validation.pathResult) {
+          const clientId = `opt_${++this.optSeq}`;
+          me.towers.push({
+            id: clientId,
+            type: 'BLOCK',
+            x: entry.x,
+            y: entry.y,
+            createdAt: Date.now(),
+          });
+          me.gold = Math.max(0, me.gold - wallCost);
+          me.pathDistance = Number(
+            validation.pathResult.totalDistance.toFixed(1)
+          );
+          me.ready = false;
+          this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+          soundEngine.playBuild('BLOCK', 0);
+          soundEngine.haptic('undo');
+          this.send({
+            type: 'PLACE_TOWER',
+            x: entry.x,
+            y: entry.y,
+            clientId,
+          });
+        }
+      }
+    } else if (entry.kind === 'BATCH_REPLACE') {
+      const round = this.roomState.roundConfig;
+      me.towers = [];
+      me.gold = round.startingGold;
+      me.usedSampleMaze = false;
+      me.ready = false;
+
+      for (const pt of entry.previousTowers) {
+        if (me.gold < wallCost) break;
+        const check = validateTowerPlacement(round, me.towers, pt.x, pt.y);
+        if (check.valid && check.pathResult) {
+          me.towers.push({
+            id: `opt_${++this.optSeq}`,
+            type: 'BLOCK',
+            x: pt.x,
+            y: pt.y,
+            createdAt: Date.now(),
+          });
+          me.gold = Math.max(0, me.gold - wallCost);
+          me.pathDistance = Number(check.pathResult.totalDistance.toFixed(1));
+        }
+      }
+
+      this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+      const evalRes = this.renderer3d.getLocalMazeEval();
+      if (evalRes) {
+        me.pathDistance = Number(evalRes.distance.toFixed(1));
+      }
+      soundEngine.playBuild('RESTORE', 0);
+      soundEngine.haptic('undo');
+      this.send({ type: 'RESTORE_TOWERS', towers: entry.previousTowers });
+    }
+
+    this.updateUndoAndToolAvailability();
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+  }
+
+  private updateUndoAndToolAvailability() {
+    const me = this.getLocalPlayer();
+    const canEdit =
+      this.roomState?.phase === 'BUILD' &&
+      !this.isSpectatingRival() &&
+      !this.renderer3d.arenaOverviewMode &&
+      Boolean(me);
+
+    const undoBtn = document.getElementById(
+      'btn-undo'
+    ) as HTMLButtonElement | null;
+    if (undoBtn) {
+      undoBtn.disabled = !canEdit || this.undoStack.length === 0;
+    }
+
+    const clearBtn = document.getElementById(
+      'btn-clear-maze'
+    ) as HTMLButtonElement | null;
+    if (clearBtn) {
+      clearBtn.disabled = !me || me.towers.length === 0;
+    }
+
+    const rerollBtn = document.getElementById(
+      'btn-reroll-map'
+    ) as HTMLButtonElement | null;
+    if (rerollBtn) {
+      rerollBtn.disabled = !this.canControlRoomRules();
+    }
+  }
+
+  // ==========================================================================
+  // 3D RENDERER CALLBACKS, HOVER INSPECTION & PRECISION TOUCH TRAY
+  // ==========================================================================
+
   private setupRendererCallbacks() {
     this.renderer3d.onPlaceTower = (x, y) => {
-      soundEngine.playBuild('BLOCK');
-      this.send({ type: 'PLACE_TOWER', x, y });
+      this.handleOptimisticPlaceTower(x, y);
     };
 
-    this.renderer3d.onSellTower = (towerId) => {
-      soundEngine.playSell();
-      this.send({ type: 'SELL_TOWER', towerId });
+    this.renderer3d.onSellTower = (towerId, x, y) => {
+      this.handleOptimisticSellTower(towerId, x, y);
     };
 
-    // Intercept outside canvas taps when popovers/drawers are open so taps don't place pillars
-    (this.renderer3d as ExtendedArena3DRenderer).dismissTransientUI = () => {
+    this.renderer3d.onTouchSnapChange = (_cell, valid) => {
+      soundEngine.playTouchSnap();
+      soundEngine.haptic(valid ? 'snap' : 'nudge');
+    };
+
+    this.renderer3d.dismissTransientUI = () => {
       return this.dismissAllTransientOverlays();
     };
 
-    // Sync HUD Standings & Overview button whenever camera focus changes in 3D
-    (this.renderer3d as ExtendedArena3DRenderer).onFocusChange = () => {
+    this.renderer3d.onFocusChange = () => {
+      this.syncSpectatorStateDOM();
+      this.updateUndoAndToolAvailability();
       this.updateScoreboardDOM();
+      this.scheduleHudSafeInsetsSync();
     };
 
-    // Support clicking/tapping projected .island-3d-badge labels in Arena Overview
+    // Support clicking/tapping projected .island-3d-badge labels in All Islands Overview
     const worldLabels = document.getElementById('world-labels');
     worldLabels?.addEventListener('click', (e) => {
       const badge = (e.target as HTMLElement).closest(
@@ -420,142 +1130,183 @@ class MazingContestClient {
         : this.roomState.players.find((p) => p.name === nameText);
 
       if (targetPlayer) {
-        this.renderer3d.clearTouchPreview?.();
+        this.renderer3d.cancelTouchGhost();
+        this.hideTouchPrecisionTray();
         this.hideCursorPill();
         this.renderer3d.focusOnPlayerIsland(targetPlayer.id);
+        this.syncSpectatorStateDOM();
+        this.updateUndoAndToolAvailability();
         this.updateScoreboardDOM();
+        this.scheduleHudSafeInsetsSync();
       }
     });
+
+    // Stationary Mobile Precision Tray (#touch-precision-tray)
+    const tray = document.getElementById('touch-precision-tray')!;
+    tray.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+    });
+
+    tray
+      .querySelectorAll<HTMLButtonElement>('.touch-nudge-btn')
+      .forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const dx = Number(btn.dataset.nudgeDx || 0);
+          const dy = Number(btn.dataset.nudgeDy || 0);
+          const moved = this.renderer3d.nudgeTouchGhost(dx, dy);
+          if (!moved) {
+            soundEngine.haptic('error');
+          }
+        });
+      });
+
+    document
+      .getElementById('btn-touch-confirm')
+      ?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const ok = this.renderer3d.confirmTouchGhost();
+        if (ok) {
+          this.hideTouchPrecisionTray();
+        } else {
+          soundEngine.playError();
+          soundEngine.haptic('error');
+        }
+      });
+
+    document
+      .getElementById('btn-touch-cancel')
+      ?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        soundEngine.playUiClick();
+        this.renderer3d.cancelTouchGhost();
+        this.hideTouchPrecisionTray();
+        this.hideCursorPill();
+      });
 
     const pill = document.getElementById('cursor-telemetry-pill')!;
 
-    // Prevent taps on the floating touch confirm pill from falling through to the 3D canvas
-    pill.addEventListener('pointerdown', (e) => {
-      e.stopPropagation();
-    });
-
-    pill.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const target = e.target as HTMLElement;
-      if (target.closest('[data-touch-action="confirm"]')) {
-        const cb = this.touchConfirmAction;
+    this.renderer3d.onHoverStatusChange = (info: HoverStatusInfo) => {
+      if (this.renderer3d.modalOpen || !this.roomState) {
         this.hideCursorPill();
-        cb?.();
-      } else if (target.closest('[data-touch-action="cancel"]')) {
-        const cb = this.touchCancelAction;
-        this.hideCursorPill();
-        cb?.();
-        this.renderer3d.clearTouchPreview?.();
-      }
-    });
-
-    this.renderer3d.onHoverStatusChange = (rawInfo) => {
-      const info = rawInfo as ExtendedHoverInfo;
-      const hubOpen = !document
-        .getElementById('home-hub-modal')
-        ?.classList.contains('hidden');
-      const helpOpen = !document
-        .getElementById('help-modal')
-        ?.classList.contains('hidden');
-
-      if (
-        !info.cell ||
-        info.offscreen ||
-        this.roomState?.phase !== 'BUILD' ||
-        hubOpen ||
-        helpOpen
-      ) {
-        this.hideCursorPill();
+        this.hideTouchPrecisionTray();
         return;
       }
 
-      pill.classList.remove('hidden');
-
-      // Suppress accidental taps on the floating pill while panning or pinching
-      if (info.isGestureMoving) {
-        pill.style.pointerEvents = 'none';
-        pill.style.opacity = '0.45';
-      } else {
-        pill.style.pointerEvents = info.isTouchPreview ? 'auto' : 'none';
-        pill.style.opacity = '1';
-      }
-
-      // Mobile / Touch Two-Stage Confirm Pill (64px ABOVE finger, clamped inside viewport)
+      // 1. Mobile Touch Two-Stage Precision Preview (Stationary Tray + Non-Blocking Micro-Tag)
       if (info.isTouchPreview) {
-        this.touchConfirmAction = info.onConfirmTouchAction || null;
-        this.touchCancelAction = info.onCancelTouchAction || null;
+        if (this.roomState.phase !== 'BUILD' || !info.cell) {
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          return;
+        }
 
-        let nextClass = 'cursor-telemetry-pill touch-interactive';
-        let nextHtml = '';
+        this.updateTouchPrecisionTrayDOM(info);
+
+        if (info.offscreen) {
+          this.hideCursorPill();
+          return;
+        }
+
+        let tagTone = 'neutral';
+        let tagHtml = '';
 
         if (info.existingTower) {
-          nextHtml = `
-            <button type="button" class="touch-confirm-btn reclaim-action" data-touch-action="confirm">
-              ${icon('reclaim', 15)}
-              <span>Reclaim · +1 Pillar</span>
-            </button>
-            <button type="button" class="touch-cancel-btn" data-touch-action="cancel" aria-label="Dismiss">
-              ${icon('close', 15)}
-            </button>
-          `;
+          tagTone = 'neutral';
+          tagHtml = `${icon('reclaim', 12)}<span>Remove (+1)</span>`;
         } else if (info.valid) {
           const dt = info.deltaTime ?? 0;
           const dOver = info.deltaOvercharge ?? 0;
+          const dKeeps = info.deltaKeeps ?? 0;
           const sign = dt >= 0 ? '+' : '';
-          const starPart =
+          tagTone =
+            dt > 0.05 || dOver > 0 || dKeeps > 0
+              ? 'positive'
+              : dt < -0.05
+              ? 'negative'
+              : 'neutral';
+          const overPart =
             dOver > 0
-              ? ` <span style="display:inline-flex;align-items:center;gap:1px">+${dOver}${icon('starFilled', 12)}</span>`
+              ? `<span class="overcharge-pips">+${dOver}${icon(
+                  'diamondFilled',
+                  10
+                )}</span>`
+              : dKeeps > 0
+              ? `<span class="overcharge-pips">+${dKeeps} Keep</span>`
               : '';
-          nextHtml = `
-            <button type="button" class="touch-confirm-btn" data-touch-action="confirm">
-              ${icon('pillar', 15)}
-              <span>${sign}${dt.toFixed(1)}s</span>${starPart}<span>· Place Pillar</span>
-            </button>
-            <button type="button" class="touch-cancel-btn" data-touch-action="cancel" aria-label="Dismiss">
-              ${icon('close', 15)}
-            </button>
-          `;
+          tagHtml = `<span>${sign}${dt.toFixed(1)}s</span>${overPart}`;
         } else {
-          nextClass = 'cursor-telemetry-pill touch-interactive invalid';
-          nextHtml = `
-            <span class="touch-blocked-label">
-              ${icon('close', 14)}
-              <span>${escapeHtml(info.reason || 'Blocked')}</span>
-            </span>
-            <button type="button" class="touch-cancel-btn" data-touch-action="cancel" aria-label="Dismiss">
-              ${icon('close', 15)}
-            </button>
-          `;
+          tagTone = 'invalid';
+          tagHtml = `${icon('close', 12)}<span>${escapeHtml(
+            info.reason || 'Blocked'
+          )}</span>`;
         }
 
-        const sig = `touch|${nextClass}|${nextHtml}`;
+        const nextClass = `cursor-telemetry-pill micro-touch-tag ${tagTone}`;
+        const sig = `touch-tag|${nextClass}|${tagHtml}`;
         if (this.lastPillSignature !== sig) {
           pill.className = nextClass;
-          pill.innerHTML = nextHtml;
+          pill.innerHTML = tagHtml;
           this.lastPillSignature = sig;
         }
+        pill.classList.remove('hidden');
+        pill.style.opacity =
+          info.isGestureMoving && !info.isLoupeDragging ? '0.55' : '1';
 
-        const pillW = pill.offsetWidth || 220;
-        const pillH = pill.offsetHeight || 52;
-        const minTop = window.innerWidth <= 980 ? 112 : 64;
-        const maxTop = Math.max(minTop, window.innerHeight - pillH - 82);
+        const pillW = pill.offsetWidth || 104;
+        const pillH = pill.offsetHeight || 28;
+        const minTop = this.cachedTopHudBottom + 8;
+        const maxTop = Math.max(
+          minTop,
+          window.innerHeight - this.cachedBottomHudInset - pillH - 8
+        );
+
+        let rawY = info.screenY - 38 - pillH * 0.5;
+        if (info.placeNearTopEdge || rawY < minTop) {
+          rawY = info.screenY + 34;
+        }
 
         const clampedX = Math.max(
           10,
           Math.min(window.innerWidth - pillW - 10, info.screenX - pillW * 0.5)
         );
-        const clampedY = Math.max(
-          minTop,
-          Math.min(maxTop, info.screenY - 64 - pillH * 0.5)
-        );
-
-        pill.style.transform = `translate3d(${Math.round(clampedX)}px, ${Math.round(clampedY)}px, 0)`;
+        const clampedY = Math.max(minTop, Math.min(maxTop, rawY));
+        pill.style.transform = `translate3d(${Math.round(
+          clampedX
+        )}px, ${Math.round(clampedY)}px, 0)`;
         return;
       }
 
-      // Desktop Mouse Hover Preview Pill (pointer-events: none)
-      this.touchConfirmAction = null;
-      this.touchCancelAction = null;
+      // Not in touch preview -> ensure touch tray is hidden
+      if (!this.renderer3d.hasActiveTouchGhost()) {
+        this.hideTouchPrecisionTray();
+      }
+
+      // 2. Desktop World Feature Inspection Card (Spire, Keep, Runner, Gate in BUILD & RUN)
+      if (info.inspectedFeature && !info.offscreen) {
+        const cardHtml = this.renderInspectedFeatureHtml(info.inspectedFeature);
+        const nextClass = 'cursor-telemetry-pill inspect-card neutral';
+        const sig = `inspect|${cardHtml}`;
+        if (this.lastPillSignature !== sig) {
+          pill.className = nextClass;
+          pill.innerHTML = cardHtml;
+          this.lastPillSignature = sig;
+        }
+        pill.classList.remove('hidden');
+        pill.style.opacity = '1';
+        this.positionDesktopFloatingPill(pill, info.screenX, info.screenY);
+        return;
+      }
+
+      // 3. Desktop Build / Remove Hover Delta Pill
+      if (
+        !info.cell ||
+        info.offscreen ||
+        this.roomState.phase !== 'BUILD'
+      ) {
+        this.hideCursorPill();
+        return;
+      }
 
       let nextClass = 'cursor-telemetry-pill neutral';
       let nextHtml = '';
@@ -563,29 +1314,43 @@ class MazingContestClient {
       if (info.existingTower) {
         const label =
           this.renderer3d.activeTool === 'SELL'
-            ? 'Reclaim · +1 Pillar'
-            : 'Right-click · +1 Pillar';
+            ? 'Click · Remove (+1)'
+            : 'Right-click · Remove (+1)';
         nextClass = 'cursor-telemetry-pill neutral';
-        nextHtml = `${icon('reclaim', 14)}<span>${label}</span>`;
+        nextHtml = `${icon('reclaim', 13)}<span>${label}</span>`;
       } else if (info.valid) {
         const dt = info.deltaTime ?? 0;
         const dOver = info.deltaOvercharge ?? 0;
+        const dKeeps = info.deltaKeeps ?? 0;
+        const dClaps = info.deltaClaps ?? 0;
         const sign = dt >= 0 ? '+' : '';
         const tone =
-          dt > 0.05 || dOver > 0
+          dt > 0.05 || dOver > 0 || dKeeps > 0
             ? 'positive'
             : dt < -0.05
             ? 'negative'
             : 'neutral';
         nextClass = `cursor-telemetry-pill ${tone}`;
-        const starBadge =
+
+        const synergyPart =
           dOver > 0
-            ? `<span class="overcharge-star">+${dOver}${icon('starFilled', 12)}</span>`
+            ? `<span class="overcharge-pips">+${dOver}${icon(
+                'diamondFilled',
+                11
+              )}</span>`
+            : dKeeps > 0
+            ? `<span class="overcharge-pips">+${dKeeps} Keep</span>`
             : '';
-        nextHtml = `<span>${sign}${dt.toFixed(1)}s</span>${starBadge}`;
+        const hitsPart =
+          dClaps > 0
+            ? `<span>+${dClaps} ${dClaps === 1 ? 'hit' : 'hits'}</span>`
+            : '';
+        nextHtml = `<span>${sign}${dt.toFixed(1)}s</span>${synergyPart}${hitsPart}`;
       } else {
         nextClass = 'cursor-telemetry-pill invalid';
-        nextHtml = `${icon('close', 13)}<span>${escapeHtml(info.reason || 'Blocked')}</span>`;
+        nextHtml = `${icon('close', 13)}<span>${escapeHtml(
+          info.reason || 'Blocked'
+        )}</span>`;
       }
 
       const sig = `hover|${nextClass}|${nextHtml}`;
@@ -594,39 +1359,273 @@ class MazingContestClient {
         pill.innerHTML = nextHtml;
         this.lastPillSignature = sig;
       }
-
-      const pillW = pill.offsetWidth || 120;
-      const offsetX = Math.max(
-        10,
-        Math.min(window.innerWidth - pillW - 12, info.screenX + 18)
-      );
-      const offsetY = Math.max(
-        64,
-        Math.min(window.innerHeight - 76, info.screenY - 22)
-      );
-      pill.style.transform = `translate3d(${Math.round(offsetX)}px, ${Math.round(offsetY)}px, 0)`;
+      pill.classList.remove('hidden');
+      pill.style.opacity = '1';
+      this.positionDesktopFloatingPill(pill, info.screenX, info.screenY);
     };
   }
 
+  private positionDesktopFloatingPill(
+    pill: HTMLElement,
+    screenX: number,
+    screenY: number
+  ) {
+    const pillW = pill.offsetWidth || 140;
+    const pillH = pill.offsetHeight || 34;
+    const minTop = this.cachedTopHudBottom + 8;
+    const maxTop = Math.max(minTop, window.innerHeight - pillH - 18);
+
+    let offsetX = screenX + 18;
+    if (offsetX + pillW > window.innerWidth - 12) {
+      offsetX = Math.max(10, screenX - pillW - 16);
+    }
+    const offsetY = Math.max(minTop, Math.min(maxTop, screenY - 22));
+    pill.style.transform = `translate3d(${Math.round(offsetX)}px, ${Math.round(
+      offsetY
+    )}px, 0)`;
+  }
+
+  private updateTouchPrecisionTrayDOM(info: HoverStatusInfo) {
+    const tray = document.getElementById('touch-precision-tray');
+    const confirmBtn = document.getElementById(
+      'btn-touch-confirm'
+    ) as HTMLButtonElement | null;
+    if (!tray || !confirmBtn) return;
+
+    const wasHidden = tray.classList.contains('hidden');
+    tray.classList.remove('hidden');
+    if (wasHidden) {
+      this.scheduleHudSafeInsetsSync();
+    }
+
+    let btnClass = 'touch-confirm-btn';
+    let btnDisabled = false;
+    let btnHtml = '';
+
+    if (info.existingTower) {
+      btnClass = 'touch-confirm-btn reclaim-action';
+      btnHtml = `${icon(
+        'reclaim',
+        15
+      )}<span id="touch-confirm-label">Remove (+1)</span>`;
+    } else if (info.valid) {
+      const dt = info.deltaTime ?? 0;
+      const dOver = info.deltaOvercharge ?? 0;
+      const sign = dt >= 0 ? '+' : '';
+      const overBadge =
+        dOver > 0
+          ? `<span class="overcharge-pips" style="color:#fef08a">+${dOver}${icon(
+              'diamondFilled',
+              11
+            )}</span>`
+          : '';
+      btnClass = 'touch-confirm-btn';
+      btnHtml = `${icon(
+        'pillar',
+        15
+      )}<span id="touch-confirm-label">Place · ${sign}${dt.toFixed(
+        1
+      )}s</span>${overBadge}`;
+    } else {
+      btnClass = 'touch-confirm-btn invalid';
+      btnDisabled = true;
+      btnHtml = `${icon('close', 14)}<span id="touch-confirm-label">${escapeHtml(
+        info.reason || 'Blocked'
+      )}</span>`;
+    }
+
+    const sig = `${btnClass}|${btnDisabled}|${btnHtml}`;
+    if (this.lastTraySignature !== sig) {
+      confirmBtn.className = btnClass;
+      confirmBtn.disabled = btnDisabled;
+      confirmBtn.innerHTML = btnHtml;
+      this.lastTraySignature = sig;
+    }
+  }
+
+  private renderOverchargeDiamonds(tier: number): string {
+    const clamped = Math.max(0, Math.min(3, tier));
+    if (clamped === 0) {
+      return `<span class="inspect-meta">Uncharged</span>`;
+    }
+    let pips = '';
+    for (let i = 0; i < clamped; i++) {
+      pips += icon('diamondFilled', 11);
+    }
+    return `<span class="overcharge-pips" title="Overcharge Tier ${clamped}">${pips}</span>`;
+  }
+
+  private renderInspectedFeatureHtml(f: InspectedWorldFeature): string {
+    if (f.kind === 'SPIRE') {
+      const spec = TOWER_SPECS[f.spireType];
+      const pips = this.renderOverchargeDiamonds(f.overchargeTier);
+      let statsLine = '';
+      if (f.spireType === 'FROST_OBELISK') {
+        const auraPct = Math.round((f.auraSlowPercent ?? 0.22) * 100);
+        statsLine = `${auraPct}% ring chill · ${Math.round(
+          f.slowPercent * 100
+        )}% burst / ${f.effectiveCooldown.toFixed(
+          1
+        )}s · ${f.effectiveRange.toFixed(1)}m`;
+      } else if (f.spireType === 'CHRONO_SPIRE') {
+        statsLine = `${Math.round(
+          f.slowPercent * 100
+        )}% slow / ${f.effectiveCooldown.toFixed(1)}s · -${(
+          f.cdrPulseSeconds ?? 1.2
+        ).toFixed(1)}s spire recharge`;
+      } else {
+        statsLine = `${Math.round(
+          f.slowPercent * 100
+        )}% slow for ${f.slowDuration.toFixed(
+          1
+        )}s · Every ${f.effectiveCooldown.toFixed(
+          1
+        )}s · ${f.effectiveRange.toFixed(1)}m`;
+      }
+
+      const isRun = this.roomState?.phase === 'RUN';
+      const metaLine = isRun
+        ? `Pulses this run: ${f.projectedOrLiveHits}`
+        : `Projected hits: ${f.projectedOrLiveHits}${
+            f.overchargeTier < 3
+              ? ' · Link Crimson Keeps to boost'
+              : ' · Max Overcharge'
+          }`;
+
+      return `
+        <div class="inspect-head">
+          ${getSpireIcon(f.spireType, 14)}
+          <span>${escapeHtml(spec.name)}</span>
+          ${pips}
+        </div>
+        <div class="inspect-sub">${escapeHtml(statsLine)}</div>
+        <div class="inspect-meta">${escapeHtml(metaLine)}</div>
+      `;
+    }
+
+    if (f.kind === 'KEEP') {
+      const badge = f.linked
+        ? `<span class="overcharge-pips">${icon('diamondFilled', 11)} Linked</span>`
+        : `<span class="inspect-meta">Unlinked</span>`;
+      const desc = f.linked
+        ? 'Connected to your walls. Grants +1 Overcharge to nearby Spires.'
+        : 'Link Stone Walls here to Overcharge nearby Spires.';
+      return `
+        <div class="inspect-head">
+          ${icon('keep', 14)}
+          <span>Crimson Keep</span>
+          ${badge}
+        </div>
+        <div class="inspect-sub">${escapeHtml(desc)}</div>
+      `;
+    }
+
+    if (f.kind === 'RUNNER') {
+      const arch = RUNNER_ARCHETYPES[f.archetype];
+      const statusPart = f.statusLabel
+        ? `<span class="inspect-meta">· ${escapeHtml(f.statusLabel)}</span>`
+        : '';
+      const subText =
+        this.roomState?.phase === 'RUN'
+          ? `Speed ${f.currentSpeed.toFixed(2)} m/s (base ${f.baseSpeed.toFixed(
+              2
+            )} m/s)`
+          : arch.traitSummary;
+      return `
+        <div class="inspect-head">
+          ${getRunnerIcon(f.archetype, 14)}
+          <span>${escapeHtml(arch.name)}</span>
+          ${statusPart}
+        </div>
+        <div class="inspect-sub">${escapeHtml(subText)}</div>
+      `;
+    }
+
+    // GATE
+    if (f.gateType === 'SPAWN') {
+      return `
+        <div class="inspect-head">
+          ${icon('compass', 14)}
+          <span>North Gate · Entrance</span>
+        </div>
+        <div class="inspect-sub">Runners enter here and route toward the South Shrine.</div>
+      `;
+    }
+
+    return `
+      <div class="inspect-head">
+        ${icon('flag', 14)}
+        <span>South Shrine · Exit</span>
+      </div>
+      <div class="inspect-sub">Round Par ${f.parTimeSeconds.toFixed(
+        1
+      )}s (+2 bonus points for beating Par)</div>
+    `;
+  }
+
+  // ==========================================================================
+  // AUDIO, SPECTATOR BAR & HOME HUB NAVIGATION
+  // ==========================================================================
+
   private syncAudioMuteButtons() {
-    const iconMarkup = icon(
-      soundEngine.muted ? 'volumeOff' : 'volumeOn',
-      18
-    );
-    const drawerIconMarkup = icon(
-      soundEngine.muted ? 'volumeOff' : 'volumeOn',
-      16
-    );
+    const hudIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 18);
+    const drawerIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 17);
 
     const muteBtn = document.getElementById('btn-mute');
     const muteIconSlot = document.getElementById('mute-icon-slot');
-    if (muteIconSlot) muteIconSlot.innerHTML = iconMarkup;
+    if (muteIconSlot) muteIconSlot.innerHTML = hudIcon;
     muteBtn?.classList.toggle('active', soundEngine.muted);
 
     const drawerMuteBtn = document.getElementById('btn-drawer-mute');
     const drawerMuteIconSlot = document.getElementById('drawer-mute-icon-slot');
-    if (drawerMuteIconSlot) drawerMuteIconSlot.innerHTML = drawerIconMarkup;
+    if (drawerMuteIconSlot) drawerMuteIconSlot.innerHTML = drawerIcon;
     drawerMuteBtn?.classList.toggle('active', soundEngine.muted);
+  }
+
+  private syncSpectatorStateDOM() {
+    const spectating = this.isSpectatingRival();
+    document.body.dataset.spectating = spectating ? 'true' : 'false';
+
+    const bar = document.getElementById('spectator-bar');
+    const nameEl = document.getElementById('spectator-target-name');
+    if (bar) {
+      const showBar =
+        spectating && Boolean(this.roomState && this.roomState.phase === 'BUILD');
+      bar.classList.toggle('hidden', !showBar);
+      if (showBar && nameEl && this.roomState) {
+        const target = this.roomState.players.find(
+          (p) => p.id === this.renderer3d.focusedPlayerId
+        );
+        nameEl.textContent = target ? `${target.name}'s Island` : 'Rival Island';
+      }
+    }
+  }
+
+  private toggleOverviewOrReturnHome() {
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
+    this.hideCursorPill();
+
+    const awayFromHome =
+      this.renderer3d.arenaOverviewMode || this.isSpectatingRival();
+    if (awayFromHome && this.localPlayerId) {
+      this.renderer3d.focusOnPlayerIsland(this.localPlayerId);
+    } else {
+      this.renderer3d.focusArenaOverview();
+    }
+
+    this.syncSpectatorStateDOM();
+    this.updateUndoAndToolAvailability();
+    this.updateScoreboardDOM();
+    this.scheduleHudSafeInsetsSync();
+  }
+
+  private syncPeekMazesButton(isPeeking: boolean) {
+    const peekBtn = document.getElementById('btn-peek-mazes');
+    if (!peekBtn) return;
+    peekBtn.innerHTML = isPeeking
+      ? `${icon('eyeOff', 15)}<span>Back to Results</span>`
+      : `${icon('eye', 15)}<span>View Mazes</span>`;
   }
 
   private openHub(
@@ -641,16 +1640,25 @@ class MazingContestClient {
     }
     if (this.roomState) {
       this.syncConfigFormFromSettings(this.roomState.settings);
+      this.updateHubHeroStatus();
     }
     this.dismissAllTransientOverlays();
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
     this.hideCursorPill();
-    this.renderer3d.clearTouchPreview?.();
     document.getElementById('home-hub-modal')?.classList.remove('hidden');
+    this.syncModalOpenState();
     this.send({ type: 'REQUEST_LOBBIES' });
   }
 
   private closeHub() {
+    this.disarmAllButtons();
     document.getElementById('home-hub-modal')?.classList.add('hidden');
+    this.syncModalOpenState();
+    if (this.pendingRoundBrief) {
+      this.triggerRoundBriefBanner();
+    }
+    this.scheduleHudSafeInsetsSync();
   }
 
   private setMobilePlayPane(pane: 'rooms' | 'setup') {
@@ -688,20 +1696,105 @@ class MazingContestClient {
     }
   }
 
+  private updateHubHeroStatus() {
+    const statusEl = document.getElementById('hub-hero-status');
+    const heroPlayBtn = document.getElementById('btn-hero-play');
+    if (!statusEl || !this.roomState) return;
+
+    const rNum = this.roomState.roundConfig.roundNumber;
+    const total = this.roomState.settings?.totalRounds || ROUNDS.length;
+    const phaseDesc =
+      this.roomState.phase === 'BUILD'
+        ? `Round ${rNum}/${total} · Build phase`
+        : this.roomState.phase === 'RUN'
+        ? `Round ${rNum}/${total} · Run in progress`
+        : `Round ${rNum}/${total} · Standings`;
+
+    statusEl.innerHTML = `
+      <span class="status-dot"></span>
+      <span>Room <strong>${escapeHtml(
+        this.roomState.roomCode
+      )}</strong> · ${escapeHtml(phaseDesc)}</span>
+    `;
+
+    if (heroPlayBtn) {
+      const me = this.getLocalPlayer();
+      const label =
+        me && me.towers.length > 0 ? 'Resume Match' : 'Play Now';
+      heroPlayBtn.innerHTML = `${icon('play', 14)}<span>${label}</span>`;
+    }
+  }
+
+  private async shareOrCopyInviteLink() {
+    const shareUrl = `${window.location.origin}/?room=${this.roomCode}`;
+
+    if (
+      document.body.dataset.input === 'touch' &&
+      typeof navigator.share === 'function'
+    ) {
+      try {
+        await navigator.share({
+          title: 'Mazing Contest',
+          text: `Join room ${this.roomCode} in Mazing Contest`,
+          url: shareUrl,
+        });
+        return;
+      } catch (err) {
+        if ((err as Error)?.name === 'AbortError') return;
+      }
+    }
+
+    let copied = false;
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+
+    if (!copied) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = shareUrl;
+        ta.setAttribute('readonly', 'true');
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        copied = document.execCommand('copy');
+        ta.remove();
+      } catch {
+        copied = false;
+      }
+    }
+
+    if (copied) {
+      this.showToast(`Invite link copied (${this.roomCode})`, true);
+    } else {
+      this.showToast(`Room code: ${this.roomCode}`, true);
+    }
+  }
+
   private setupHubEvents() {
     document.getElementById('btn-open-hub')?.addEventListener('click', () => {
+      soundEngine.playUiClick();
       this.openHub('play');
     });
 
     document
       .getElementById('btn-open-leaderboard')
       ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
         this.openHub('leaderboard');
       });
 
     document
       .getElementById('btn-drawer-open-config')
       ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
         this.dismissAllTransientOverlays();
         this.openHub('play', 'setup');
       });
@@ -709,6 +1802,7 @@ class MazingContestClient {
     document
       .getElementById('btn-results-leaderboard')
       ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
         if (this.roomState) {
           this.selectedLeaderboardRound =
             this.roomState.roundConfig.roundNumber;
@@ -718,6 +1812,12 @@ class MazingContestClient {
       });
 
     document.getElementById('btn-close-hub')?.addEventListener('click', () => {
+      soundEngine.playUiClick();
+      this.closeHub();
+    });
+
+    document.getElementById('btn-hero-play')?.addEventListener('click', () => {
+      soundEngine.playUiClick();
       this.closeHub();
     });
 
@@ -732,16 +1832,17 @@ class MazingContestClient {
       .querySelectorAll<HTMLButtonElement>('.hub-tab-btn')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
+          soundEngine.playUiClick();
           const tab = btn.dataset.hubTab as 'play' | 'leaderboard' | 'codex';
           this.switchHubTab(tab);
         });
       });
 
-    // Mobile Sub-Tab Switcher (Active Rooms | Match Setup)
     document
       .querySelectorAll<HTMLButtonElement>('#hub-play-subtabs .subtab-pill')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
+          soundEngine.playUiClick();
           const pane = (btn.dataset.playPane as 'rooms' | 'setup') || 'rooms';
           this.setMobilePlayPane(pane);
         });
@@ -759,7 +1860,11 @@ class MazingContestClient {
       const clean = val.trim().slice(0, 18);
       if (clean) {
         this.playerName = clean;
-        localStorage.setItem('mc2026_player_name', clean);
+        try {
+          localStorage.setItem(NAME_STORAGE_KEY, clean);
+        } catch {
+          // ignore
+        }
         if (hubNameInput) hubNameInput.value = clean;
         if (drawerNameInput) drawerNameInput.value = clean;
         this.send({ type: 'SET_NAME', playerName: clean });
@@ -769,6 +1874,13 @@ class MazingContestClient {
     hubNameInput?.addEventListener('change', () =>
       commitName(hubNameInput.value)
     );
+    hubNameInput?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitName(hubNameInput.value);
+        hubNameInput.blur();
+      }
+    });
 
     // Join by Room Code
     const joinCodeInput = document.getElementById(
@@ -789,7 +1901,9 @@ class MazingContestClient {
         type: 'JOIN_ROOM',
         roomCode: code,
         playerName: this.playerName,
+        sessionId: this.sessionId,
       });
+      if (joinCodeInput) joinCodeInput.value = '';
       this.showToast(`Joined room ${code}`, true);
       this.closeHub();
     };
@@ -803,15 +1917,18 @@ class MazingContestClient {
       }
     });
 
-    // Instant Solo Arena
+    // Solo vs Bots (1-click private match)
     document.getElementById('btn-quick-solo')?.addEventListener('click', () => {
+      soundEngine.playUiClick();
       const soloCode = `SOLO${Math.floor(10 + Math.random() * 89)}`;
+      this.roomCode = soloCode;
       this.send({
         type: 'CREATE_ROOM',
         roomCode: soloCode,
         playerName: this.playerName,
+        sessionId: this.sessionId,
         settings: {
-          roomName: `${this.playerName}'s Sanctum`,
+          roomName: `${this.playerName}'s Island`,
           isPublic: false,
           totalRounds: 8,
           buildTimeSeconds: 0,
@@ -825,38 +1942,49 @@ class MazingContestClient {
       this.closeHub();
     });
 
-    // Restart Match
-    document
-      .getElementById('btn-hub-restart-match')
-      ?.addEventListener('click', () => {
-        this.send({ type: 'RESTART_MATCH' });
-        this.showToast('Match restarted from Round 1', true);
-        this.closeHub();
-      });
+    // Two-Tap Guarded Restart Match
+    const restartBtn = document.getElementById('btn-hub-restart-match');
+    restartBtn?.addEventListener('click', () => {
+      if (!this.canControlRoomRules()) {
+        this.showToast('Only the room host can restart the match.');
+        return;
+      }
+      this.armDestructiveButton(
+        restartBtn,
+        true,
+        'Confirm Restart',
+        'refresh',
+        () => {
+          this.send({ type: 'RESTART_MATCH' });
+          this.showToast('Match restarted at Round 1', true);
+          this.closeHub();
+        }
+      );
+    });
 
-    // Copy Invite URL
+    // Invite Link
     document
       .getElementById('btn-hub-copy-invite')
       ?.addEventListener('click', () => {
-        const shareUrl = `${window.location.origin}/?room=${this.roomCode}`;
-        navigator.clipboard?.writeText(shareUrl).catch(() => {});
-        this.showToast(`Invite link copied (${this.roomCode})`, true);
+        this.shareOrCopyInviteLink();
       });
 
-    // Refresh Public Rooms
+    // Refresh Open Rooms
     document
       .getElementById('btn-refresh-lobbies')
       ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
         this.send({ type: 'REQUEST_LOBBIES' });
         this.fetchInitialHubData();
       });
 
-    // Segmented Controls in Match Setup
+    // Segmented Controls in Room Rules
     document
       .querySelectorAll<HTMLElement>('.match-config-pane .segmented-control')
       .forEach((group) => {
         group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
           btn.addEventListener('click', () => {
+            soundEngine.playUiClick();
             group
               .querySelectorAll<HTMLButtonElement>('.seg-btn')
               .forEach((b) => b.classList.remove('active'));
@@ -865,19 +1993,21 @@ class MazingContestClient {
         });
       });
 
-    // Apply Settings to Current Room
+    // Update Current Room Rules
     document
       .getElementById('btn-apply-room-settings')
       ?.addEventListener('click', () => {
+        if (!this.canControlRoomRules()) {
+          this.showToast('Only the room host can update room rules.');
+          return;
+        }
+        soundEngine.playUiClick();
         const settings = this.readConfigFormSettings();
         this.send({
           type: 'UPDATE_SETTINGS',
           settings,
         });
-        this.showToast(
-          `Updated rules for ${this.roomCode} (${settings.totalRounds} Rounds)`,
-          true
-        );
+        this.showToast(`Updated rules for ${this.roomCode}`, true);
         this.closeHub();
       });
 
@@ -885,12 +2015,15 @@ class MazingContestClient {
     document
       .getElementById('btn-create-custom-room')
       ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
         const settings = this.readConfigFormSettings();
-        const customCode = `CIT${Math.floor(100 + Math.random() * 899)}`;
+        const customCode = `ROOM${Math.floor(100 + Math.random() * 899)}`;
+        this.roomCode = customCode;
         this.send({
           type: 'CREATE_ROOM',
           roomCode: customCode,
           playerName: this.playerName,
+          sessionId: this.sessionId,
           settings,
         });
         this.showToast(`Created room ${customCode}`, true);
@@ -903,6 +2036,7 @@ class MazingContestClient {
       ?.querySelectorAll<HTMLButtonElement>('.seg-btn')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
+          soundEngine.playUiClick();
           lbModeGroup
             .querySelectorAll<HTMLButtonElement>('.seg-btn')
             .forEach((b) => b.classList.remove('active'));
@@ -926,7 +2060,7 @@ class MazingContestClient {
       'cfg-room-name'
     ) as HTMLInputElement | null;
     const roomName =
-      nameInput?.value.trim().slice(0, 26) || `${this.playerName}'s Citadel`;
+      nameInput?.value.trim().slice(0, 26) || `${this.playerName}'s Room`;
 
     return {
       roomName,
@@ -973,7 +2107,19 @@ class MazingContestClient {
     if (fogChk) {
       fogChk.checked = Boolean(settings.fogOfWar);
     }
+
+    const canEditRules = this.canControlRoomRules();
+    const applyBtn = document.getElementById(
+      'btn-apply-room-settings'
+    ) as HTMLButtonElement | null;
+    if (applyBtn) {
+      applyBtn.disabled = !canEditRules;
+    }
   }
+
+  // ==========================================================================
+  // OPEN ROOMS & HEADERED LEADERBOARD RENDERING
+  // ==========================================================================
 
   private renderLobbyBrowser() {
     const listEl = document.getElementById('lobby-browser-list');
@@ -983,7 +2129,7 @@ class MazingContestClient {
 
     const rooms = this.lobbies;
     if (countEl) {
-      countEl.textContent = `${rooms.length} Active`;
+      countEl.textContent = `${rooms.length} Open`;
     }
     if (mobileCountEl) {
       mobileCountEl.textContent = String(rooms.length);
@@ -991,7 +2137,7 @@ class MazingContestClient {
 
     listEl.innerHTML = '';
     if (rooms.length === 0) {
-      listEl.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No public rooms active right now. Create a new room or start Instant Solo.</div>`;
+      listEl.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:12px">No public rooms open right now. Start Solo vs Bots or create a new room.</div>`;
       return;
     }
 
@@ -1005,40 +2151,53 @@ class MazingContestClient {
           ? `Build R${r.currentRound}/${r.totalRounds}`
           : r.phase === 'RUN'
           ? `Run R${r.currentRound}/${r.totalRounds}`
-          : `Results`;
+          : 'Standings';
 
       const paceDesc =
         r.settings.buildTimeSeconds === 999
-          ? 'Relaxed'
+          ? '∞ Timer'
           : r.settings.buildTimeSeconds > 0
-          ? `${r.settings.buildTimeSeconds}s Timer`
-          : 'Standard';
+          ? `${r.settings.buildTimeSeconds}s`
+          : 'Default';
 
-      const fogSuffix = r.settings.fogOfWar ? ' · Fog of War' : '';
-      const subtitleText = `Host: ${escapeHtml(r.hostName)} · ${r.totalRounds} Rounds · ${paceDesc}${fogSuffix}`;
+      const hiddenSuffix = r.settings.fogOfWar ? ' · Hidden Mazes' : '';
+      const subtitleText = `Host: ${escapeHtml(r.hostName)} · ${
+        r.totalRounds
+      } Rounds · ${paceDesc}${hiddenSuffix}`;
 
       card.innerHTML = `
         <div class="lobby-card-main">
           <div class="lobby-card-title-row">
             <span class="lobby-card-name">${escapeHtml(r.roomName)}</span>
             <span class="room-code-badge">${escapeHtml(r.roomCode)}</span>
-            <span class="lobby-phase-dot${r.phase === 'RUN' ? ' running' : ''}">${phaseText}</span>
+            <span class="lobby-phase-dot${
+              r.phase === 'RUN' ? ' running' : ''
+            }">${phaseText}</span>
           </div>
           <div class="lobby-card-subtitle">${subtitleText}</div>
         </div>
         <div class="lobby-card-right">
-          <span class="capacity-pill" title="${r.humanCount} Human · ${r.botCount} AI">
+          <span class="capacity-pill" title="${r.humanCount} Players · ${
+        r.botCount
+      } Bots">
             ${icon('users', 14)}
             <span>${r.playerCount}/${r.maxPlayers}</span>
           </span>
-          <button type="button" class="hub-action-pill ${isCurrent ? 'sage' : 'gold'}">
-            ${isCurrent ? `${icon('check', 14)}<span>Active</span>` : `<span>Join</span>`}
+          <button type="button" class="hub-action-pill ${
+            isCurrent ? 'sage' : 'gold'
+          }">
+            ${
+              isCurrent
+                ? `${icon('check', 14)}<span>Active</span>`
+                : `<span>Join</span>`
+            }
           </button>
         </div>
       `;
 
       const btn = card.querySelector('button')!;
       btn.addEventListener('click', () => {
+        soundEngine.playUiClick();
         if (isCurrent) {
           this.closeHub();
         } else {
@@ -1047,6 +2206,7 @@ class MazingContestClient {
             type: 'JOIN_ROOM',
             roomCode: r.roomCode,
             playerName: this.playerName,
+            sessionId: this.sessionId,
           });
           this.showToast(`Joined ${r.roomName} (${r.roomCode})`, true);
           this.closeHub();
@@ -1076,6 +2236,7 @@ class MazingContestClient {
       )}`;
       btn.title = `Round ${r.roundNumber}: ${r.title} (${arch.name})`;
       btn.addEventListener('click', () => {
+        soundEngine.playUiClick();
         this.selectedLeaderboardRound = r.roundNumber;
         this.renderLeaderboard();
       });
@@ -1089,6 +2250,13 @@ class MazingContestClient {
     const tableWrap = document.getElementById('leaderboard-table-wrap');
     if (!tableWrap || !metaEl) return;
 
+    const lbModeGroup = document.getElementById('leaderboard-mode-group');
+    lbModeGroup
+      ?.querySelectorAll<HTMLButtonElement>('.seg-btn')
+      .forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.lbMode === this.leaderboardMode);
+      });
+
     pillsWrap
       ?.querySelectorAll<HTMLButtonElement>('.lb-round-pill')
       .forEach((btn) => {
@@ -1099,11 +2267,12 @@ class MazingContestClient {
       });
 
     if (!this.leaderboard) {
-      tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">Loading Hall of Fame...</div>`;
+      tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">Loading leaderboard...</div>`;
       return;
     }
 
     tableWrap.innerHTML = '';
+    const myLower = this.playerName.trim().toLowerCase();
 
     if (this.leaderboardMode === 'rounds') {
       pillsWrap?.classList.remove('hidden');
@@ -1114,11 +2283,13 @@ class MazingContestClient {
 
       metaEl.innerHTML = `
         <div class="lb-meta-main">
-          <strong>Round ${roundCfg.roundNumber}: ${escapeHtml(roundCfg.title)}</strong>
+          <strong>Round ${roundCfg.roundNumber} · ${escapeHtml(
+        roundCfg.title
+      )}</strong>
           <span class="lb-meta-trait">${getRunnerIcon(
             roundCfg.runnerType || 'SCOUT',
             14
-          )} ${escapeHtml(arch.name)} — ${escapeHtml(arch.traitSummary)}</span>
+          )} ${escapeHtml(arch.name)} · ${escapeHtml(arch.traitSummary)}</span>
         </div>
         <div class="par-pill">
           ${icon('starFilled', 11)}
@@ -1129,14 +2300,27 @@ class MazingContestClient {
       const records =
         this.leaderboard.roundRecords[this.selectedLeaderboardRound] || [];
       if (records.length === 0) {
-        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No survival records yet for Round ${this.selectedLeaderboardRound}. Complete a run to claim 1st place!</div>`;
+        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No survival records yet for Round ${this.selectedLeaderboardRound}. Complete a run to set the first record.</div>`;
         return;
       }
+
+      const head = document.createElement('div');
+      head.className = 'lb-table-head';
+      head.innerHTML = `
+        <div>Rank</div>
+        <div>Player</div>
+        <div>Survival</div>
+        <div class="lb-synergies">Maze Stats</div>
+        <div class="lb-meta-right">Supply</div>
+      `;
+      tableWrap.appendChild(head);
 
       records.forEach((rec, idx) => {
         const row = document.createElement('div');
         const rankClass = idx < 3 ? ` rank-${idx + 1}` : '';
-        row.className = `lb-row${rankClass}`;
+        const isMe = rec.playerName.trim().toLowerCase() === myLower;
+        row.className = `lb-row${rankClass}${isMe ? ' is-me' : ''}`;
+
         const rankBadge =
           idx < 3
             ? getMedalBadge((idx + 1) as 1 | 2 | 3, 22)
@@ -1144,25 +2328,38 @@ class MazingContestClient {
         const parBadge = rec.beatPar
           ? `<span class="par-pill">${icon('starFilled', 10)}<span>Par</span></span>`
           : '';
+        const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
 
         row.innerHTML = `
           <div class="lb-rank">${rankBadge}</div>
           <div class="lb-architect">
-            <span class="player-swatch" style="background:${escapeHtml(rec.playerColor)}"></span>
+            <span class="player-swatch" style="background:${escapeHtml(
+              rec.playerColor
+            )}"></span>
             <span>${escapeHtml(rec.playerName)}</span>
+            ${youBadge}
           </div>
           <div class="lb-time-primary">
             <span>${rec.survivalTimeSeconds.toFixed(2)}s</span>
             ${parBadge}
           </div>
           <div class="lb-synergies">
-            <span class="stat-chip" title="Spire Hits">${icon('bolt', 12)} ${rec.clapsTaken}</span>
-            <span class="stat-chip" title="Overcharge Stars">${icon('starFilled', 11)} ${rec.overchargedSpires}</span>
-            <span class="stat-chip" title="Linked Keeps">${icon('keep', 12)} ${rec.linkedKeeps}</span>
-            <span class="stat-chip" title="Path Length">${rec.pathDistance.toFixed(0)}m</span>
+            <span class="stat-chip" title="Spire Pulses">${icon('bolt', 12)} ${
+          rec.clapsTaken
+        }</span>
+            <span class="stat-chip" title="Overcharge Diamonds">${icon(
+              'diamondFilled',
+              11
+            )} ${rec.overchargedSpires}</span>
+            <span class="stat-chip" title="Linked Keeps">${icon('keep', 12)} ${
+          rec.linkedKeeps
+        }</span>
+            <span class="stat-chip" title="Path Length">${rec.pathDistance.toFixed(
+              0
+            )}m</span>
           </div>
           <div class="lb-meta-right">
-            ${escapeHtml(rec.roomCode)} · ${Math.round((rec.goldMultiplier || 1) * 100)}%
+            ${formatWallSupplyLabel(rec.goldMultiplier)}
           </div>
         `;
         tableWrap.appendChild(row);
@@ -1172,44 +2369,64 @@ class MazingContestClient {
       metaEl.innerHTML = `
         <div class="lb-meta-main">
           ${icon('crown', 16)}
-          <strong>Citadel Career Champions</strong>
-          <span class="lb-meta-trait">Ranked by total points, match victories &amp; Par stars</span>
+          <strong>Top Players</strong>
+          <span class="lb-meta-trait">Ranked by total points, match wins, and Par stars</span>
         </div>
         <div class="meta-pill">All-Time</div>
       `;
 
       const champs = this.leaderboard.champions || [];
       if (champs.length === 0) {
-        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">Complete a full match to crown the first Citadel Champion!</div>`;
+        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">Complete a full match to claim the top spot on the leaderboard.</div>`;
         return;
       }
+
+      const head = document.createElement('div');
+      head.className = 'lb-table-head';
+      head.innerHTML = `
+        <div>Rank</div>
+        <div>Player</div>
+        <div>Points</div>
+        <div class="lb-synergies">Highlights</div>
+        <div class="lb-meta-right">Best Run</div>
+      `;
+      tableWrap.appendChild(head);
 
       champs.forEach((c, idx) => {
         const row = document.createElement('div');
         const rankClass = idx < 3 ? ` rank-${idx + 1}` : '';
-        row.className = `lb-row${rankClass}`;
+        const isMe = c.playerName.trim().toLowerCase() === myLower;
+        row.className = `lb-row${rankClass}${isMe ? ' is-me' : ''}`;
+
         const rankBadge =
           idx < 3
             ? getMedalBadge((idx + 1) as 1 | 2 | 3, 22)
             : `<span>#${idx + 1}</span>`;
+        const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
 
         row.innerHTML = `
           <div class="lb-rank">${rankBadge}</div>
           <div class="lb-architect">
-            <span class="player-swatch" style="background:${escapeHtml(c.playerColor)}"></span>
+            <span class="player-swatch" style="background:${escapeHtml(
+              c.playerColor
+            )}"></span>
             <span>${escapeHtml(c.playerName)}</span>
+            ${youBadge}
           </div>
           <div class="lb-time-primary" style="color:var(--accent-sage)">
             <span>${c.totalCareerPoints} pts</span>
           </div>
           <div class="lb-synergies">
-            <span class="stat-chip">${icon('trophy', 12)} ${c.matchesWon} Wins</span>
-            <span class="stat-chip">${icon('starFilled', 11)} ${c.parStarsEarned} Par</span>
+            <span class="stat-chip">${icon('trophy', 12)} ${
+          c.matchesWon
+        } Wins</span>
+            <span class="stat-chip">${icon('starFilled', 11)} ${
+          c.parStarsEarned
+        } Par</span>
             <span class="stat-chip">${c.roundsPlayed} Rounds</span>
-            <span class="stat-chip">${icon('clock', 12)} ${c.bestSurvivalTime.toFixed(1)}s (R${c.bestRoundNumber})</span>
           </div>
           <div class="lb-meta-right">
-            Architect
+            ${c.bestSurvivalTime.toFixed(1)}s · R${c.bestRoundNumber}
           </div>
         `;
         tableWrap.appendChild(row);
@@ -1217,22 +2434,40 @@ class MazingContestClient {
     }
   }
 
+  // ==========================================================================
+  // IN-GAME HUD, DOCK, POPOVER & KEYBOARD EVENTS
+  // ==========================================================================
+
   private setupUIEvents() {
-    // Bottom Build / Reclaim Tools
+    // Round Strategy Brief Dismiss
     document
-      .querySelectorAll<HTMLButtonElement>('.dock-tool-btn')
+      .getElementById('btn-dismiss-brief')
+      ?.addEventListener('click', () => {
+        this.dismissRoundBrief();
+      });
+
+    // Bottom Dock Build / Remove / Pan Tools
+    document
+      .querySelectorAll<HTMLButtonElement>('#tower-buttons .dock-tool-btn')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
-          const tool = btn.dataset.tool as 'BLOCK' | 'SELL';
+          const tool = (btn.dataset.tool as ActiveBuildTool) || 'BLOCK';
+          soundEngine.playUiClick();
           this.selectTool(tool);
         });
       });
+
+    // Undo Button
+    document.getElementById('btn-undo')?.addEventListener('click', () => {
+      this.performUndo();
+    });
 
     // Bottom Progressive-Disclosure Tools Popover
     const dockToolsBtn = document.getElementById('btn-dock-tools')!;
     const dockToolsPopover = document.getElementById('dock-tools-popover')!;
     dockToolsBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      soundEngine.playUiClick();
       const willOpen = dockToolsPopover.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
@@ -1246,6 +2481,7 @@ class MazingContestClient {
     const standingsDropdown = document.getElementById('standings-dropdown')!;
     standingsBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      soundEngine.playUiClick();
       const willOpen = standingsDropdown.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
@@ -1254,11 +2490,12 @@ class MazingContestClient {
       }
     });
 
-    // Round Selector Popover
+    // Round Inspect & Switcher Popover
     const roundDropdown = document.getElementById('round-dropdown')!;
     const roundPickerBtn = document.getElementById('btn-round-picker')!;
     roundPickerBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      soundEngine.playUiClick();
       const willOpen = roundDropdown.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
@@ -1266,11 +2503,12 @@ class MazingContestClient {
       }
     });
 
-    // Room & Chat Slide-Over Drawer
+    // Room & Chat Slide-Over Drawer / Mobile Sheet
     const lobbyDrawer = document.getElementById('lobby-drawer')!;
     const lobbyToggleBtn = document.getElementById('btn-toggle-lobby')!;
     lobbyToggleBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      soundEngine.playUiClick();
       const willOpen = lobbyDrawer.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
@@ -1282,13 +2520,17 @@ class MazingContestClient {
     document
       .getElementById('btn-close-lobby')
       ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
         lobbyDrawer.classList.add('hidden');
         lobbyToggleBtn.classList.remove('active');
       });
 
-    // Global Outside-Click Dismissal for Popovers & Drawers
+    // Global Outside-Click Dismissal for Popovers & Armed Buttons
     window.addEventListener('click', (e) => {
       const target = e.target as HTMLElement;
+      if (!target.closest('[data-armed="true"]')) {
+        this.disarmAllButtons();
+      }
       if (!target.closest('.round-selector-wrap')) {
         roundDropdown.classList.add('hidden');
       }
@@ -1309,175 +2551,413 @@ class MazingContestClient {
       }
     });
 
-    // Desktop Keyboard Shortcuts (WASD free for camera pan; Q = Build, E / X = Reclaim)
+    // Modal-Guarded Desktop Keyboard Shortcuts
     window.addEventListener('keydown', (e) => {
-      if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
-      const key = e.key.toUpperCase();
-      if (key === 'Q' || key === 'B') this.selectTool('BLOCK');
-      else if (key === 'E' || key === 'X') this.selectTool('SELL');
-      else if (key === 'H') this.openHub('play');
-      else if (key === 'L') this.openHub('leaderboard');
-      else if (e.code === 'Escape') {
+      const activeEl = e.target as HTMLElement | null;
+      const tag = activeEl?.tagName;
+      if (
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT' ||
+        activeEl?.isContentEditable
+      ) {
+        if (e.code === 'Escape') {
+          activeEl?.blur();
+        }
+        return;
+      }
+
+      if (e.code === 'Escape') {
+        const resultsModal = document.getElementById('results-modal');
+        if (
+          resultsModal &&
+          !resultsModal.classList.contains('hidden') &&
+          resultsModal.classList.contains('peek-minimized')
+        ) {
+          resultsModal.classList.remove('peek-minimized');
+          this.syncPeekMazesButton(false);
+          this.syncModalOpenState();
+          return;
+        }
         this.dismissAllTransientOverlays();
         document.getElementById('help-modal')?.classList.add('hidden');
-        this.renderer3d.clearTouchPreview?.();
+        this.renderer3d.cancelTouchGhost();
+        this.hideTouchPrecisionTray();
         this.hideCursorPill();
         this.closeHub();
-      } else if (e.code === 'Space') {
-        const hubOpen = !document
-          .getElementById('home-hub-modal')
-          ?.classList.contains('hidden');
-        if (!hubOpen) {
+        return;
+      }
+
+      // Results Modal Shortcuts (Space / Enter -> Next Round)
+      if (this.isResultsBlocking()) {
+        if (e.code === 'Space' || e.code === 'Enter') {
           e.preventDefault();
-          this.send({ type: 'TOGGLE_READY' });
+          document.getElementById('btn-next-round')?.click();
+        } else if (e.key.toUpperCase() === 'L') {
+          this.openHub('leaderboard');
+        }
+        return;
+      }
+
+      // Suppress arena hotkeys while Hub or Guide modal is open
+      if (this.isHubOpen() || this.isHelpOpen()) {
+        return;
+      }
+
+      const key = e.key.toUpperCase();
+
+      if ((e.ctrlKey || e.metaKey) && key === 'Z') {
+        e.preventDefault();
+        this.performUndo();
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      if (key === 'Z') {
+        e.preventDefault();
+        this.performUndo();
+      } else if (key === 'Q' || key === 'B') {
+        this.selectTool('BLOCK');
+      } else if (key === 'X' || key === 'E') {
+        this.selectTool('SELL');
+      } else if (key === 'R') {
+        this.renderer3d.resetCameraView();
+        this.updateScoreboardDOM();
+      } else if (key === 'M') {
+        soundEngine.toggleMuted();
+        this.syncAudioMuteButtons();
+      } else if (key === 'C') {
+        document.getElementById('btn-toggle-lobby')?.click();
+      } else if (e.key === '?') {
+        document.getElementById('btn-help')?.click();
+      } else if (key === 'H') {
+        this.openHub('play');
+      } else if (key === 'L') {
+        this.openHub('leaderboard');
+      } else if (e.code === 'Space') {
+        e.preventDefault();
+        if (this.roomState?.phase === 'BUILD') {
+          document.getElementById('btn-ready-lock')?.click();
+        } else if (
+          this.roomState?.phase === 'ROUND_RESULTS' ||
+          this.roomState?.phase === 'GAME_OVER'
+        ) {
+          document.getElementById('btn-next-round')?.click();
         }
       } else if (key === '0' || e.code === 'Tab') {
         e.preventDefault();
-        if (this.renderer3d.arenaOverviewMode && this.localPlayerId) {
-          this.renderer3d.focusOnPlayerIsland(this.localPlayerId);
-        } else {
-          this.renderer3d.focusArenaOverview();
-        }
-        this.updateScoreboardDOM();
+        this.toggleOverviewOrReturnHome();
       } else if (['1', '2', '3', '4', '5', '6'].includes(key)) {
         const idx = Number(key) - 1;
-        const target = this.roomState?.players[idx];
-        if (target) {
-          this.renderer3d.focusOnPlayerIsland(target.id);
+        const targetId =
+          this.sortedStandingsIds[idx] || this.roomState?.players[idx]?.id;
+        if (targetId) {
+          this.renderer3d.cancelTouchGhost();
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          this.renderer3d.focusOnPlayerIsland(targetId);
+          this.syncSpectatorStateDOM();
+          this.updateUndoAndToolAvailability();
           this.updateScoreboardDOM();
+          this.scheduleHudSafeInsetsSync();
         }
       }
     });
 
+    // Playback Speed Controls (Both Top Bar & Mobile #hud-run-dock)
     document
       .querySelectorAll<HTMLButtonElement>('.speed-btn')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
+          soundEngine.playUiClick();
           const spd = Number(btn.dataset.speed) as 1 | 2 | 4;
           this.send({ type: 'SET_SIM_SPEED', speed: spd });
         });
       });
 
-    document.getElementById('btn-reroll-map')?.addEventListener('click', () => {
-      soundEngine.playCheckpoint();
-      this.renderer3d.clearTouchPreview?.();
-      this.hideCursorPill();
-      this.hideTransientPopovers();
-      this.send({ type: 'REROLL_MAP' });
+    // Clear All (2-Tap Guarded + Undoable via BATCH_REPLACE)
+    const clearMazeBtn = document.getElementById('btn-clear-maze');
+    clearMazeBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const me = this.getLocalPlayer();
+      if (!me || me.towers.length === 0 || this.roomState?.phase !== 'BUILD') {
+        return;
+      }
+      this.armDestructiveButton(
+        clearMazeBtn,
+        true,
+        'Confirm Clear',
+        'trash',
+        () => {
+          const previousTowers = me.towers.map((t) => ({ x: t.x, y: t.y }));
+          this.pushUndo({ kind: 'BATCH_REPLACE', previousTowers });
+
+          me.towers = [];
+          me.gold = this.roomState!.roundConfig.startingGold;
+          me.usedSampleMaze = false;
+          me.ready = false;
+
+          this.renderer3d.cancelTouchGhost();
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          this.hideTransientPopovers();
+
+          this.renderer3d.syncRoomState(this.roomState!, this.localPlayerId);
+          const evalRes = this.renderer3d.getLocalMazeEval();
+          if (evalRes) {
+            me.pathDistance = Number(evalRes.distance.toFixed(1));
+          }
+
+          soundEngine.playSell();
+          soundEngine.haptic('sell');
+          this.updateUndoAndToolAvailability();
+          this.updateTopBarAndResources();
+          this.updateScoreboardDOM();
+          this.showToast('Cleared walls. Press Undo to restore.', true);
+          this.send({ type: 'CLEAR_TOWERS' });
+        }
+      );
     });
 
-    document
-      .getElementById('btn-demo-layout')
-      ?.addEventListener('click', () => {
-        soundEngine.playBuild('THUNDERCLAP');
-        this.renderer3d.clearTouchPreview?.();
-        this.hideCursorPill();
-        this.hideTransientPopovers();
-        this.send({ type: 'LOAD_PRESET_DEMO' });
-      });
+    // New Map (2-Tap Guarded)
+    const rerollBtn = document.getElementById('btn-reroll-map');
+    rerollBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!this.canControlRoomRules()) {
+        this.showToast('Only the room host can generate a new map.');
+        return;
+      }
+      this.armDestructiveButton(
+        rerollBtn,
+        true,
+        'Confirm New Map',
+        'dice',
+        () => {
+          soundEngine.playCheckpoint();
+          this.renderer3d.cancelTouchGhost();
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          this.hideTransientPopovers();
+          this.send({ type: 'REROLL_MAP' });
+        }
+      );
+    });
 
+    // Sample Maze (2-Tap Guarded When Walls Exist + Undoable)
+    const sampleBtn = document.getElementById('btn-demo-layout');
+    sampleBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const me = this.getLocalPlayer();
+      if (!me || this.roomState?.phase !== 'BUILD') return;
+
+      const hasWalls = me.towers.length > 0;
+      this.armDestructiveButton(
+        sampleBtn,
+        hasWalls,
+        'Replace Walls?',
+        'wand',
+        () => {
+          const previousTowers = me.towers.map((t) => ({ x: t.x, y: t.y }));
+          this.pushUndo({ kind: 'BATCH_REPLACE', previousTowers });
+
+          soundEngine.playBuild('SAMPLE', 0);
+          soundEngine.haptic('build');
+          this.renderer3d.cancelTouchGhost();
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          this.hideTransientPopovers();
+          this.updateUndoAndToolAvailability();
+          this.send({ type: 'LOAD_PRESET_DEMO' });
+        }
+      );
+    });
+
+    // Reset Camera View
     document
       .getElementById('btn-reset-camera')
       ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
         this.hideTransientPopovers();
-        if (typeof this.renderer3d.resetCameraView === 'function') {
-          this.renderer3d.resetCameraView();
-        } else if (this.localPlayerId) {
+        if (this.localPlayerId) {
           this.renderer3d.focusOnPlayerIsland(this.localPlayerId);
+        } else {
+          this.renderer3d.resetCameraView();
         }
+        this.syncSpectatorStateDOM();
+        this.updateUndoAndToolAvailability();
         this.updateScoreboardDOM();
       });
 
-    document.getElementById('btn-clear-maze')?.addEventListener('click', () => {
-      soundEngine.playSell();
-      this.renderer3d.clearTouchPreview?.();
-      this.hideCursorPill();
-      this.hideTransientPopovers();
-      this.send({ type: 'CLEAR_TOWERS' });
+    // Ready / Start Button (2-Tap Guarded on 0-Wall Solo Start)
+    const readyBtn = document.getElementById('btn-ready-lock');
+    readyBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const me = this.getLocalPlayer();
+      if (!me || this.roomState?.phase !== 'BUILD') return;
+
+      const isEmptySoloStart =
+        !me.ready && me.towers.length === 0 && this.getHumanCount() <= 1;
+
+      this.armDestructiveButton(
+        readyBtn,
+        isEmptySoloStart,
+        'Start Empty?',
+        'play',
+        () => {
+          const nextReady = !me.ready;
+          me.ready = nextReady;
+          soundEngine.playReady(nextReady);
+          soundEngine.haptic('ready');
+          this.renderer3d.cancelTouchGhost();
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          this.hideTransientPopovers();
+          this.updateTopBarAndResources();
+          this.updateScoreboardDOM();
+          this.send({ type: 'TOGGLE_READY' });
+        }
+      );
     });
 
-    document.getElementById('btn-ready-lock')?.addEventListener('click', () => {
-      this.renderer3d.clearTouchPreview?.();
-      this.hideCursorPill();
-      this.hideTransientPopovers();
-      this.send({ type: 'TOGGLE_READY' });
-    });
+    // Spectator Return to My Island
+    document
+      .getElementById('btn-return-my-island')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        if (this.localPlayerId) {
+          this.renderer3d.focusOnPlayerIsland(this.localPlayerId);
+          this.syncSpectatorStateDOM();
+          this.updateUndoAndToolAvailability();
+          this.updateScoreboardDOM();
+          this.scheduleHudSafeInsetsSync();
+        }
+      });
 
-    document.getElementById('btn-next-round')?.addEventListener('click', () => {
-      this.send({ type: 'NEXT_ROUND' });
-    });
-
+    // Top Overview & Mobile Run Dock Overview Toggles
     document
       .getElementById('btn-camera-overview')
       ?.addEventListener('click', () => {
-        this.renderer3d.clearTouchPreview?.();
-        this.hideCursorPill();
-        if (this.renderer3d.arenaOverviewMode && this.localPlayerId) {
-          this.renderer3d.focusOnPlayerIsland(this.localPlayerId);
-        } else {
-          this.renderer3d.focusArenaOverview();
-        }
-        this.updateScoreboardDOM();
+        soundEngine.playUiClick();
+        this.toggleOverviewOrReturnHome();
       });
 
-    const toggleMute = () => {
-      soundEngine.muted = !soundEngine.muted;
+    document
+      .getElementById('btn-run-overview-toggle')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.toggleOverviewOrReturnHome();
+      });
+
+    // Results Modal: View Mazes Peek Toggle & Next Round
+    document
+      .getElementById('btn-peek-mazes')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        const resultsModal = document.getElementById('results-modal');
+        if (!resultsModal) return;
+        const isPeeking = resultsModal.classList.toggle('peek-minimized');
+        this.syncPeekMazesButton(isPeeking);
+        this.syncModalOpenState();
+      });
+
+    document.getElementById('btn-next-round')?.addEventListener('click', () => {
+      soundEngine.playUiClick();
+      if (!this.canControlRoomRules()) {
+        this.showToast('Waiting for room host or auto-advance timer.');
+        return;
+      }
+      this.send({ type: 'NEXT_ROUND' });
+    });
+
+    // Audio Mute Toggles
+    const handleToggleMute = () => {
+      soundEngine.toggleMuted();
       this.syncAudioMuteButtons();
     };
-    document.getElementById('btn-mute')?.addEventListener('click', toggleMute);
+    document
+      .getElementById('btn-mute')
+      ?.addEventListener('click', handleToggleMute);
     document
       .getElementById('btn-drawer-mute')
-      ?.addEventListener('click', toggleMute);
+      ?.addEventListener('click', handleToggleMute);
 
+    // Quick Guide Modal
     const helpModal = document.getElementById('help-modal')!;
+    const closeHelp = () => {
+      helpModal.classList.add('hidden');
+      this.syncModalOpenState();
+    };
     document.getElementById('btn-help')?.addEventListener('click', () => {
+      soundEngine.playUiClick();
       this.dismissAllTransientOverlays();
+      this.renderer3d.cancelTouchGhost();
+      this.hideTouchPrecisionTray();
       this.hideCursorPill();
       helpModal.classList.remove('hidden');
-    });
-    document.getElementById('btn-close-help')?.addEventListener('click', () => {
-      helpModal.classList.add('hidden');
+      this.syncModalOpenState();
     });
     document
+      .getElementById('btn-close-help')
+      ?.addEventListener('click', closeHelp);
+    document
       .getElementById('btn-close-help-x')
-      ?.addEventListener('click', () => {
-        helpModal.classList.add('hidden');
-      });
+      ?.addEventListener('click', closeHelp);
     helpModal.addEventListener('click', (e) => {
       if (e.target === helpModal) {
-        helpModal.classList.add('hidden');
+        closeHelp();
       }
     });
 
+    // Room Drawer Controls
     const nameInput = document.getElementById(
       'player-name-input'
     ) as HTMLInputElement | null;
-    nameInput?.addEventListener('change', () => {
-      const val = nameInput.value.trim().slice(0, 18);
+    const commitDrawerName = () => {
+      const val = (nameInput?.value || '').trim().slice(0, 18);
       if (val) {
         this.playerName = val;
-        localStorage.setItem('mc2026_player_name', val);
+        try {
+          localStorage.setItem(NAME_STORAGE_KEY, val);
+        } catch {
+          // ignore
+        }
         const hubName = document.getElementById(
           'hub-player-name-input'
         ) as HTMLInputElement | null;
         if (hubName) hubName.value = val;
         this.send({ type: 'SET_NAME', playerName: val });
       }
+    };
+    nameInput?.addEventListener('change', commitDrawerName);
+    nameInput?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        commitDrawerName();
+        nameInput.blur();
+      }
     });
 
     document
       .getElementById('btn-copy-invite')
       ?.addEventListener('click', () => {
-        const shareUrl = `${window.location.origin}/?room=${this.roomCode}`;
-        navigator.clipboard?.writeText(shareUrl).catch(() => {});
-        this.showToast(`Invite link copied (${this.roomCode})`, true);
+        this.shareOrCopyInviteLink();
       });
 
     document.getElementById('btn-add-bot')?.addEventListener('click', () => {
+      if (!this.canControlRoomRules()) {
+        this.showToast('Only the room host can add bots.');
+        return;
+      }
+      soundEngine.playUiClick();
       this.send({ type: 'ADD_BOT' });
     });
 
     document.getElementById('btn-remove-bot')?.addEventListener('click', () => {
+      if (!this.canControlRoomRules()) {
+        this.showToast('Only the room host can remove bots.');
+        return;
+      }
+      soundEngine.playUiClick();
       this.send({ type: 'REMOVE_BOT' });
     });
 
@@ -1485,6 +2965,12 @@ class MazingContestClient {
       'chk-fog'
     ) as HTMLInputElement | null;
     fogChk?.addEventListener('change', () => {
+      if (!this.canControlRoomRules()) {
+        fogChk.checked = Boolean(this.roomState?.settings?.fogOfWar);
+        this.showToast('Only the room host can change rival visibility.');
+        return;
+      }
+      soundEngine.playUiClick();
       this.send({
         type: 'UPDATE_SETTINGS',
         settings: { fogOfWar: fogChk.checked },
@@ -1508,20 +2994,24 @@ class MazingContestClient {
     });
   }
 
-  private selectTool(tool: 'BLOCK' | 'SELL') {
+  private selectTool(tool: ActiveBuildTool) {
     this.renderer3d.activeTool = tool;
-    this.renderer3d.clearTouchPreview?.();
-    this.hideCursorPill();
+    if (tool === 'PAN') {
+      this.renderer3d.cancelTouchGhost();
+      this.hideTouchPrecisionTray();
+      this.hideCursorPill();
+    }
     document
-      .querySelectorAll<HTMLButtonElement>('.dock-tool-btn')
-      .forEach((c) => {
-        c.classList.toggle('active', c.dataset.tool === tool);
+      .querySelectorAll<HTMLButtonElement>('#tower-buttons .dock-tool-btn')
+      .forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.tool === tool);
       });
   }
 
   private renderRoundSelectorPills() {
     const container = document.getElementById('round-pills')!;
     container.innerHTML = '';
+
     ROUNDS.forEach((r, idx) => {
       const btn = document.createElement('button');
       btn.type = 'button';
@@ -1537,29 +3027,78 @@ class MazingContestClient {
           14
         )}</span>
       `;
-      btn.title = `${r.subtitle} (${arch.name}: ${arch.traitSummary}) — ${r.hint}`;
-      btn.addEventListener('click', () => {
-        this.send({ type: 'JUMP_TO_ROUND', roundIndex: idx });
-        document.getElementById('round-dropdown')?.classList.add('hidden');
+      btn.title = `${r.title} (${arch.name}: ${arch.traitSummary})`;
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (this.roomState?.currentRoundIndex === idx) {
+          document.getElementById('round-dropdown')?.classList.add('hidden');
+          return;
+        }
+        if (!this.canControlRoomRules()) {
+          this.showToast('Only the room host can switch rounds.');
+          return;
+        }
+        const me = this.getLocalPlayer();
+        const hasWalls = Boolean(
+          this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
+        );
+        this.armDestructiveButton(
+          btn,
+          hasWalls,
+          `Switch to R${r.roundNumber}?`,
+          'arrowRight',
+          () => {
+            this.send({ type: 'JUMP_TO_ROUND', roundIndex: idx });
+            document.getElementById('round-dropdown')?.classList.add('hidden');
+          }
+        );
       });
       container.appendChild(btn);
     });
   }
 
+  // ==========================================================================
+  // TOP BAR, STANDINGS, RESULTS MODAL & CHAT DOM UPDATES
+  // ==========================================================================
+
   private updateTopBarAndResources() {
     if (!this.roomState) return;
     const round = this.roomState.roundConfig;
-    const arch = RUNNER_ARCHETYPES[round.runnerType || 'SCOUT'];
+    const archKey = round.runnerType || 'SCOUT';
+    const arch = RUNNER_ARCHETYPES[archKey];
     const totalRounds = this.roomState.settings?.totalRounds || ROUNDS.length;
+    const effectivePar = round.parTimeSeconds;
 
     document.getElementById('round-code-label')!.textContent =
       `R${round.roundNumber}/${totalRounds}`;
     document.getElementById('round-subtitle')!.textContent = round.title;
     document.getElementById('btn-round-picker')!.title =
-      `Round ${round.roundNumber}: ${round.title} — Runner: ${arch.name} (${arch.traitSummary})`;
+      `Round ${round.roundNumber}: ${round.title} · ${arch.name} (${arch.traitSummary})`;
+
+    const runnerBadge = document.getElementById('round-runner-badge');
+    if (runnerBadge) {
+      runnerBadge.innerHTML = getRunnerIcon(archKey, 13);
+      runnerBadge.title = `${arch.name}: ${arch.traitSummary}`;
+    }
+
+    // Populate Round Inspect Header inside #round-dropdown
+    const inspectTitle = document.getElementById('round-inspect-title');
+    if (inspectTitle) {
+      inspectTitle.textContent = `Round ${round.roundNumber} · ${round.title}`;
+    }
+    const inspectRunner = document.getElementById('round-inspect-runner');
+    if (inspectRunner) {
+      inspectRunner.innerHTML = `${getRunnerIcon(archKey, 14)}<span>${escapeHtml(
+        arch.name
+      )} · ${escapeHtml(arch.traitSummary)}</span>`;
+    }
+    const inspectHint = document.getElementById('round-inspect-hint');
+    if (inspectHint) {
+      inspectHint.textContent = round.hint;
+    }
+
     document.getElementById('room-code-badge')!.textContent =
       this.roomState.roomCode;
-
     const hubRoomBadge = document.getElementById('hub-active-room-badge');
     if (hubRoomBadge) {
       hubRoomBadge.textContent = this.roomState.roomCode;
@@ -1585,12 +3124,11 @@ class MazingContestClient {
     if (chronoCount > 0)
       featureParts.push(`${chronoCount} ${icon('chrono', 12)}`);
     featureParts.push(`${round.obstacles.length} ${icon('keep', 12)}`);
-    featureParts.push(
-      `${getRunnerIcon(round.runnerType || 'SCOUT', 12)} ${escapeHtml(arch.name)}`
-    );
 
-    document.getElementById('map-features-summary')!.innerHTML =
-      featureParts.join(' · ');
+    const featuresEl = document.getElementById('map-features-summary');
+    if (featuresEl) {
+      featuresEl.innerHTML = featureParts.join(' · ');
+    }
 
     const phaseDot = document.getElementById('phase-dot')!;
     const phaseLabel = document.getElementById('phase-label')!;
@@ -1607,11 +3145,11 @@ class MazingContestClient {
     } else {
       phaseDot.className = 'phase-dot build';
       phaseLabel.textContent =
-        this.roomState.phase === 'GAME_OVER' ? 'FINAL' : 'RESULTS';
+        this.roomState.phase === 'GAME_OVER' ? 'FINAL' : 'STANDINGS';
       speedControls.classList.add('hidden');
     }
 
-    this.updateTimerDOM();
+    this.updateTimerDOM(false);
 
     document.querySelectorAll<HTMLButtonElement>('.speed-btn').forEach((b) => {
       b.classList.toggle(
@@ -1620,15 +3158,15 @@ class MazingContestClient {
       );
     });
 
-    const me = this.roomState.players.find((p) => p.id === this.localPlayerId);
+    const me = this.getLocalPlayer();
     if (me) {
       const wallsLeft = Math.floor(me.gold / TOWER_SPECS.BLOCK.goldCost);
-      const goldEl = document.getElementById('gold-value')!;
-      goldEl.textContent = `${wallsLeft}`;
-      goldEl.style.color =
-        wallsLeft === 0 ? 'var(--accent-coral)' : 'var(--text-primary)';
-      document.getElementById('walls-chip')!.title =
-        `${wallsLeft} Stone Pillars remaining (100% Pillar Refund on Reclaim)`;
+
+      // Optional legacy #gold-value / #walls-chip null-safe support
+      const goldEl = document.getElementById('gold-value');
+      if (goldEl) {
+        goldEl.textContent = `${wallsLeft}`;
+      }
 
       const dockBadge = document.getElementById('dock-pillars-badge');
       if (dockBadge) {
@@ -1636,30 +3174,44 @@ class MazingContestClient {
         dockBadge.classList.toggle('empty', wallsLeft === 0);
       }
 
-      const evalRun = evaluateMazeRunTime(round, me.towers);
-      const estEl = document.getElementById('est-time-value')!;
-      estEl.textContent = `${evalRun.finishTimeSeconds.toFixed(1)}s / ${round.parTimeSeconds.toFixed(0)}s`;
-      estEl.style.color =
-        evalRun.finishTimeSeconds >= round.parTimeSeconds
-          ? 'var(--accent-sage)'
-          : 'var(--text-primary)';
+      const evalRun = this.renderer3d.getLocalMazeEval();
+      const estSecs = evalRun?.finishTimeSeconds ?? 0;
+      const estEl = document.getElementById('est-time-value');
+      if (estEl && this.roomState.phase !== 'RUN') {
+        estEl.textContent = `Est ${estSecs.toFixed(
+          1
+        )}s · Par ${effectivePar.toFixed(0)}s`;
+        estEl.style.color =
+          estSecs >= effectivePar
+            ? 'var(--accent-sage)'
+            : 'var(--text-primary)';
+      }
 
       const timeChip = document.getElementById('time-chip');
-      if (timeChip) {
-        timeChip.title = `Simulated Survival: ${evalRun.finishTimeSeconds.toFixed(1)}s (Par ${round.parTimeSeconds.toFixed(0)}s) · Spire Hits: ${evalRun.clapsTaken} · Linked Keeps: ${evalRun.linkedKeeps}/${round.obstacles.length} · Overcharge: ${evalRun.overchargedSpires}★`;
+      if (timeChip && evalRun) {
+        timeChip.title = `Estimated Run: ${estSecs.toFixed(
+          1
+        )}s (Par ${effectivePar.toFixed(1)}s) · Spire Pulses: ${
+          evalRun.clapsTaken
+        } · Linked Keeps: ${evalRun.linkedKeeps}/${
+          round.obstacles.length
+        } · Overcharge: ${evalRun.overchargedSpires}`;
       }
 
       const readyBtn = document.getElementById('btn-ready-lock')!;
       const readyText = document.getElementById('ready-btn-text')!;
       const readyIcon = document.getElementById('ready-btn-icon')!;
-      if (me.ready) {
-        readyBtn.classList.add('locked-in');
-        readyIcon.classList.remove('hidden');
-        readyText.textContent = 'Locked';
-      } else {
-        readyBtn.classList.remove('locked-in');
-        readyIcon.classList.add('hidden');
-        readyText.textContent = 'Ready';
+      if (!this.armedTimers.has(readyBtn)) {
+        if (me.ready) {
+          readyBtn.classList.add('locked-in');
+          readyIcon.classList.remove('hidden');
+          readyText.textContent = 'Ready';
+        } else {
+          readyBtn.classList.remove('locked-in');
+          readyIcon.classList.add('hidden');
+          readyText.textContent =
+            this.getHumanCount() <= 1 ? 'Start' : 'Ready';
+        }
       }
     }
 
@@ -1673,7 +3225,7 @@ class MazingContestClient {
       });
   }
 
-  private updateTimerDOM() {
+  private updateTimerDOM(fromTick: boolean) {
     if (!this.roomState) return;
     if (
       this.roomState.phase === 'BUILD' &&
@@ -1682,10 +3234,25 @@ class MazingContestClient {
       document.getElementById('timer-display')!.textContent = '∞';
       return;
     }
+
     const secs = Math.max(0, Math.ceil(this.roomState.phaseTimeRemaining));
     const mm = String(Math.floor(secs / 60)).padStart(2, '0');
     const ss = String(secs % 60).padStart(2, '0');
     document.getElementById('timer-display')!.textContent = `${mm}:${ss}`;
+
+    // Subtle countdown ticks in the final 5s of BUILD when player hasn't readied yet
+    if (
+      fromTick &&
+      this.roomState.phase === 'BUILD' &&
+      secs >= 1 &&
+      secs <= 5 &&
+      secs !== this.lastCountdownTickSec &&
+      !this.getLocalPlayer()?.ready &&
+      !this.isHubOpen()
+    ) {
+      this.lastCountdownTickSec = secs;
+      soundEngine.playCountdownTick(secs <= 2);
+    }
   }
 
   private updateScoreboardDOM() {
@@ -1693,21 +3260,34 @@ class MazingContestClient {
     const list = document.getElementById('scoreboard-list')!;
     list.innerHTML = '';
 
+    const awayFromHome =
+      this.renderer3d.arenaOverviewMode || this.isSpectatingRival();
+
     const overviewBtn = document.getElementById('btn-camera-overview')!;
     const overviewIcon = document.getElementById('overview-icon')!;
     const overviewLabel = document.getElementById('overview-label')!;
     overviewBtn.classList.toggle('active', this.renderer3d.arenaOverviewMode);
-    overviewIcon.innerHTML = icon(
-      this.renderer3d.arenaOverviewMode ? 'sanctum' : 'overview',
-      17
-    );
-    overviewLabel.textContent = this.renderer3d.arenaOverviewMode
-      ? 'Sanctum'
-      : 'Arena';
+    overviewIcon.innerHTML = icon(awayFromHome ? 'sanctum' : 'overview', 17);
+    overviewLabel.textContent = awayFromHome ? 'My Island' : 'All Islands';
+
+    const runOverviewBtn = document.getElementById('btn-run-overview-toggle');
+    const runOverviewLabel = document.getElementById('run-overview-label');
+    if (runOverviewBtn && runOverviewLabel) {
+      runOverviewBtn.classList.toggle(
+        'active',
+        this.renderer3d.arenaOverviewMode
+      );
+      const slot = runOverviewBtn.querySelector('.icon-slot');
+      if (slot) {
+        slot.innerHTML = icon(awayFromHome ? 'sanctum' : 'overview', 16);
+      }
+      runOverviewLabel.textContent = awayFromHome ? 'My Island' : 'All Islands';
+    }
 
     const sorted = [...this.roomState.players].sort(
       (a, b) => b.totalScore - a.totalScore
     );
+    this.sortedStandingsIds = sorted.map((p) => p.id);
 
     const countMeta = document.getElementById('standings-count-meta');
     if (countMeta) {
@@ -1716,7 +3296,6 @@ class MazingContestClient {
       }`;
     }
 
-    // Update Compact Top-Left Standings Pill Summary
     const targetId =
       (!this.renderer3d.arenaOverviewMode && this.renderer3d.focusedPlayerId) ||
       this.localPlayerId;
@@ -1752,29 +3331,46 @@ class MazingContestClient {
       const isMe = p.id === this.localPlayerId;
       const readyHtml =
         this.roomState?.phase === 'BUILD' && p.ready
-          ? `<span class="standings-ready-icon" title="Ready">${icon('check', 13)}</span>`
+          ? `<span class="standings-ready-icon" title="Ready">${icon(
+              'check',
+              13
+            )}</span>`
           : '';
+      const botHtml = p.isBot ? `<span class="bot-badge">BOT</span>` : '';
+      const youHtml = isMe ? `<span class="you-badge">You</span>` : '';
+      const distMeta = p.fogMasked ? 'Hidden' : `${p.pathDistance.toFixed(0)}m`;
 
-      row.title = `Spectate ${p.name}${isMe ? ' (You)' : ''} — ${p.totalScore} pts · ${p.pathDistance.toFixed(0)}m path`;
+      row.title = `View ${p.name}'s Island (${p.totalScore} pts · ${distMeta})`;
       row.innerHTML = `
         <span class="standings-row-left">
           <span class="standings-rank">${idx + 1}.</span>
-          <span class="player-swatch" style="background:${escapeHtml(p.color)}"></span>
-          <span class="standings-name">${isMe ? 'You' : escapeHtml(p.name)}</span>
+          <span class="player-swatch" style="background:${escapeHtml(
+            p.color
+          )}"></span>
+          <span class="standings-name">${escapeHtml(p.name)}</span>
+          ${youHtml}
+          ${botHtml}
           ${readyHtml}
         </span>
-        <span class="standings-row-right" id="sub-telemetry-${p.id}">${p.totalScore}p</span>
+        <span class="standings-row-right" id="sub-telemetry-${p.id}">${
+        p.totalScore
+      }p</span>
       `;
 
       row.addEventListener('click', () => {
-        this.renderer3d.clearTouchPreview?.();
+        soundEngine.playUiClick();
+        this.renderer3d.cancelTouchGhost();
+        this.hideTouchPrecisionTray();
         this.hideCursorPill();
         this.renderer3d.focusOnPlayerIsland(p.id);
         document.getElementById('standings-dropdown')?.classList.add('hidden');
         document
           .getElementById('btn-standings-toggle')
           ?.classList.remove('active');
+        this.syncSpectatorStateDOM();
+        this.updateUndoAndToolAvailability();
         this.updateScoreboardDOM();
+        this.scheduleHudSafeInsetsSync();
       });
 
       list.appendChild(row);
@@ -1782,15 +3378,19 @@ class MazingContestClient {
   }
 
   private updateLiveRunScoreboard() {
+    if (!this.roomState) return;
     const activeTargetId =
       (!this.renderer3d.arenaOverviewMode && this.renderer3d.focusedPlayerId) ||
       this.localPlayerId;
     const pillScoreEl = document.getElementById('standings-score');
+    const estEl = document.getElementById('est-time-value');
+    const parSecs = this.roomState.roundConfig.parTimeSeconds;
 
     for (const [pid, sim] of this.simulators.entries()) {
-      const formatted = sim.state.finished
-        ? `${sim.state.finishTimeSeconds.toFixed(1)}s`
-        : `${sim.elapsedSeconds.toFixed(1)}s`;
+      const liveSecs = sim.state.finished
+        ? sim.state.finishTimeSeconds
+        : sim.elapsedSeconds;
+      const formatted = `${liveSecs.toFixed(1)}s`;
       const toneColor = sim.state.finished
         ? 'var(--accent-sage)'
         : 'var(--accent-gold)';
@@ -1803,11 +3403,30 @@ class MazingContestClient {
         subEl.style.color = toneColor;
       }
 
-      if (pillScoreEl && pid === activeTargetId) {
-        pillScoreEl.textContent = formatted;
-        pillScoreEl.style.color = toneColor;
+      if (pid === activeTargetId) {
+        if (pillScoreEl) {
+          pillScoreEl.textContent = formatted;
+          pillScoreEl.style.color = toneColor;
+        }
+        if (estEl) {
+          estEl.textContent = `${
+            sim.state.finished ? 'Done' : 'Run'
+          } ${formatted} · Par ${parSecs.toFixed(0)}s`;
+          estEl.style.color =
+            liveSecs >= parSecs
+              ? 'var(--accent-sage)'
+              : 'var(--text-primary)';
+        }
       }
     }
+  }
+
+  private updateResultsCountdownDOM() {
+    if (!this.roomState || this.roomState.phase !== 'ROUND_RESULTS') return;
+    const nextBtnLabel = document.getElementById('next-round-label');
+    if (!nextBtnLabel) return;
+    const secs = Math.max(0, Math.ceil(this.roomState.phaseTimeRemaining));
+    nextBtnLabel.textContent = secs > 0 ? `Next Round (${secs}s)` : 'Next Round';
   }
 
   private renderRoundResultsModal(state: RoomState) {
@@ -1815,6 +3434,7 @@ class MazingContestClient {
     const isGameOver = state.phase === 'GAME_OVER';
     const roundsDone = state.roundsCompleted || round.roundNumber;
     const totalRounds = state.settings?.totalRounds || ROUNDS.length;
+    const parTarget = round.parTimeSeconds || computeEffectivePar(28, state.settings?.goldMultiplier);
 
     const titleEl = document.getElementById('results-title')!;
     const subEl = document.getElementById('results-subtitle')!;
@@ -1829,15 +3449,20 @@ class MazingContestClient {
 
     if (state.newRecordHolders && state.newRecordHolders.length > 0) {
       recordCallout.classList.remove('hidden');
-      recordCallout.innerHTML = `${icon('trophy', 15)} <span>New Hall of Fame Top-5 Record on Round ${round.roundNumber} by ${escapeHtml(state.newRecordHolders.join(', '))}!</span>`;
+      recordCallout.innerHTML = `${icon(
+        'trophy',
+        15
+      )} <span>New Top-5 Leaderboard Record on Round ${
+        round.roundNumber
+      } by ${escapeHtml(state.newRecordHolders.join(', '))}</span>`;
     } else {
       recordCallout.classList.add('hidden');
     }
 
     if (isGameOver) {
-      titleEl.textContent = 'Citadel Championship Complete';
-      subEl.textContent = `Final standings across ${totalRounds} rounds — recorded to the Hall of Fame.`;
-      nextBtnLabel.textContent = 'Play New Match';
+      titleEl.textContent = 'Match Complete';
+      subEl.textContent = `Final standings across ${totalRounds} rounds.`;
+      nextBtnLabel.textContent = 'New Match';
 
       const overallRanked = [...state.players].sort(
         (a, b) =>
@@ -1848,25 +3473,44 @@ class MazingContestClient {
 
       overallRanked.slice(0, 3).forEach((p, idx) => {
         const card = document.createElement('div');
-        card.className = `podium-card${idx === 0 ? ' first' : ''}`;
+        const isMe = p.id === this.localPlayerId;
+        card.className = `podium-card${idx === 0 ? ' first' : ''}${
+          isMe ? ' is-me' : ''
+        }`;
         const medalSvg = getMedalBadge((idx + 1) as 1 | 2 | 3, 28);
         card.innerHTML = `
           <div class="podium-medal">${medalSvg}</div>
-          <div class="podium-name">${escapeHtml(p.name)}</div>
+          <div class="podium-name">${escapeHtml(p.name)}${
+          isMe ? ' (You)' : ''
+        }</div>
           <div class="podium-pts">${p.totalScore} pts</div>
-          <div class="podium-sub">Best ${p.bestMazeTime.toFixed(1)}s · ${p.parStarsEarned || 0} Par</div>
+          <div class="podium-sub">Best ${p.bestMazeTime.toFixed(1)}s · ${
+          p.parStarsEarned || 0
+        } Par</div>
         `;
         podiumEl.appendChild(card);
       });
     } else {
       titleEl.textContent = `Round ${round.roundNumber} · ${round.title}`;
-      subEl.textContent = `Par Target: ${round.parTimeSeconds.toFixed(1)}s (+2 bonus points for beating Par)`;
-      nextBtnLabel.textContent = 'Next Round';
+      subEl.textContent = `Par Target: ${parTarget.toFixed(
+        1
+      )}s (+2 bonus points for beating Par) · Skill: ${formatBotSkillLabel(
+        state.settings?.botDifficulty
+      )}`;
+      this.updateResultsCountdownDOM();
       podiumEl.classList.add('hidden');
     }
 
     const table = document.getElementById('results-table')!;
     table.innerHTML = '';
+
+    const tableHead = document.createElement('div');
+    tableHead.className = 'results-table-head';
+    tableHead.innerHTML = `
+      <span>Player &amp; Maze Stats</span>
+      <span>Run Time &amp; Score</span>
+    `;
+    table.appendChild(tableHead);
 
     const ranked = [...state.players].sort((a, b) =>
       isGameOver
@@ -1877,29 +3521,40 @@ class MazingContestClient {
 
     ranked.forEach((p, idx) => {
       const row = document.createElement('div');
-      row.className = `result-row${idx === 0 ? ' winner' : ''}`;
+      const isMe = p.id === this.localPlayerId;
+      row.className = `result-row${idx === 0 ? ' winner' : ''}${
+        isMe ? ' is-me' : ''
+      }`;
       const rankHtml =
-        idx < 3
-          ? getMedalBadge((idx + 1) as 1 | 2 | 3, 20)
-          : `#${idx + 1}`;
+        idx < 3 ? getMedalBadge((idx + 1) as 1 | 2 | 3, 20) : `#${idx + 1}`;
       const beatPar =
-        (p.lastRoundTime || 0) >= round.parTimeSeconds
+        (p.lastRoundTime || 0) >= parTarget
           ? `<span class="par-pill">${icon('starFilled', 10)}<span>Par</span></span>`
           : '';
-      const synBadges = `<span class="stat-chip">${icon('bolt', 11)} ${p.lastRoundClaps || 0} · ${icon('starFilled', 10)} ${p.lastRoundOvercharge || 0} · ${p.pathDistance.toFixed(0)}m</span>`;
+      const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
+      const botBadge = p.isBot ? `<span class="bot-badge">BOT</span>` : '';
+      const synBadges = `<span class="stat-chip">${icon('bolt', 11)} ${
+        p.lastRoundClaps || 0
+      } · ${icon('diamondFilled', 10)} ${
+        p.lastRoundOvercharge || 0
+      } · ${p.pathDistance.toFixed(0)}m</span>`;
 
       row.innerHTML = `
         <div class="result-row-left">
           <span class="result-rank-slot">${rankHtml}</span>
-          <span class="player-swatch" style="background:${escapeHtml(p.color)}"></span>
+          <span class="player-swatch" style="background:${escapeHtml(
+            p.color
+          )}"></span>
           <strong>${escapeHtml(p.name)}</strong>
+          ${youBadge}
+          ${botBadge}
           ${beatPar}
           ${synBadges}
         </div>
         <div class="result-stats">
           <strong>${(p.lastRoundTime || 0).toFixed(2)}s</strong>
           <span style="color:var(--accent-sage)">+${p.lastRoundPoints}p</span>
-          <span style="color:var(--accent-gold)">(${p.totalScore}p)</span>
+          <span style="color:var(--text-secondary)">(${p.totalScore}p)</span>
         </div>
       `;
       table.appendChild(row);

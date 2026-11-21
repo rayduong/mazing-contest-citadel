@@ -9,7 +9,7 @@
     <meta name="theme-color" content="#cde8f6" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <title>Citadel · Tactical Mazing Arena</title>
+    <title>Mazing Contest</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -18,34 +18,57 @@
     />
     <link rel="stylesheet" href="/src/client/style.css" />
   </head>
-  <body data-phase="BUILD">
+  <body data-phase="BUILD" data-input="mouse" data-spectating="false">
     <!-- 3D WebGL Diorama Viewport -->
     <div id="viewport-container"></div>
     <!-- 3D Projected World Labels -->
     <div id="world-labels"></div>
 
-    <!-- Tactile Build Preview & Touch Confirm Pill -->
+    <!-- Non-Blocking Build Delta & World Feature Inspection Pill -->
     <div id="cursor-telemetry-pill" class="cursor-telemetry-pill hidden"></div>
 
-    <!-- Non-Overlapping Responsive Top HUD Bar -->
-    <header class="hud-top-bar">
-      <!-- Left Cluster: Hub, Camera View & Collapsible Standings Pill -->
+    <!-- Non-Blocking Round Strategy Brief Banner -->
+    <div
+      id="round-brief-banner"
+      class="round-brief-banner surface-pill hidden"
+      role="status"
+      aria-live="polite"
+    >
+      <span id="round-brief-text" class="round-brief-text">
+        Fold switchbacks past both Storm Spires. Link a Crimson Keep into your wall to boost Spire range.
+      </span>
+      <button
+        type="button"
+        id="btn-dismiss-brief"
+        class="brief-dismiss-btn"
+        aria-label="Dismiss tip"
+        title="Dismiss"
+      >
+        <span class="icon-slot" data-icon="close" data-icon-size="13"></span>
+      </button>
+    </div>
+
+    <!-- Single-Row Responsive Top HUD Bar -->
+    <header id="hud-top-bar" class="hud-top-bar">
+      <!-- Left Cluster: Menu, Island View & Collapsible Standings -->
       <div id="hud-top-left" class="hud-cluster-left">
         <button
           type="button"
           id="btn-open-hub"
           class="top-pill-btn hub-pill-btn"
-          title="Open Citadel Hub — Lobbies, Match Setup & Hall of Fame (H)"
+          title="Main Menu (H)"
+          aria-label="Main Menu"
         >
           <span class="icon-slot" data-icon="hub" data-icon-size="17"></span>
-          <span class="btn-label">Hub</span>
+          <span class="btn-label">Menu</span>
         </button>
 
         <button
           type="button"
           id="btn-camera-overview"
           class="top-pill-btn overview-toggle"
-          title="Toggle Arena Overview / My Sanctum (Tab)"
+          title="Switch between My Island and All Islands (Tab)"
+          aria-label="Toggle All Islands View"
         >
           <span
             id="overview-icon"
@@ -53,7 +76,7 @@
             data-icon="overview"
             data-icon-size="17"
           ></span>
-          <span id="overview-label" class="btn-label">Arena</span>
+          <span id="overview-label" class="btn-label">All Islands</span>
         </button>
 
         <div id="standings-wrap" class="standings-wrap">
@@ -61,7 +84,8 @@
             type="button"
             id="btn-standings-toggle"
             class="top-pill-btn standings-pill-btn"
-            title="View Contestant Standings & Spectate Islands (1–6)"
+            title="Standings & Spectate Islands (1-6)"
+            aria-label="Standings and Spectate"
           >
             <span id="standings-swatch" class="player-swatch"></span>
             <span id="standings-summary" class="standings-summary">1st · You</span>
@@ -78,7 +102,7 @@
             class="standings-dropdown surface-panel hidden"
           >
             <div class="dropdown-header">
-              <span>STANDINGS &amp; SPECTATE</span>
+              <span>Standings</span>
               <span id="standings-count-meta" class="meta-pill">1 Player</span>
             </div>
             <div id="scoreboard-list" class="standings-list"></div>
@@ -86,19 +110,20 @@
         </div>
       </div>
 
-      <!-- Center Capsule: Round · Timer · Pillars · Run Time -->
-      <div class="hud-top-pill surface-pill">
+      <!-- Center Capsule: Round Info · Phase Clock · Playback Speed · Est vs Par -->
+      <div id="hud-top-pill" class="hud-top-pill surface-pill">
         <div class="round-selector-wrap">
           <button
             type="button"
             id="btn-round-picker"
             class="telemetry-chip interactive"
-            title="Select Round or Inspect Map Spires"
+            title="Inspect Round Details or Switch Round"
           >
             <span class="chip-accent" id="round-code-label">R1/8</span>
-            <span class="round-mini-title" id="round-subtitle">
-              Sanctum Foundations
+            <span id="round-runner-badge" class="round-runner-badge">
+              <span class="icon-slot" data-icon="scout" data-icon-size="13"></span>
             </span>
+            <span class="round-mini-title" id="round-subtitle">Meadow Gate</span>
             <span
               class="icon-slot caret-slot"
               data-icon="chevronDown"
@@ -106,11 +131,29 @@
             ></span>
           </button>
 
-          <!-- On-Demand Round Selector Sheet -->
+          <!-- Round Inspect & Host Round Switcher Popover -->
           <div id="round-dropdown" class="round-dropdown surface-panel hidden">
+            <div class="round-inspect-card">
+              <div class="round-inspect-head">
+                <strong id="round-inspect-title">Round 1 · Meadow Gate</strong>
+                <span id="map-features-summary" class="meta-pill">
+                  2 Storm · 4 Keeps
+                </span>
+              </div>
+              <div id="round-inspect-runner" class="round-inspect-runner">
+                <span class="icon-slot" data-icon="scout" data-icon-size="14"></span>
+                <span>Citadel Scout · 3.5 m/s · Standard slow duration</span>
+              </div>
+              <p id="round-inspect-hint" class="round-inspect-hint">
+                Fold switchbacks past both Storm Spires. Link a Crimson Keep into your wall to boost Spire range and recharge.
+              </p>
+            </div>
+
+            <div class="popover-divider"></div>
+
             <div class="dropdown-header">
-              <span>SELECT ROUND</span>
-              <span id="map-features-summary" class="meta-pill"></span>
+              <span>Switch Round</span>
+              <span class="dropdown-subtle-note">Resets current walls</span>
             </div>
             <div id="round-pills" class="round-pills-grid"></div>
           </div>
@@ -121,13 +164,13 @@
         <div class="phase-clock-cluster" title="Current Phase & Remaining Time">
           <span id="phase-dot" class="phase-dot build"></span>
           <span id="phase-label" class="phase-label">BUILD</span>
-          <span id="timer-display" class="timer-display">01:20</span>
+          <span id="timer-display" class="timer-display">01:30</span>
         </div>
 
         <div
           class="speed-controls hidden"
           id="speed-controls"
-          title="Simulation Playback Speed"
+          title="Run Speed"
         >
           <button type="button" class="speed-btn active" data-speed="1">
             1×
@@ -136,35 +179,26 @@
           <button type="button" class="speed-btn" data-speed="4">4×</button>
         </div>
 
-        <div class="pill-divider divider-before-walls"></div>
-
-        <div
-          class="telemetry-chip gold-chip"
-          id="walls-chip"
-          title="Remaining 2×2 Stone Pillars (100% Pillar Refund on Reclaim)"
-        >
-          <span class="icon-slot chip-icon" data-icon="pillar" data-icon-size="15"></span>
-          <span id="gold-value" class="chip-num">35</span>
-        </div>
+        <div class="pill-divider divider-before-time"></div>
 
         <div
           class="telemetry-chip time-chip"
           id="time-chip"
-          title="Simulated Runner Survival Time vs. Round Par"
+          title="Estimated Run Time vs. Round Par"
         >
-          <span class="icon-slot chip-icon" data-icon="clock" data-icon-size="15"></span>
-          <span id="est-time-value" class="chip-num">6.2s / 46s</span>
+          <span class="icon-slot chip-icon" data-icon="clock" data-icon-size="14"></span>
+          <span id="est-time-value" class="chip-num">Est 6.2s · Par 28s</span>
         </div>
       </div>
 
-      <!-- Right Cluster: Hall of Fame, Room & Chat, Audio, Guide -->
+      <!-- Right Cluster: Leaderboard, Room & Chat, Audio, Guide -->
       <div id="hud-top-right" class="hud-cluster-right">
         <button
           type="button"
           id="btn-open-leaderboard"
-          class="icon-circle-btn gold-accent-btn"
-          title="Hall of Fame (L)"
-          aria-label="Hall of Fame"
+          class="icon-circle-btn gold-accent-btn leaderboard-hud-btn"
+          title="Leaderboard (L)"
+          aria-label="Leaderboard"
         >
           <span class="icon-slot" data-icon="trophy" data-icon-size="18"></span>
         </button>
@@ -172,7 +206,7 @@
           type="button"
           id="btn-toggle-lobby"
           class="icon-circle-btn"
-          title="Room, Audio, AI Bots & Chat"
+          title="Room & Chat (C)"
           aria-label="Room and Chat"
         >
           <span class="icon-slot" data-icon="users" data-icon-size="18"></span>
@@ -182,7 +216,7 @@
           type="button"
           id="btn-mute"
           class="icon-circle-btn mute-hud-btn"
-          title="Toggle Audio"
+          title="Toggle Audio (M)"
           aria-label="Toggle Audio"
         >
           <span
@@ -196,7 +230,7 @@
           type="button"
           id="btn-help"
           class="icon-circle-btn guide-hud-btn"
-          title="How to Play"
+          title="How to Play (?)"
           aria-label="How to Play"
         >
           <span class="icon-slot" data-icon="help" data-icon-size="18"></span>
@@ -204,12 +238,14 @@
       </div>
     </header>
 
-    <!-- Slide-Over Room & Chat Drawer -->
+    <!-- Slide-Over Room & Chat Drawer (Keyboard-Aware Bottom Sheet on Mobile) -->
     <aside id="lobby-drawer" class="lobby-drawer surface-panel hidden">
       <div class="drawer-header">
         <div class="drawer-title-group">
-          <span>ROOM &amp; CHAT</span>
-          <span id="room-code-badge" class="room-code-badge">ARENA1</span>
+          <span>Room &amp; Chat</span>
+          <span id="room-code-badge" class="room-code-badge" title="Active Room Code">
+            ARENA1
+          </span>
         </div>
         <div class="drawer-header-actions">
           <button
@@ -223,7 +259,7 @@
               id="drawer-mute-icon-slot"
               class="icon-slot"
               data-icon="volumeOn"
-              data-icon-size="16"
+              data-icon-size="17"
             ></span>
           </button>
           <button
@@ -233,7 +269,7 @@
             title="Close"
             aria-label="Close Room Drawer"
           >
-            <span class="icon-slot" data-icon="close" data-icon-size="16"></span>
+            <span class="icon-slot" data-icon="close" data-icon-size="17"></span>
           </button>
         </div>
       </div>
@@ -244,24 +280,30 @@
             id="player-name-input"
             type="text"
             maxlength="18"
-            placeholder="Your Architect Name"
+            placeholder="Your Name"
+            aria-label="Your Name"
+            autocomplete="nickname"
+            autocorrect="off"
+            spellcheck="false"
+            enterkeyhint="done"
           />
           <button
             type="button"
             id="btn-copy-invite"
             class="mini-action-btn"
-            title="Copy Shareable Room Link"
+            title="Share Invite Link"
           >
             <span class="icon-slot" data-icon="link" data-icon-size="14"></span>
             <span>Invite</span>
           </button>
         </div>
+
         <div class="bot-controls-row">
           <button
             type="button"
             id="btn-add-bot"
             class="mini-action-btn"
-            title="Add AI Bot"
+            title="Add Bot"
           >
             <span class="icon-slot" data-icon="plus" data-icon-size="13"></span>
             <span>Bot</span>
@@ -270,7 +312,7 @@
             type="button"
             id="btn-remove-bot"
             class="mini-action-btn"
-            title="Remove AI Bot"
+            title="Remove Bot"
           >
             <span class="icon-slot" data-icon="minus" data-icon-size="13"></span>
             <span>Bot</span>
@@ -279,21 +321,22 @@
             type="button"
             id="btn-drawer-open-config"
             class="mini-action-btn"
-            title="Match Setup & Rooms"
+            title="Room Rules & Open Rooms"
           >
             <span
               class="icon-slot"
               data-icon="sliders"
               data-icon-size="13"
             ></span>
-            <span>Setup</span>
+            <span>Rules</span>
           </button>
           <label
             class="fog-toggle"
-            title="Hide rival islands during Build Phase"
+            title="Hide rival mazes during Build phase"
           >
             <input type="checkbox" id="chk-fog" />
-            <span>Fog</span>
+            <span class="icon-slot" data-icon="eyeOff" data-icon-size="13"></span>
+            <span>Hidden</span>
           </label>
         </div>
       </div>
@@ -306,6 +349,8 @@
           type="text"
           placeholder="Send a message..."
           maxlength="160"
+          autocomplete="off"
+          enterkeyhint="send"
         />
         <button type="submit" title="Send Message" aria-label="Send Message">
           <span class="icon-slot" data-icon="send" data-icon-size="15"></span>
@@ -313,126 +358,277 @@
       </form>
     </aside>
 
-    <!-- Ergonomic Bottom Build Bar (Auto-Hides Outside BUILD Phase) -->
+    <!-- Stationary Mobile Thumb-Zone Precision Tray -->
+    <div
+      id="touch-precision-tray"
+      class="touch-precision-tray surface-pill hidden"
+      role="toolbar"
+      aria-label="Precision Wall Placement"
+    >
+      <div class="touch-nudge-cluster">
+        <button
+          type="button"
+          id="btn-nudge-left"
+          class="touch-nudge-btn"
+          data-nudge-dx="-1"
+          data-nudge-dy="0"
+          aria-label="Nudge West"
+          title="Nudge Left"
+        >
+          <span class="icon-slot" data-icon="arrowLeft" data-icon-size="17"></span>
+        </button>
+        <button
+          type="button"
+          id="btn-nudge-up"
+          class="touch-nudge-btn"
+          data-nudge-dx="0"
+          data-nudge-dy="-1"
+          aria-label="Nudge North"
+          title="Nudge Up"
+        >
+          <span class="icon-slot" data-icon="arrowUp" data-icon-size="17"></span>
+        </button>
+        <button
+          type="button"
+          id="btn-nudge-down"
+          class="touch-nudge-btn"
+          data-nudge-dx="0"
+          data-nudge-dy="1"
+          aria-label="Nudge South"
+          title="Nudge Down"
+        >
+          <span class="icon-slot" data-icon="arrowDown" data-icon-size="17"></span>
+        </button>
+        <button
+          type="button"
+          id="btn-nudge-right"
+          class="touch-nudge-btn"
+          data-nudge-dx="1"
+          data-nudge-dy="0"
+          aria-label="Nudge East"
+          title="Nudge Right"
+        >
+          <span class="icon-slot" data-icon="arrowRight" data-icon-size="17"></span>
+        </button>
+      </div>
+
+      <button
+        type="button"
+        id="btn-touch-confirm"
+        class="touch-confirm-btn"
+      >
+        <span class="icon-slot" data-icon="pillar" data-icon-size="15"></span>
+        <span id="touch-confirm-label">Place</span>
+      </button>
+
+      <button
+        type="button"
+        id="btn-touch-cancel"
+        class="touch-cancel-btn"
+        aria-label="Cancel Selection"
+        title="Cancel"
+      >
+        <span class="icon-slot" data-icon="close" data-icon-size="16"></span>
+      </button>
+    </div>
+
+    <!-- Bottom Build Dock (Auto-Hides Outside BUILD or While Spectating) -->
     <footer id="hud-bottom-dock" class="hud-bottom-dock surface-pill">
       <div class="dock-tools" id="tower-buttons">
         <button
           type="button"
+          id="btn-tool-build"
           class="dock-tool-btn active"
           data-tool="BLOCK"
-          title="Build 2×2 Stone Pillar — Bridges Automatically (Q)"
+          title="Build 2×2 Stone Wall (Q)"
         >
-          <span class="icon-slot" data-icon="pillar" data-icon-size="18"></span>
+          <span class="tool-top-row">
+            <span class="icon-slot" data-icon="pillar" data-icon-size="17"></span>
+            <span id="dock-pillars-badge" class="dock-count-badge">26</span>
+          </span>
           <span class="tool-label">Build</span>
-          <span id="dock-pillars-badge" class="dock-count-badge">35</span>
+          <kbd>Q</kbd>
         </button>
 
         <button
           type="button"
+          id="btn-tool-sell"
           class="dock-tool-btn sell-btn"
           data-tool="SELL"
-          title="Reclaim Stone Pillar (+1 Pillar Refund) — E or Right-Click"
+          title="Remove Stone Wall (X or Right-Click)"
         >
-          <span class="icon-slot" data-icon="reclaim" data-icon-size="18"></span>
-          <span class="tool-label">Reclaim</span>
+          <span class="icon-slot" data-icon="reclaim" data-icon-size="17"></span>
+          <span class="tool-label">Remove</span>
+          <kbd>X</kbd>
+        </button>
+
+        <button
+          type="button"
+          id="btn-tool-pan"
+          class="dock-tool-btn touch-only-tool"
+          data-tool="PAN"
+          title="Pan Camera Safe Mode"
+        >
+          <span class="icon-slot" data-icon="pan" data-icon-size="17"></span>
+          <span class="tool-label">Pan</span>
         </button>
       </div>
+
+      <button
+        type="button"
+        id="btn-undo"
+        class="dock-tool-btn undo-btn"
+        title="Undo Last Wall Action (Z)"
+        disabled
+      >
+        <span class="icon-slot" data-icon="undo" data-icon-size="17"></span>
+        <span class="tool-label">Undo</span>
+        <kbd>Z</kbd>
+      </button>
 
       <div class="dock-tools-menu-wrap" id="dock-tools-wrap">
         <button
           type="button"
           id="btn-dock-tools"
           class="dock-more-btn"
-          title="Architect Tools — Auto-Blueprint, Reroll Map & Clear"
-          aria-label="Architect Tools"
+          title="Board Tools"
+          aria-label="Board Tools"
         >
-          <span class="icon-slot" data-icon="more" data-icon-size="18"></span>
-          <span class="more-label">Tools</span>
+          <span class="icon-slot" data-icon="more" data-icon-size="17"></span>
+          <span class="more-label tool-label">Tools</span>
         </button>
 
-        <!-- Upward Progressive-Disclosure Tools Popover -->
+        <!-- Upward Tools Popover (Safe Thumb Order: Destructive Top, Safe Bottom) -->
         <div
           id="dock-tools-popover"
           class="dock-tools-popover surface-panel hidden"
         >
           <button
             type="button"
-            id="btn-demo-layout"
-            class="popover-action-btn"
-            title="Build a Sample Labyrinth Layout"
+            id="btn-clear-maze"
+            class="popover-action-btn danger"
+            title="Remove all placed Stone Walls"
           >
-            <span class="icon-slot" data-icon="wand" data-icon-size="16"></span>
-            <span>Auto-Blueprint</span>
+            <span class="icon-slot" data-icon="trash" data-icon-size="16"></span>
+            <span>Clear All</span>
           </button>
           <button
             type="button"
             id="btn-reroll-map"
-            class="popover-action-btn"
-            title="Generate a Fresh Map Seed with New Spires & Keeps"
+            class="popover-action-btn warning-item"
+            title="Generate a fresh map layout for this round"
           >
             <span class="icon-slot" data-icon="dice" data-icon-size="16"></span>
-            <span>Reroll Map</span>
+            <span>New Map</span>
+          </button>
+          <div class="popover-divider"></div>
+          <button
+            type="button"
+            id="btn-demo-layout"
+            class="popover-action-btn"
+            title="Build an 80% sample maze scaffold"
+          >
+            <span class="icon-slot" data-icon="wand" data-icon-size="16"></span>
+            <span>Sample Maze</span>
           </button>
           <button
             type="button"
             id="btn-reset-camera"
             class="popover-action-btn"
-            title="Center Camera on Your Sanctum"
+            title="Center camera on My Island (R)"
           >
-            <span
-              class="icon-slot"
-              data-icon="target"
-              data-icon-size="16"
-            ></span>
-            <span>Center Sanctum</span>
-          </button>
-          <div class="popover-divider"></div>
-          <button
-            type="button"
-            id="btn-clear-maze"
-            class="popover-action-btn danger"
-            title="Reclaim All Placed Pillars (100% Pillar Refund)"
-          >
-            <span class="icon-slot" data-icon="trash" data-icon-size="16"></span>
-            <span>Clear Pillars</span>
+            <span class="icon-slot" data-icon="target" data-icon-size="16"></span>
+            <span>Reset View</span>
+            <kbd class="popover-kbd">R</kbd>
           </button>
         </div>
       </div>
+
+      <div class="dock-ready-divider"></div>
 
       <button
         type="button"
         id="btn-ready-lock"
         class="dock-ready-btn"
-        title="Lock In Maze & Ready for Run Phase (Space)"
+        title="Lock In Maze & Start Run (Space)"
       >
         <span
           id="ready-btn-icon"
           class="icon-slot hidden"
           data-icon="check"
-          data-icon-size="16"
+          data-icon-size="15"
         ></span>
         <span id="ready-btn-text">Ready</span>
+        <kbd class="ready-kbd">Space</kbd>
       </button>
     </footer>
 
-    <!-- Round Results & Championship Podium Modal -->
+    <!-- Contextual Spectator Bar (Shown When Viewing Another Island During BUILD) -->
+    <div id="spectator-bar" class="spectator-bar surface-pill hidden">
+      <span class="spectator-info">
+        Viewing <strong id="spectator-target-name">Rival Island</strong>
+      </span>
+      <button
+        type="button"
+        id="btn-return-my-island"
+        class="dock-ready-btn spectator-return-btn"
+        title="Return to My Island (Tab)"
+      >
+        <span class="icon-slot" data-icon="arrowLeft" data-icon-size="15"></span>
+        <span>My Island</span>
+        <kbd class="ready-kbd">Tab</kbd>
+      </button>
+    </div>
+
+    <!-- Mobile Thumb-Zone Run Dock (Shown During RUN Phase on <= 768px) -->
+    <div id="hud-run-dock" class="hud-run-dock surface-pill hidden">
+      <div class="run-speed-group" role="group" aria-label="Run Speed">
+        <button type="button" class="speed-btn active" data-speed="1">1×</button>
+        <button type="button" class="speed-btn" data-speed="2">2×</button>
+        <button type="button" class="speed-btn" data-speed="4">4×</button>
+      </div>
+      <div class="pill-divider"></div>
+      <button
+        type="button"
+        id="btn-run-overview-toggle"
+        class="run-overview-btn"
+      >
+        <span class="icon-slot" data-icon="overview" data-icon-size="16"></span>
+        <span id="run-overview-label">All Islands</span>
+      </button>
+    </div>
+
+    <!-- Round Results & Final Standings Modal -->
     <div id="results-modal" class="modal-backdrop hidden">
       <div class="modal-card results-modal-card surface-panel">
         <div class="modal-header">
           <div class="results-header-row">
-            <h2 id="results-title">Round 1 Complete</h2>
-            <span id="results-match-progress" class="meta-pill">
-              Round 1 of 8
-            </span>
+            <div class="results-title-group">
+              <h2 id="results-title">Round 1 Complete</h2>
+              <span id="results-match-progress" class="meta-pill">
+                Round 1 of 8
+              </span>
+            </div>
+            <button
+              type="button"
+              id="btn-peek-mazes"
+              class="mini-action-btn peek-mazes-btn"
+              title="Inspect 3D Mazes on the Board"
+            >
+              <span class="icon-slot" data-icon="eye" data-icon-size="15"></span>
+              <span>View Mazes</span>
+            </button>
           </div>
-          <p id="results-subtitle">Longest runner survival time wins</p>
+          <p id="results-subtitle">Beat Par for +2 bonus points</p>
         </div>
+
         <div id="results-podium" class="results-podium hidden"></div>
         <div
           id="results-record-callout"
           class="results-record-callout hidden"
         ></div>
         <div id="results-table" class="results-table"></div>
+
         <div class="modal-actions results-actions">
           <button
             type="button"
@@ -444,7 +640,7 @@
               data-icon="trophy"
               data-icon-size="15"
             ></span>
-            <span>Hall of Fame</span>
+            <span>Leaderboard</span>
           </button>
           <button type="button" id="btn-next-round" class="dock-ready-btn">
             <span id="next-round-label">Next Round</span>
@@ -458,7 +654,7 @@
       </div>
     </div>
 
-    <!-- CITADEL HUB (Sunlit Indie Home Screen, Lobby Browser, Match Setup & Hall of Fame) -->
+    <!-- MAZING CONTEST HOME HUB (Calm Sunlit 880px Overlay) -->
     <div id="home-hub-modal" class="hub-backdrop">
       <div class="hub-shell surface-panel">
         <!-- Header Bar -->
@@ -468,12 +664,14 @@
               <span class="icon-slot" data-icon="hub" data-icon-size="22"></span>
             </div>
             <div>
-              <h1 class="hub-title">CITADEL</h1>
-              <p class="hub-subtitle hub-brand-sub">Tactical Mazing Arena</p>
+              <h1 class="hub-title">Mazing Contest</h1>
+              <p class="hub-subtitle hub-brand-sub">
+                Build stone mazes. Slow the runner. Outlast rivals.
+              </p>
             </div>
           </div>
 
-          <nav class="hub-nav-tabs" aria-label="Citadel Navigation">
+          <nav class="hub-nav-tabs" aria-label="Main Navigation">
             <button
               type="button"
               class="hub-tab-btn active"
@@ -496,7 +694,7 @@
                 data-icon="trophy"
                 data-icon-size="15"
               ></span>
-              <span>Hall of Fame</span>
+              <span>Leaderboard</span>
             </button>
             <button type="button" class="hub-tab-btn" data-hub-tab="codex">
               <span
@@ -509,7 +707,7 @@
           </nav>
 
           <div class="hub-profile-cluster">
-            <div class="hub-name-box" title="Your Architect Display Name">
+            <div class="hub-name-box" title="Your Name">
               <span
                 class="icon-slot hub-name-icon"
                 data-icon="user"
@@ -519,8 +717,12 @@
                 id="hub-player-name-input"
                 type="text"
                 maxlength="18"
-                placeholder="Architect Name"
-                aria-label="Architect Name"
+                placeholder="Your Name"
+                aria-label="Your Name"
+                autocomplete="nickname"
+                autocorrect="off"
+                spellcheck="false"
+                enterkeyhint="done"
               />
             </div>
             <span id="hub-active-room-badge" class="room-code-badge">
@@ -529,82 +731,64 @@
             <button
               type="button"
               id="btn-close-hub"
-              class="dock-ready-btn hub-resume-btn"
-              title="Enter 3D Arena (Esc)"
+              class="hub-secondary-btn hub-resume-btn"
+              title="Close Menu & Enter Island (Esc)"
+              aria-label="Close Menu"
             >
               <span
                 class="icon-slot"
-                data-icon="play"
-                data-icon-size="13"
+                data-icon="close"
+                data-icon-size="15"
               ></span>
-              <span>Enter Arena</span>
+              <span class="resume-btn-text">Close</span>
             </button>
           </div>
         </header>
 
-        <!-- Clean Quick Bar -->
-        <div class="hub-quick-bar">
-          <div class="quick-actions-left">
-            <button
-              type="button"
-              id="btn-quick-solo"
-              class="hub-action-pill sage"
-              title="Start an Instant Solo Arena with AI Opponents"
-            >
-              <span
-                class="icon-slot"
-                data-icon="play"
-                data-icon-size="13"
-              ></span>
-              <span>Instant Solo</span>
-            </button>
+        <!-- TAB 1: PLAY (Hero Play Strip + Open Rooms & Room Rules) -->
+        <section id="hub-tab-play" class="hub-tab-body">
+          <!-- Hero Play Strip (Fast 1-Click Entry, Scoped Inside Play Tab Only) -->
+          <div class="hub-hero-strip">
+            <div class="hub-hero-copy">
+              <p class="hub-hero-tagline">
+                Place stone walls to wind runners past elemental spires. Longest survival wins each round.
+              </p>
+              <div id="hub-hero-status" class="hub-hero-status">
+                <span class="status-dot"></span>
+                <span>Room <strong>ARENA1</strong> · Ready to play</span>
+              </div>
+            </div>
 
-            <div class="quick-join-group">
-              <input
-                id="join-code-input"
-                type="text"
-                maxlength="8"
-                placeholder="Room Code"
-                aria-label="Room Code"
-              />
-              <button type="button" id="btn-join-code" class="hub-action-pill">
-                <span>Join</span>
+            <div class="hub-hero-actions">
+              <button
+                type="button"
+                id="btn-quick-solo"
+                class="hub-secondary-btn hero-solo-btn"
+                title="Start a fresh solo match against bots"
+              >
+                <span
+                  class="icon-slot"
+                  data-icon="user"
+                  data-icon-size="15"
+                ></span>
+                <span>Solo vs Bots</span>
+              </button>
+              <button
+                type="button"
+                id="btn-hero-play"
+                class="dock-ready-btn hero-play-btn"
+                title="Enter your sunlit island now"
+              >
+                <span
+                  class="icon-slot"
+                  data-icon="play"
+                  data-icon-size="14"
+                ></span>
+                <span>Play Now</span>
               </button>
             </div>
           </div>
 
-          <div class="quick-actions-right">
-            <button
-              type="button"
-              id="btn-hub-copy-invite"
-              class="hub-action-pill gold"
-              title="Copy Shareable Room Link"
-            >
-              <span
-                class="icon-slot"
-                data-icon="link"
-                data-icon-size="14"
-              ></span>
-              <span>Copy Invite</span>
-            </button>
-            <button
-              type="button"
-              id="btn-hub-restart-match"
-              class="hub-action-pill"
-              title="Restart Current Room from Round 1"
-            >
-              <span
-                class="icon-slot"
-                data-icon="refresh"
-                data-icon-size="14"
-              ></span>
-              <span>Restart Match</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- TAB 1: PLAY — ACTIVE ROOMS & MATCH SETUP -->
-        <section id="hub-tab-play" class="hub-tab-body">
           <!-- Mobile Sub-Tab Switcher (Progressive Disclosure on <= 860px) -->
           <div class="hub-play-subtabs" id="hub-play-subtabs">
             <button
@@ -617,7 +801,7 @@
                 data-icon="globe"
                 data-icon-size="14"
               ></span>
-              <span>Active Rooms</span>
+              <span>Open Rooms</span>
               <span id="mobile-lobby-count" class="subtab-count">1</span>
             </button>
             <button
@@ -630,54 +814,100 @@
                 data-icon="sliders"
                 data-icon-size="14"
               ></span>
-              <span>Match Setup</span>
+              <span>Room Rules</span>
             </button>
           </div>
 
           <div class="hub-play-grid" id="hub-play-grid" data-mobile-pane="rooms">
-            <!-- Left Pane: Active Rooms -->
+            <!-- Left Pane: Open Rooms & Room Code Join -->
             <div class="lobby-browser-pane" data-pane-id="rooms">
               <div class="pane-header">
                 <div class="pane-title-wrap">
-                  <h3>Active Rooms</h3>
-                  <span id="public-lobby-count" class="meta-pill">1 Active</span>
+                  <h3>Open Rooms</h3>
+                  <span id="public-lobby-count" class="meta-pill">1 Open</span>
+                </div>
+                <div class="pane-header-actions">
+                  <button
+                    type="button"
+                    id="btn-hub-copy-invite"
+                    class="mini-action-btn"
+                    title="Copy or Share Room Invite Link"
+                  >
+                    <span
+                      class="icon-slot"
+                      data-icon="link"
+                      data-icon-size="14"
+                    ></span>
+                    <span>Invite Link</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="btn-refresh-lobbies"
+                    class="mini-action-btn"
+                    title="Refresh Open Rooms"
+                    aria-label="Refresh Open Rooms"
+                  >
+                    <span
+                      class="icon-slot"
+                      data-icon="refresh"
+                      data-icon-size="14"
+                    ></span>
+                    <span class="refresh-btn-label">Refresh</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="quick-join-row">
+                <input
+                  id="join-code-input"
+                  type="text"
+                  maxlength="8"
+                  placeholder="Enter room code"
+                  aria-label="Room Code"
+                  autocapitalize="characters"
+                  autocomplete="off"
+                  autocorrect="off"
+                  spellcheck="false"
+                  enterkeyhint="go"
+                />
+                <button
+                  type="button"
+                  id="btn-join-code"
+                  class="mini-action-btn join-code-btn"
+                >
+                  <span>Join Code</span>
+                </button>
+              </div>
+
+              <div id="lobby-browser-list" class="lobby-browser-list"></div>
+            </div>
+
+            <!-- Right Pane: Room Rules -->
+            <div class="match-config-pane" data-pane-id="setup">
+              <div class="pane-header">
+                <div class="pane-title-wrap">
+                  <h3>Room Rules</h3>
                 </div>
                 <button
                   type="button"
-                  id="btn-refresh-lobbies"
+                  id="btn-hub-restart-match"
                   class="mini-action-btn"
-                  title="Refresh Room List"
+                  title="Restart Current Match from Round 1"
                 >
                   <span
                     class="icon-slot"
                     data-icon="refresh"
                     data-icon-size="13"
                   ></span>
-                  <span>Refresh</span>
+                  <span>Restart Match</span>
                 </button>
-              </div>
-
-              <div id="lobby-browser-list" class="lobby-browser-list"></div>
-
-              <div class="lobby-browser-footer">
-                Share your invite link or room code so friends join your island ring.
-              </div>
-            </div>
-
-            <!-- Right Pane: Match Setup -->
-            <div class="match-config-pane" data-pane-id="setup">
-              <div class="pane-header">
-                <div class="pane-title-wrap">
-                  <h3>Match Setup</h3>
-                  <span id="config-host-badge" class="meta-pill">Custom Rules</span>
-                </div>
               </div>
 
               <div class="config-matrix">
                 <!-- Row 1: Room Name & Visibility -->
                 <div class="config-row">
                   <label class="config-label" for="cfg-room-name">
-                    Room Title &amp; Visibility
+                    Room Name
                   </label>
                   <div class="config-inline-split">
                     <input
@@ -685,7 +915,11 @@
                       class="cfg-text-input"
                       type="text"
                       maxlength="26"
-                      placeholder="Sunlit Citadel"
+                      placeholder="Meadow Gate #1"
+                      autocomplete="off"
+                      autocorrect="off"
+                      spellcheck="false"
+                      enterkeyhint="done"
                     />
                     <div
                       class="segmented-control"
@@ -706,9 +940,9 @@
                   </div>
                 </div>
 
-                <!-- Row 2: Total Rounds -->
+                <!-- Row 2: Rounds -->
                 <div class="config-row">
-                  <label class="config-label">Match Length</label>
+                  <label class="config-label">Rounds</label>
                   <div
                     class="segmented-control"
                     id="cfg-rounds-group"
@@ -741,91 +975,86 @@
                       60s
                     </button>
                     <button type="button" class="seg-btn active" data-val="0">
-                      Standard
+                      Default
                     </button>
                     <button type="button" class="seg-btn" data-val="120">
                       120s
                     </button>
                     <button type="button" class="seg-btn" data-val="999">
-                      Relaxed ∞
+                      ∞
                     </button>
                   </div>
                 </div>
 
-                <!-- Row 4: Pillar Supply -->
+                <!-- Row 4: Wall Supply -->
                 <div class="config-row">
-                  <label class="config-label">Stone Pillar Supply</label>
+                  <label class="config-label">Wall Supply</label>
                   <div
                     class="segmented-control"
                     id="cfg-gold-group"
                     data-setting="goldMultiplier"
                   >
                     <button type="button" class="seg-btn" data-val="0.8">
-                      80% Lean
+                      80%
                     </button>
                     <button type="button" class="seg-btn active" data-val="1">
-                      100% Standard
+                      Normal
                     </button>
                     <button type="button" class="seg-btn" data-val="1.25">
-                      125% Abundant
+                      125%
                     </button>
                   </div>
                 </div>
 
-                <!-- Row 5: AI Opponents -->
+                <!-- Row 5: Bots -->
                 <div class="config-row">
-                  <label class="config-label">AI Opponents &amp; Tier</label>
-                  <div class="config-inline-split wrap-on-mobile">
-                    <div
-                      class="segmented-control"
-                      id="cfg-botcount-group"
-                      data-setting="botCount"
-                    >
-                      <button type="button" class="seg-btn" data-val="0">
-                        0
-                      </button>
-                      <button type="button" class="seg-btn" data-val="1">
-                        1
-                      </button>
-                      <button type="button" class="seg-btn" data-val="2">
-                        2
-                      </button>
-                      <button type="button" class="seg-btn active" data-val="3">
-                        3 Bots
-                      </button>
-                      <button type="button" class="seg-btn" data-val="5">
-                        5 Bots
-                      </button>
-                    </div>
-                    <div
-                      class="segmented-control"
-                      id="cfg-botdiff-group"
-                      data-setting="botDifficulty"
-                    >
-                      <button type="button" class="seg-btn" data-val="NOVICE">
-                        Novice
-                      </button>
-                      <button
-                        type="button"
-                        class="seg-btn active"
-                        data-val="ARCHITECT"
-                      >
-                        Architect
-                      </button>
-                      <button
-                        type="button"
-                        class="seg-btn"
-                        data-val="GRANDMASTER"
-                      >
-                        Grandmaster
-                      </button>
-                    </div>
+                  <label class="config-label">Bots</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-botcount-group"
+                    data-setting="botCount"
+                  >
+                    <button type="button" class="seg-btn" data-val="0">0</button>
+                    <button type="button" class="seg-btn" data-val="1">1</button>
+                    <button type="button" class="seg-btn" data-val="2">2</button>
+                    <button type="button" class="seg-btn active" data-val="3">
+                      3
+                    </button>
+                    <button type="button" class="seg-btn" data-val="5">5</button>
                   </div>
                 </div>
 
-                <!-- Row 6: Scouting Visibility -->
+                <!-- Row 6: Bot Skill -->
                 <div class="config-row">
-                  <label class="config-label">Rival Island Scouting</label>
+                  <label class="config-label">Bot Skill</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-botdiff-group"
+                    data-setting="botDifficulty"
+                  >
+                    <button type="button" class="seg-btn" data-val="NOVICE">
+                      Easy
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn active"
+                      data-val="ARCHITECT"
+                    >
+                      Normal
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      data-val="GRANDMASTER"
+                    >
+                      Hard
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Row 7: Rival Mazes -->
+                <div class="config-row">
+                  <label class="config-label">Rival Mazes</label>
                   <div
                     class="segmented-control"
                     id="cfg-fog-group"
@@ -836,10 +1065,10 @@
                       class="seg-btn active"
                       data-val="false"
                     >
-                      Open Sight
+                      Visible
                     </button>
                     <button type="button" class="seg-btn" data-val="true">
-                      Fog of War
+                      Hidden
                     </button>
                   </div>
                 </div>
@@ -852,7 +1081,7 @@
                   class="hub-secondary-btn"
                   title="Update Rules in Current Room"
                 >
-                  Apply to Room
+                  Update Room
                 </button>
                 <button
                   type="button"
@@ -860,14 +1089,14 @@
                   class="dock-ready-btn"
                   title="Create a New Room with These Rules"
                 >
-                  Create New Room
+                  New Room
                 </button>
               </div>
             </div>
           </div>
         </section>
 
-        <!-- TAB 2: HALL OF FAME (LEADERBOARD) -->
+        <!-- TAB 2: LEADERBOARD -->
         <section id="hub-tab-leaderboard" class="hub-tab-body hidden">
           <div class="leaderboard-header-bar">
             <div class="segmented-control" id="leaderboard-mode-group">
@@ -883,7 +1112,7 @@
                 class="seg-btn"
                 data-lb-mode="champions"
               >
-                Career Champions
+                Top Players
               </button>
             </div>
 
@@ -895,65 +1124,67 @@
           <div id="leaderboard-table-wrap" class="leaderboard-table-wrap"></div>
         </section>
 
-        <!-- TAB 3: HOW TO PLAY (PLAYER-FRIENDLY VISUAL GUIDE) -->
+        <!-- TAB 3: HOW TO PLAY (Single-Source Guide) -->
         <section id="hub-tab-codex" class="hub-tab-body hidden">
-          <div class="codex-grid hub-codex-grid">
-            <div class="codex-item">
-              <div class="codex-card-head">
-                <span class="codex-icon" data-icon="pillar" data-icon-size="20"></span>
-                <h4>1. Shape the Labyrinth</h4>
+          <div id="codex-guide-content" class="guide-content-wrap">
+            <div class="codex-grid hub-codex-grid">
+              <div class="codex-item">
+                <div class="codex-card-head">
+                  <span class="codex-icon" data-icon="pillar" data-icon-size="19"></span>
+                  <h4>1. Build Stone Walls</h4>
+                </div>
+                <p>
+                  Place <strong>2×2 Stone Walls</strong> anywhere on open grass. Nearby blocks connect into walls automatically to wind the runner from the <strong>North Gate</strong> to the <strong>South Shrine</strong>. Removing walls is always free.
+                </p>
               </div>
-              <p>
-                Place <strong>2×2 Stone Pillars</strong> (100% refund when reclaimed) anywhere on the sunlit meadow. Nearby pillars automatically connect into straight and diagonal stone walls to wind runners from the <strong>North Gate</strong> to the <strong>South Shrine</strong>.
-              </p>
+
+              <div class="codex-item">
+                <div class="codex-card-head">
+                  <span class="codex-icon" data-icon="bolt" data-icon-size="19"></span>
+                  <h4>2. Route Past Spires</h4>
+                </div>
+                <p>
+                  Fold switchbacks and spirals around map spires for repeated hits. <strong>Storm Spires</strong> slow by 50%, <strong>Frost Obelisks</strong> chill inside their ring plus 45% bursts, and <strong>Chrono Spires</strong> slow by 55% while recharging other spires.
+                </p>
+              </div>
+
+              <div class="codex-item">
+                <div class="codex-card-head">
+                  <span class="codex-icon" data-icon="keep" data-icon-size="19"></span>
+                  <h4>3. Link Keeps for Overcharge</h4>
+                </div>
+                <p>
+                  Connect red <strong>Crimson Keeps</strong> through your walls to nearby spires to grant up to three <strong>Overcharge diamonds</strong>, expanding spire range, speeding up pulses, and piercing Juggernaut armor.
+                </p>
+              </div>
+
+              <div class="codex-item">
+                <div class="codex-card-head">
+                  <span class="codex-icon" data-icon="starFilled" data-icon-size="19"></span>
+                  <h4>4. Outlast Rivals &amp; Beat Par</h4>
+                </div>
+                <p>
+                  Longest runner survival time wins each round, plus <strong>+2 bonus points</strong> for beating the round Par target. Adapt your maze for swift Outriders, armored Juggernauts, and Wind Heralds.
+                </p>
+              </div>
             </div>
 
-            <div class="codex-item">
-              <div class="codex-card-head">
-                <span class="codex-icon" data-icon="bolt" data-icon-size="20"></span>
-                <h4>2. Route Past Elemental Spires</h4>
+            <div class="controls-summary-card">
+              <div class="controls-row touch-only-hint">
+                <strong>Touch Controls:</strong>
+                <span>Tap or hold-drag to aim wall · Nudge 1 tile with arrows · Tap Place to build · Pinch to zoom</span>
               </div>
-              <p>
-                Fold switchbacks and spirals around map spires for repeated hits: <strong>Storm Spires</strong> unleash a 50% shock slow, <strong>Frost Obelisks</strong> chill runners inside a permafrost aura plus glacial pulses, and <strong>Chrono Spires</strong> warp time while recharging other spires.
-              </p>
-            </div>
-
-            <div class="codex-item">
-              <div class="codex-card-head">
-                <span class="codex-icon" data-icon="keep" data-icon-size="20"></span>
-                <h4>3. Link Keeps for Overcharge</h4>
+              <div class="controls-row desktop-only-hint">
+                <strong>Desktop Controls:</strong>
+                <span>Left-click build · Right-click remove · Drag or WASD to pan · <kbd>Q</kbd> Build · <kbd>X</kbd> Remove · <kbd>Z</kbd> Undo · <kbd>Space</kbd> Ready · <kbd>Tab</kbd> All Islands</span>
               </div>
-              <p>
-                Connect pre-placed <strong>Crimson Keeps</strong> into the same wall network as an Elemental Spire to <strong>Overcharge</strong> it (up to 3 stars)—expanding spire radius, shortening cooldowns, and piercing heavy Juggernaut armor.
-              </p>
-            </div>
-
-            <div class="codex-item">
-              <div class="codex-card-head">
-                <span class="codex-icon" data-icon="crown" data-icon-size="20"></span>
-                <h4>4. Outlast Rivals &amp; Beat Par</h4>
-              </div>
-              <p>
-                Longest runner survival time wins each round, with <strong>+2 bonus points</strong> for beating the round’s Par target. Adapt your layout for swift <strong>Outriders</strong>, armored <strong>Juggernauts</strong>, and gale-hasted <strong>Wind Heralds</strong>.
-              </p>
-            </div>
-          </div>
-
-          <div class="controls-summary-card">
-            <div class="controls-row">
-              <strong>Touch Controls:</strong>
-              <span>Tap grass to preview &amp; confirm · Tap existing pillar to reclaim · Drag to pan · Pinch to zoom</span>
-            </div>
-            <div class="controls-row desktop-only-hint">
-              <strong>Desktop Controls:</strong>
-              <span>Left-click build · Right-click reclaim · Drag / WASD or Arrows to pan · Q Build · E Reclaim · Space Ready · Tab Overview</span>
             </div>
           </div>
         </section>
       </div>
     </div>
 
-    <!-- Quick How to Play Overlay (? Button in Arena) -->
+    <!-- In-Game Quick Guide Modal (Hydrated From Single-Source Guide) -->
     <div id="help-modal" class="modal-backdrop hidden">
       <div class="modal-card surface-panel">
         <div class="modal-header">
@@ -965,70 +1196,19 @@
               class="drawer-close-btn"
               aria-label="Close Guide"
             >
-              <span class="icon-slot" data-icon="close" data-icon-size="16"></span>
+              <span class="icon-slot" data-icon="close" data-icon-size="17"></span>
             </button>
           </div>
           <p>
-            Every open grass tile inside the limestone border is buildable—craft the longest survival path!
+            Every open grass tile inside the limestone border is buildable. Longest survival run wins each round.
           </p>
         </div>
 
-        <div class="codex-grid">
-          <div class="codex-item">
-            <div class="codex-card-head">
-              <span class="codex-icon" data-icon="pillar" data-icon-size="18"></span>
-              <h4>Stone Pillars</h4>
-            </div>
-            <p>
-              Place <strong>2×2 Stone Pillars</strong> (100% refund when reclaimed). Adjacent pillars connect automatically in straight, 45° diagonal, and angled steps.
-            </p>
-          </div>
-
-          <div class="codex-item">
-            <div class="codex-card-head">
-              <span class="codex-icon" data-icon="bolt" data-icon-size="18"></span>
-              <h4>Elemental Spires</h4>
-            </div>
-            <p>
-              Weave paths around <strong>Storm</strong> (50% shock), <strong>Frost</strong> (continuous chill + nova), and <strong>Chrono</strong> (time-warp + global spire recharge) spires.
-            </p>
-          </div>
-
-          <div class="codex-item">
-            <div class="codex-card-head">
-              <span class="codex-icon" data-icon="keep" data-icon-size="18"></span>
-              <h4>Crimson Keep Overcharge</h4>
-            </div>
-            <p>
-              Link <strong>Crimson Keeps</strong> through your walls to nearby spires to grant Overcharge stars—boosting range, haste, and armor pierce.
-            </p>
-          </div>
-
-          <div class="codex-item">
-            <div class="codex-card-head">
-              <span class="codex-icon" data-icon="crown" data-icon-size="18"></span>
-              <h4>Runners &amp; Par</h4>
-            </div>
-            <p>
-              Longest survival from North Gate to South Shrine wins each round. Beat the Par target for <strong>+2 bonus points</strong>.
-            </p>
-          </div>
-        </div>
-
-        <div class="controls-summary-card">
-          <div class="controls-row">
-            <strong>Touch:</strong>
-            <span>Tap grass to preview &amp; confirm · Tap pillar to reclaim · Drag to pan · Pinch to zoom</span>
-          </div>
-          <div class="controls-row desktop-only-hint">
-            <strong>Desktop:</strong>
-            <span>Drag / WASD or Arrows to pan · Q Build · E Reclaim · Space Ready · Tab Overview</span>
-          </div>
-        </div>
+        <div id="help-guide-content" class="guide-content-wrap"></div>
 
         <div class="modal-actions">
           <button type="button" id="btn-close-help" class="dock-ready-btn">
-            Back to Arena
+            Back to Island
           </button>
         </div>
       </div>
