@@ -437,20 +437,18 @@ function passesMasonryRules(
     if (kpBridges > 3) return false;
   }
 
-  if (!options.allowSliverSeal) {
-    for (let i = 0; i < ctx.towers.length; i++) {
-      const t = ctx.towers[i];
-      if (Math.abs(t.x - x) > 2 || Math.abs(t.y - y) > 2) continue;
-      let tBridges = 0;
-      for (let m = 0; m < localMasonry.length; m++) {
-        const other = localMasonry[m];
-        if (other.x === t.x && other.y === t.y) continue;
-        if (areMasonryNodesBridged(t.x, t.y, other.x, other.y, localMasonry)) {
-          tBridges++;
-        }
+  for (let i = 0; i < ctx.towers.length; i++) {
+    const t = ctx.towers[i];
+    if (Math.abs(t.x - x) > 2 || Math.abs(t.y - y) > 2) continue;
+    let tBridges = 0;
+    for (let m = 0; m < localMasonry.length; m++) {
+      const other = localMasonry[m];
+      if (other.x === t.x && other.y === t.y) continue;
+      if (areMasonryNodesBridged(t.x, t.y, other.x, other.y, localMasonry)) {
+        tBridges++;
       }
-      if (tBridges > 3) return false;
     }
+    if (tBridges > maxRawDeg) return false;
   }
 
   if (bridgedNeighbors.length > 0) return true;
@@ -537,6 +535,11 @@ function tryPlaceWallDetailed(
     };
   }
 
+  commitValidatedWall(ctx, x, y);
+  return { placed: true, blockedPath: false, pathResult: check.pathResult };
+}
+
+function commitValidatedWall(ctx: BuilderContext, x: number, y: number): void {
   ctx.towers.push({
     id: `${ctx.idPrefix}_${ctx.idSeq++}`,
     type: 'BLOCK',
@@ -551,8 +554,6 @@ function tryPlaceWallDetailed(
   ctx.occupied[r0 + 1] = 1;
   ctx.occupied[r1] = 1;
   ctx.occupied[r1 + 1] = 1;
-
-  return { placed: true, blockedPath: false, pathResult: check.pathResult };
 }
 
 function removeWallAtIndex(ctx: BuilderContext, idx: number): void {
@@ -625,12 +626,50 @@ function buildVerifiedBaffle(
   minRequiredDetour = 1.6
 ): BaffleBuildResult {
   const clampY = (y: number) => Math.max(2, Math.min(ctx.gh - 4, y));
-  const minWallX = Math.max(0, cellMinX);
-  const maxWallX = Math.min(ctx.gw - 2, cellMaxX - 1);
   const midRefY = clampY(ryFn(Math.floor(ctx.gw * 0.5)));
+  const remBudget = Math.min(wallCap, ctx.maxWalls) - ctx.towers.length;
 
   const beforePath = computeFullMazePath(ctx.round, ctx.towers);
-  if (!beforePath.valid || minWallX > maxWallX) {
+  if (!beforePath.valid || remBudget < 2) {
+    const cross = measureBandCrossingX(beforePath, midRefY, ctx.gw * 0.5);
+    return {
+      committed: false,
+      actualOpenLeft: cross < ctx.gw * 0.5,
+      crossingX: cross,
+      wallsAdded: 0,
+    };
+  }
+
+  let minWallX = Math.max(0, cellMinX);
+  let maxWallX = Math.min(ctx.gw - 2, cellMaxX - 1);
+  let effWantOpenLeft = wantOpenLeft;
+  let effMinDetour = minRequiredDetour;
+  let effCellMinX = cellMinX;
+  let effCellMaxX = cellMaxX;
+
+  // When remaining walls cannot span the full arena, build a cliff-rooted chicane wing
+  // across the side where the runner currently enters this band instead of rolling back!
+  const fullBricksNeeded = Math.ceil((maxWallX - minWallX + 2) / 2.3);
+  const isPartialWing = remBudget < fullBricksNeeded - 1;
+  if (isPartialWing) {
+    const curCross = measureBandCrossingX(beforePath, midRefY, ctx.gw * 0.5);
+    if (curCross < ctx.gw * 0.5) {
+      minWallX = 0;
+      maxWallX = Math.min(ctx.gw - 4, remBudget * 2 - 2);
+      effCellMinX = 0;
+      effCellMaxX = maxWallX + 1;
+      effWantOpenLeft = false;
+    } else {
+      maxWallX = ctx.gw - 2;
+      minWallX = Math.max(2, ctx.gw - remBudget * 2);
+      effCellMinX = minWallX;
+      effCellMaxX = ctx.gw - 1;
+      effWantOpenLeft = true;
+    }
+    effMinDetour = 0.8;
+  }
+
+  if (minWallX > maxWallX) {
     const cross = measureBandCrossingX(beforePath, midRefY, ctx.gw * 0.5);
     return {
       committed: false,
@@ -641,7 +680,7 @@ function buildVerifiedBaffle(
   }
 
   const prevLen = ctx.towers.length;
-  const fromRightToLeft = wantOpenLeft;
+  const fromRightToLeft = effWantOpenLeft;
 
   const targetXs: number[] = [];
   if (fromRightToLeft) {
@@ -652,16 +691,12 @@ function buildVerifiedBaffle(
     if (targetXs[targetXs.length - 1] !== maxWallX) targetXs.push(maxWallX);
   }
 
+  // Fast batch placement: place the entire masonry row with O(1) rules and validate in 1 A* call!
   for (const bx of targetXs) {
-    if (
-      ctx.towers.length >= wallCap ||
-      ctx.towers.length >= ctx.maxWalls ||
-      ctx.astarRemaining <= 4
-    ) {
+    if (ctx.towers.length >= wallCap || ctx.towers.length >= ctx.maxWalls) {
       break;
     }
     const by = clampY(ryFn(bx));
-
     const r0 = by * ctx.gw + bx;
     const r1 = r0 + ctx.gw;
     if (
@@ -671,11 +706,16 @@ function buildVerifiedBaffle(
       continue;
     }
 
-    const direct = tryPlaceWallDetailed(ctx, bx, by, {
-      allowCliffRoot: true,
-      allowSpireRoot: true,
-    });
-    if (direct.placed || direct.blockedPath) continue;
+    if (
+      canFit2x2Fast(ctx, bx, by) &&
+      passesMasonryRules(ctx, bx, by, {
+        allowCliffRoot: true,
+        allowSpireRoot: true,
+      })
+    ) {
+      commitValidatedWall(ctx, bx, by);
+      continue;
+    }
 
     const dir = fromRightToLeft ? -1 : 1;
     const collarOffsets: Array<[number, number]> = [
@@ -688,35 +728,96 @@ function buildVerifiedBaffle(
     ];
     for (const [cx, cy] of collarOffsets) {
       if (cx < minWallX || cx > maxWallX) continue;
+      const cby = clampY(cy);
       if (
-        tryPlaceWallDetailed(ctx, cx, clampY(cy), {
+        canFit2x2Fast(ctx, cx, cby) &&
+        passesMasonryRules(ctx, cx, cby, {
           allowCliffRoot: true,
           allowSpireRoot: true,
           allowSliverSeal: true,
-        }).placed
+        })
       ) {
+        commitValidatedWall(ctx, cx, cby);
         break;
       }
     }
   }
 
-  for (let guard = 0; guard < 5; guard++) {
+  ctx.astarRemaining = Math.max(0, ctx.astarRemaining - 1);
+  let latestPath = computeFullMazePath(ctx.round, ctx.towers);
+
+  // Fallback to brick-by-brick validation ONLY when the batch row pinched a Keep/Spire choke
+  if (!latestPath.valid) {
+    rollbackTowersTo(ctx, prevLen);
+    for (const bx of targetXs) {
+      if (
+        ctx.towers.length >= wallCap ||
+        ctx.towers.length >= ctx.maxWalls ||
+        ctx.astarRemaining <= 4
+      ) {
+        break;
+      }
+      const by = clampY(ryFn(bx));
+      const r0 = by * ctx.gw + bx;
+      const r1 = r0 + ctx.gw;
+      if (
+        (ctx.occupied[r0] || ctx.occupied[r1]) &&
+        (ctx.occupied[r0 + 1] || ctx.occupied[r1 + 1])
+      ) {
+        continue;
+      }
+
+      const direct = tryPlaceWallDetailed(ctx, bx, by, {
+        allowCliffRoot: true,
+        allowSpireRoot: true,
+      });
+      if (direct.placed) {
+        if (direct.pathResult) latestPath = direct.pathResult;
+        continue;
+      }
+      if (direct.blockedPath) continue;
+
+      const dir = fromRightToLeft ? -1 : 1;
+      const collarOffsets: Array<[number, number]> = [
+        [bx + dir, by],
+        [bx - dir, by],
+        [bx, by + 1],
+        [bx, by - 1],
+        [bx, by + 2],
+        [bx, by - 2],
+      ];
+      for (const [cx, cy] of collarOffsets) {
+        if (cx < minWallX || cx > maxWallX) continue;
+        const cRes = tryPlaceWallDetailed(ctx, cx, clampY(cy), {
+          allowCliffRoot: true,
+          allowSpireRoot: true,
+          allowSliverSeal: true,
+        });
+        if (cRes.placed) {
+          if (cRes.pathResult) latestPath = cRes.pathResult;
+          break;
+        }
+      }
+    }
+    latestPath = computeFullMazePath(ctx.round, ctx.towers);
+  }
+
+  for (let guard = 0; guard < 4; guard++) {
     if (
       ctx.towers.length >= wallCap ||
       ctx.towers.length >= ctx.maxWalls ||
-      ctx.astarRemaining <= 4
+      ctx.astarRemaining <= 4 ||
+      !latestPath.valid
     ) {
       break;
     }
-    const path = computeFullMazePath(ctx.round, ctx.towers);
-    if (!path.valid) break;
 
     let leakCell: GridPoint | null = null;
-    for (let i = 1; i < path.allPoints.length - 1; i++) {
-      const pt = path.allPoints[i];
+    for (let i = 1; i < latestPath.allPoints.length - 1; i++) {
+      const pt = latestPath.allPoints[i];
       const lx = Math.floor(pt.x);
       const ly = Math.floor(pt.y);
-      if (lx < cellMinX || lx > cellMaxX) continue;
+      if (lx < effCellMinX || lx > effCellMaxX) continue;
       const bandY = clampY(ryFn(Math.min(ctx.gw - 2, Math.max(0, lx))));
       if (ly >= bandY && ly <= bandY + 1) {
         leakCell = { x: lx, y: ly };
@@ -742,13 +843,13 @@ function buildVerifiedBaffle(
     let plugged = false;
     for (const [px, py] of plugs) {
       if (px < minWallX || px > maxWallX) continue;
-      if (
-        tryPlaceWallDetailed(ctx, px, py, {
-          allowCliffRoot: true,
-          allowSpireRoot: true,
-          allowSliverSeal: true,
-        }).placed
-      ) {
+      const pRes = tryPlaceWallDetailed(ctx, px, py, {
+        allowCliffRoot: true,
+        allowSpireRoot: true,
+        allowSliverSeal: true,
+      });
+      if (pRes.placed) {
+        if (pRes.pathResult) latestPath = pRes.pathResult;
         plugged = true;
         break;
       }
@@ -756,15 +857,19 @@ function buildVerifiedBaffle(
     if (!plugged) break;
   }
 
-  const afterPath = computeFullMazePath(ctx.round, ctx.towers);
+  const afterPath = latestPath.valid
+    ? latestPath
+    : computeFullMazePath(ctx.round, ctx.towers);
   const wallsAdded = ctx.towers.length - prevLen;
   const distGain = afterPath.totalDistance - beforePath.totalDistance;
   const crossX = measureBandCrossingX(afterPath, midRefY, ctx.gw * 0.5);
-  const reachedTargetSide = wantOpenLeft
+  const reachedTargetSide = isPartialWing
+    ? distGain >= effMinDetour
+    : effWantOpenLeft
     ? crossX < ctx.gw * 0.48
     : crossX > ctx.gw * 0.52;
 
-  if (wallsAdded > 0 && distGain < minRequiredDetour && !reachedTargetSide) {
+  if (wallsAdded > 0 && distGain < effMinDetour && !reachedTargetSide) {
     rollbackTowersTo(ctx, prevLen);
     const revCross = measureBandCrossingX(beforePath, midRefY, ctx.gw * 0.5);
     return {
@@ -814,6 +919,8 @@ function corridorPluggedBetween(
 
 /**
  * Exact O(gh² * K) Dynamic Programming row selector packing non-colliding Spire-aligned rows.
+ * When `sawtoothMode` is active (`maxWalls >= 40`), opens a 3-tile North Apron (`minY = 3`) and
+ * rewards `stride = 5` (3-tile corridors) so alternating sawtooth slalom teeth fit cleanly!
  */
 function selectOptimalBaffleRowsDP(
   round: RoundConfig,
@@ -921,13 +1028,13 @@ function buildSwitchbackScaffold(
       ? Math.min(3, Math.max(2, Math.floor(scaffoldBudget / 6)))
       : difficulty === 'ARCHITECT'
       ? Math.min(4, Math.max(3, Math.floor(scaffoldBudget / 6.2)))
-      : Math.min(6, Math.max(4, Math.round(scaffoldBudget / 6.0)));
+      : Math.min(6, Math.max(4, Math.ceil(scaffoldBudget / 7.2)));
 
   const rows = selectOptimalBaffleRowsDP(ctx.round, desiredBaffles, minStride);
   let wantOpenLeft = chooseInitialOpenLeft(ctx.round, flipPolarity);
 
   for (const ry of rows) {
-    if (ctx.towers.length >= scaffoldBudget || ctx.astarRemaining <= 6) break;
+    if (ctx.towers.length >= scaffoldBudget || ctx.astarRemaining <= 4) break;
     const cellMinX = wantOpenLeft ? turnGap : 0;
     const cellMaxX = wantOpenLeft ? ctx.gw - 1 : ctx.gw - 1 - turnGap;
 
@@ -951,28 +1058,27 @@ function buildSpiralScaffold(
   scaffoldBudget: number,
   flipPolarity: boolean
 ): void {
-  const spires = [...ctx.round.preplacedSpires];
-  if (spires.length === 0) {
+  const frostSpires = ctx.round.preplacedSpires.filter(
+    (s) => s.spireType === 'FROST_OBELISK'
+  );
+  if (frostSpires.length === 0) {
     buildSwitchbackScaffold(ctx, difficulty, scaffoldBudget, flipPolarity);
     return;
   }
 
   const centerX = ctx.gw * 0.5 - 1;
   const centerY = ctx.gh * 0.5 - 1;
-  spires.sort((a, b) => {
-    const aFrost = a.spireType === 'FROST_OBELISK' ? 1 : 0;
-    const bFrost = b.spireType === 'FROST_OBELISK' ? 1 : 0;
-    if (aFrost !== bFrost) return bFrost - aFrost;
-    return (
+  frostSpires.sort(
+    (a, b) =>
       Math.hypot(a.x - centerX, a.y - centerY) -
       Math.hypot(b.x - centerX, b.y - centerY)
-    );
-  });
+  );
 
-  const primary = spires[0];
+  const primary = frostSpires[0];
   const sy = Math.max(6, Math.min(ctx.gh - 8, primary.y));
   const turnGap =
     difficulty === 'NOVICE' ? 4 : difficulty === 'ARCHITECT' ? 3 : 2;
+  const baseStride = 4;
 
   const yTop = Math.max(
     2,
@@ -983,20 +1089,25 @@ function buildSpiralScaffold(
     sy + (corridorPluggedBetween(ctx.round, sy, sy + 4) ? 5 : 4)
   );
 
+  const maxBands =
+    difficulty === 'NOVICE' ? 3 : difficulty === 'ARCHITECT' ? 4 : 6;
+
   const bandYs: number[] = [yTop, sy, yBot];
   let ny = yTop;
-  while (ny - 4 >= 2 && bandYs.length < (difficulty === 'NOVICE' ? 3 : 6)) {
-    const step = corridorPluggedBetween(ctx.round, ny - 4, ny) ? 5 : 4;
+  while (ny - baseStride >= 2 && bandYs.length < maxBands) {
+    const step = corridorPluggedBetween(ctx.round, ny - baseStride, ny)
+      ? baseStride + 1
+      : baseStride;
     if (ny - step < 2) break;
     ny -= step;
     bandYs.unshift(ny);
   }
 
   let by = yBot;
-  const maxBands =
-    difficulty === 'NOVICE' ? 3 : difficulty === 'ARCHITECT' ? 4 : 6;
-  while (by + 4 <= ctx.gh - 4 && bandYs.length < maxBands) {
-    const step = corridorPluggedBetween(ctx.round, by, by + 4) ? 5 : 4;
+  while (by + baseStride <= ctx.gh - 4 && bandYs.length < maxBands) {
+    const step = corridorPluggedBetween(ctx.round, by, by + baseStride)
+      ? baseStride + 1
+      : baseStride;
     if (by + step > ctx.gh - 4) break;
     by += step;
     bandYs.push(by);
@@ -1011,24 +1122,11 @@ function buildSpiralScaffold(
     coreIdx % 2 === 0 ? desiredCoreOpenLeft : !desiredCoreOpenLeft;
 
   for (const rowY of bandYs) {
-    if (ctx.towers.length >= scaffoldBudget || ctx.astarRemaining <= 6) break;
+    if (ctx.towers.length >= scaffoldBudget || ctx.astarRemaining <= 4) break;
     const isCore = rowY === sy;
 
-    let cellMinX = wantOpenLeft ? turnGap : 0;
-    let cellMaxX = wantOpenLeft ? ctx.gw - 1 : ctx.gw - 1 - turnGap;
-
-    if (isCore) {
-      if (wantOpenLeft) {
-        cellMinX = Math.max(turnGap, Math.min(primary.x - 2, ctx.gw - 5));
-        cellMaxX = ctx.gw - 1;
-      } else {
-        cellMinX = 0;
-        cellMaxX = Math.min(
-          ctx.gw - 1 - turnGap,
-          Math.max(primary.x + 3, 4)
-        );
-      }
-    }
+    const cellMinX = wantOpenLeft ? turnGap : 0;
+    const cellMaxX = wantOpenLeft ? ctx.gw - 1 : ctx.gw - 1 - turnGap;
 
     const res = buildVerifiedBaffle(
       ctx,
@@ -1046,7 +1144,7 @@ function buildSpiralScaffold(
         isCore &&
         difficulty !== 'NOVICE' &&
         ctx.towers.length < scaffoldBudget &&
-        ctx.astarRemaining > 6
+        ctx.astarRemaining > 4
       ) {
         const flankX = res.actualOpenLeft ? primary.x - 4 : primary.x + 4;
         if (flankX >= turnGap && flankX <= ctx.gw - 2 - turnGap) {
@@ -1082,7 +1180,7 @@ function buildClapChainScaffold(
       ? 3
       : difficulty === 'ARCHITECT'
       ? 4
-      : Math.min(6, Math.max(4, Math.round(scaffoldBudget / 6.0)));
+      : Math.min(6, Math.max(4, Math.ceil(scaffoldBudget / 7.2)));
 
   const rows = selectOptimalBaffleRowsDP(ctx.round, desiredStages, minStride);
 
@@ -1110,7 +1208,7 @@ function buildClapChainScaffold(
   const apexEnd = Math.ceil(ctx.gw * 0.56);
 
   for (let idx = 0; idx < rows.length; idx++) {
-    if (ctx.towers.length >= scaffoldBudget || ctx.astarRemaining <= 6) break;
+    if (ctx.towers.length >= scaffoldBudget || ctx.astarRemaining <= 4) break;
     const baseY = rows[idx];
     const prevY = idx > 0 ? rows[idx - 1] : -10;
     const nextY = idx + 1 < rows.length ? rows[idx + 1] : ctx.gh + 10;
@@ -1171,9 +1269,31 @@ function buildClapChainScaffold(
   }
 }
 
+function isSpireHitByPath(
+  path: PathResult,
+  sp: { x: number; y: number; spireType?: SpireType },
+  tier: number
+): boolean {
+  const sType: SpireType = sp.spireType || 'THUNDERCLAP';
+  const radSq = Math.pow(
+    getEffectiveSpireStats(sType, tier).effectiveRange + 0.15,
+    2
+  );
+  const cx = sp.x + 1.0;
+  const cy = sp.y + 1.0;
+  const pts = path.allPoints;
+  for (let i = 0; i < pts.length; i++) {
+    const dx = pts[i].x - cx;
+    const dy = pts[i].y - cy;
+    if (dx * dx + dy * dy <= radSq) return true;
+  }
+  return false;
+}
+
 /**
- * Stage 3: Bridges Crimson Keeps into Spire perimeters ONLY when the target Spire is actively
- * hit by the runner's route.
+ * Stage 3: Zero-Sim Geometric Keep-to-Spire Overcharge Bridging (<1ms).
+ * Connects Crimson Keeps into Spire perimeters strictly when the target Spire is actively
+ * hit by the runner's route, without burning 60Hz tick simulations per candidate!
  */
 function bridgeKeepsForOvercharge(
   ctx: BuilderContext,
@@ -1189,8 +1309,7 @@ function bridgeKeepsForOvercharge(
   while (
     ctx.towers.length < ctx.maxWalls &&
     passes < 3 &&
-    ctx.astarRemaining > 10 &&
-    ctx.simRemaining > 4
+    ctx.astarRemaining > 6
   ) {
     passes++;
     const baseCirc = computeCitadelCircuitry(ctx.round, ctx.towers);
@@ -1198,7 +1317,15 @@ function bridgeKeepsForOvercharge(
 
     const basePath = computeFullMazePath(ctx.round, ctx.towers);
     if (!basePath.valid) break;
-    const baseEval = evalSimCounted(ctx, ctx.towers, basePath);
+    const baseGeo = scorePathWithMapFeatures(
+      ctx.round,
+      basePath,
+      baseCirc.spireOverchargeTiers
+    );
+
+    const activeSpireFlags = ctx.round.preplacedSpires.map((sp, idx) =>
+      isSpireHitByPath(basePath, sp, (baseCirc.spireOverchargeTiers[idx] || 0) + 1)
+    );
 
     const candidateSet = new Map<number, GridPoint>();
     ctx.round.obstacles.forEach((kp, kIdx) => {
@@ -1213,9 +1340,8 @@ function bridgeKeepsForOvercharge(
       }
     });
     ctx.round.preplacedSpires.forEach((sp, sIdx) => {
-      const activeHits = baseEval.perSpireClaps[`spire_${sIdx}`] || 0;
       if (
-        activeHits > 0 &&
+        activeSpireFlags[sIdx] &&
         (baseCirc.spireOverchargeTiers[sIdx] || 0) < targetMaxTier
       ) {
         for (let dy = -3; dy <= 3; dy++) {
@@ -1233,7 +1359,7 @@ function bridgeKeepsForOvercharge(
 
     let bestSingle: { x: number; y: number; gainScore: number } | null = null;
     for (const cand of candidateSet.values()) {
-      if (ctx.astarRemaining <= 6 || ctx.simRemaining <= 3) break;
+      if (ctx.astarRemaining <= 4) break;
       if (!passesMasonryRules(ctx, cand.x, cand.y, { allowSpireRoot: false })) {
         continue;
       }
@@ -1249,7 +1375,7 @@ function bridgeKeepsForOvercharge(
         const diffTier =
           (nextCirc.spireOverchargeTiers[s] || 0) -
           (baseCirc.spireOverchargeTiers[s] || 0);
-        if (diffTier > 0 && (baseEval.perSpireClaps[`spire_${s}`] || 0) > 0) {
+        if (diffTier > 0 && activeSpireFlags[s]) {
           activeOverDelta += diffTier;
         }
       }
@@ -1257,39 +1383,39 @@ function bridgeKeepsForOvercharge(
 
       const check = validateCounted(ctx, ctx.towers, cand.x, cand.y);
       if (!check.valid || !check.pathResult) continue;
+      if (check.pathResult.totalDistance < basePath.totalDistance - 0.15) {
+        continue;
+      }
 
-      const sim = evalSimCounted(ctx, testTowers, check.pathResult);
-      const dt = sim.finishTimeSeconds - baseEval.finishTimeSeconds;
-      if (dt < -0.2) continue;
+      const geoDelta =
+        scorePathWithMapFeatures(
+          ctx.round,
+          check.pathResult,
+          nextCirc.spireOverchargeTiers
+        ) - baseGeo;
 
       const gainScore =
-        dt * 3.4 + activeOverDelta * (isJuggernaut ? 4.2 : 2.2);
+        geoDelta + activeOverDelta * (isJuggernaut ? 4.2 : 2.2);
       if (gainScore > 0.8 && (!bestSingle || gainScore > bestSingle.gainScore)) {
         bestSingle = { x: cand.x, y: cand.y, gainScore };
       }
     }
 
-    if (
-      bestSingle &&
-      tryPlaceWallDetailed(ctx, bestSingle.x, bestSingle.y, {
-        allowCliffRoot: false,
-        allowSpireRoot: false,
-      }).placed
-    ) {
+    if (bestSingle) {
+      commitValidatedWall(ctx, bestSingle.x, bestSingle.y);
       continue;
     }
 
     if (
       difficulty === 'GRANDMASTER' &&
       ctx.towers.length + 2 <= ctx.maxWalls &&
-      ctx.astarRemaining > 12 &&
-      ctx.simRemaining > 4
+      ctx.astarRemaining > 8
     ) {
       let bestPair: { a: GridPoint; b: GridPoint; gainScore: number } | null =
         null;
 
       for (let kIdx = 0; kIdx < ctx.round.obstacles.length; kIdx++) {
-        if (ctx.astarRemaining <= 8 || ctx.simRemaining <= 3) break;
+        if (ctx.astarRemaining <= 6) break;
         if (baseCirc.linkedKeepIndices.has(kIdx)) continue;
         const kp = ctx.round.obstacles[kIdx];
 
@@ -1319,7 +1445,7 @@ function bridgeKeepsForOvercharge(
               const dtier =
                 (pairCirc.spireOverchargeTiers[s] || 0) -
                 (baseCirc.spireOverchargeTiers[s] || 0);
-              if (dtier > 0 && (baseEval.perSpireClaps[`spire_${s}`] || 0) > 0) {
+              if (dtier > 0 && activeSpireFlags[s]) {
                 activeOverDelta += dtier;
               }
             }
@@ -1329,15 +1455,20 @@ function bridgeKeepsForOvercharge(
             if (!c1.valid) continue;
             const c2 = validateCounted(ctx, pairTowers.slice(0, -1), bx, by);
             if (!c2.valid || !c2.pathResult) continue;
+            if (c2.pathResult.totalDistance < basePath.totalDistance - 0.1) {
+              continue;
+            }
 
-            const sim = evalSimCounted(ctx, pairTowers, c2.pathResult);
-            const dt = sim.finishTimeSeconds - baseEval.finishTimeSeconds;
-            if (dt < 0.05) continue;
-
+            const geoDelta =
+              scorePathWithMapFeatures(
+                ctx.round,
+                c2.pathResult,
+                pairCirc.spireOverchargeTiers
+              ) - baseGeo;
             const gainScore =
-              dt * 3.2 + activeOverDelta * (isJuggernaut ? 4.5 : 2.4);
+              geoDelta + activeOverDelta * (isJuggernaut ? 4.5 : 2.4);
             if (
-              gainScore > 2.2 &&
+              gainScore > 2.0 &&
               (!bestPair || gainScore > bestPair.gainScore)
             ) {
               bestPair = { a: { x: ax, y: ay }, b: { x: bx, y: by }, gainScore };
@@ -1347,22 +1478,18 @@ function bridgeKeepsForOvercharge(
       }
 
       if (bestPair) {
+        commitValidatedWall(ctx, bestPair.a.x, bestPair.a.y);
         if (
-          tryPlaceWallDetailed(ctx, bestPair.a.x, bestPair.a.y, {
+          canFit2x2Fast(ctx, bestPair.b.x, bestPair.b.y) &&
+          passesMasonryRules(ctx, bestPair.b.x, bestPair.b.y, {
             allowCliffRoot: false,
             allowSpireRoot: false,
-          }).placed
+          })
         ) {
-          if (
-            !tryPlaceWallDetailed(ctx, bestPair.b.x, bestPair.b.y, {
-              allowCliffRoot: false,
-              allowSpireRoot: false,
-            }).placed
-          ) {
-            removeWallAtIndex(ctx, ctx.towers.length - 1);
-          } else {
-            continue;
-          }
+          commitValidatedWall(ctx, bestPair.b.x, bestPair.b.y);
+          continue;
+        } else {
+          removeWallAtIndex(ctx, ctx.towers.length - 1);
         }
       }
     }
@@ -1458,7 +1585,7 @@ function collectRankedPathCandidates(
     for (const [dx, dy] of CLEAN_MASONRY_DIRS) consider(o.x + dx, o.y + dy);
   }
   if (allowCliffRoot) {
-    for (let y = 2; y <= ctx.gh - 4; y += 2) {
+    for (let y = 0; y <= ctx.gh - 2; y += 2) {
       consider(0, y);
       consider(ctx.gw - 2, y);
     }
@@ -1469,26 +1596,37 @@ function collectRankedPathCandidates(
 }
 
 /**
- * Stage 4 & Stage 5: Budget-Counted Frontier Polish + Path-Intersecting Full-Spend Pass.
+ * Stage 4 & Stage 5: Cached-Sim Frontier Polish + Dedicated Full-Budget GRANDMASTER Spend Pass.
  */
 function spendAndPolishWalls(
   ctx: BuilderContext,
   difficulty: BotDifficulty
-): void {
+): MazeEvalResult | null {
+  const isHeavyRound = ctx.round.parTimeSeconds >= 50;
   const maxSteps =
-    difficulty === 'NOVICE' ? 2 : difficulty === 'ARCHITECT' ? 5 : 18;
-  const topK = difficulty === 'NOVICE' ? 2 : 3;
-  const evalBatchCap = difficulty === 'GRANDMASTER' ? 16 : 12;
+    difficulty === 'NOVICE'
+      ? 2
+      : difficulty === 'ARCHITECT'
+      ? 4
+      : isHeavyRound
+      ? 6
+      : 10;
+  const topK = isHeavyRound ? 1 : 2;
+  const targetValidPerStep = difficulty === 'GRANDMASTER' ? 5 : 4;
+
+  let cachedPath: PathResult | null = null;
+  let cachedEval: MazeEvalResult | null = null;
 
   let step = 0;
   while (
     ctx.towers.length < ctx.maxWalls &&
     step < maxSteps &&
-    ctx.astarRemaining > 4 &&
-    ctx.simRemaining > 2
+    ctx.astarRemaining > 3 &&
+    ctx.simRemaining > 1
   ) {
     step++;
-    const curPath = computeFullMazePath(ctx.round, ctx.towers);
+    const curPath: PathResult =
+      cachedPath ?? computeFullMazePath(ctx.round, ctx.towers);
     if (!curPath.valid) break;
 
     const curCirc = computeCitadelCircuitry(ctx.round, ctx.towers);
@@ -1497,13 +1635,16 @@ function spendAndPolishWalls(
       curPath,
       curCirc.spireOverchargeTiers
     );
-    const curEval = evalSimCounted(ctx, ctx.towers, curPath);
+    const curEval: MazeEvalResult =
+      cachedEval ?? evalSimCounted(ctx, ctx.towers, curPath);
+    cachedPath = curPath;
+    cachedEval = curEval;
+
     const curComp =
       curEval.finishTimeSeconds * 4.0 +
       curEval.overchargedSpires * 1.4 +
       curPath.totalDistance * 0.12;
 
-    // Fast path-intersection-only scan first (`includeHalo = false`)
     const directPathCoords = collectRankedPathCandidates(
       ctx,
       curPath,
@@ -1518,9 +1659,13 @@ function spendAndPolishWalls(
       pathResult: PathResult;
     }> = [];
 
-    const limit = Math.min(directPathCoords.length, evalBatchCap);
-    for (let i = 0; i < limit; i++) {
-      if (ctx.astarRemaining <= 2) break;
+    for (
+      let i = 0;
+      i < directPathCoords.length &&
+      geoCandidates.length < targetValidPerStep &&
+      ctx.astarRemaining > 1;
+      i++
+    ) {
       const c = directPathCoords[i];
       const check = validateCounted(ctx, ctx.towers, c.x, c.y);
       if (!check.valid || !check.pathResult) continue;
@@ -1532,8 +1677,8 @@ function spendAndPolishWalls(
       );
       const geoDelta = geo - curGeo;
       if (
-        geoDelta > 0.05 ||
-        check.pathResult.totalDistance > curPath.totalDistance + 0.1
+        geoDelta > 0.03 ||
+        check.pathResult.totalDistance > curPath.totalDistance + 0.15
       ) {
         geoCandidates.push({
           x: c.x,
@@ -1547,8 +1692,14 @@ function spendAndPolishWalls(
     geoCandidates.sort((a, b) => b.geoDelta - a.geoDelta);
     const shortlist = geoCandidates.slice(0, topK);
 
-    let bestSingle: { x: number; y: number; comp: number } | null = null;
-    const minGain = difficulty === 'GRANDMASTER' ? 0.12 : 0.35;
+    let bestSingle: {
+      x: number;
+      y: number;
+      comp: number;
+      pathResult: PathResult;
+      sim: MazeEvalResult;
+    } | null = null;
+    const minGain = difficulty === 'GRANDMASTER' ? 0.1 : 0.3;
 
     for (const cand of shortlist) {
       if (ctx.simRemaining <= 0) break;
@@ -1566,109 +1717,43 @@ function spendAndPolishWalls(
         cand.pathResult.totalDistance * 0.12;
 
       if (comp > curComp + minGain && (!bestSingle || comp > bestSingle.comp)) {
-        bestSingle = { x: cand.x, y: cand.y, comp };
+        bestSingle = {
+          x: cand.x,
+          y: cand.y,
+          comp,
+          pathResult: cand.pathResult,
+          sim,
+        };
       }
     }
 
-    if (
-      bestSingle &&
-      tryPlaceWallDetailed(ctx, bestSingle.x, bestSingle.y, {
-        allowCliffRoot: difficulty === 'GRANDMASTER',
-        allowSpireRoot: false,
-      }).placed
-    ) {
+    if (bestSingle) {
+      commitValidatedWall(ctx, bestSingle.x, bestSingle.y);
+      cachedPath = bestSingle.pathResult;
+      cachedEval = bestSingle.sim;
       continue;
-    }
-
-    // 2-Wall Corridor-Folding Tooth Lookahead (only on GRANDMASTER when single step stalls)
-    if (
-      difficulty === 'GRANDMASTER' &&
-      ctx.towers.length + 2 <= ctx.maxWalls &&
-      ctx.astarRemaining > 10 &&
-      ctx.simRemaining > 3
-    ) {
-      const haloCoords = collectRankedPathCandidates(ctx, curPath, true, true);
-      const seeds = haloCoords.slice(0, 4);
-      let placedPair = false;
-
-      for (const s of seeds) {
-        if (ctx.astarRemaining <= 4 || ctx.simRemaining <= 1) break;
-        if (
-          !tryPlaceWallDetailed(ctx, s.x, s.y, {
-            allowCliffRoot: true,
-            allowSpireRoot: false,
-          }).placed
-        ) {
-          continue;
-        }
-
-        let bestExt: { x: number; y: number; comp: number } | null = null;
-        for (const [dx, dy] of CLEAN_MASONRY_DIRS) {
-          if (ctx.astarRemaining <= 2 || ctx.simRemaining <= 0) break;
-          const ex = s.x + dx;
-          const ey = s.y + dy;
-          if (!canFit2x2Fast(ctx, ex, ey)) continue;
-          if (
-            !passesMasonryRules(ctx, ex, ey, {
-              allowCliffRoot: true,
-              allowSpireRoot: false,
-            })
-          ) {
-            continue;
-          }
-          const c2 = validateCounted(ctx, ctx.towers, ex, ey);
-          if (!c2.valid || !c2.pathResult) continue;
-          if (c2.pathResult.totalDistance <= curPath.totalDistance + 0.3) {
-            continue;
-          }
-
-          const sim2 = evalSimCounted(
-            ctx,
-            [
-              ...ctx.towers,
-              { id: '__p2__', type: 'BLOCK', x: ex, y: ey, createdAt: 0 },
-            ],
-            c2.pathResult
-          );
-          const comp2 =
-            sim2.finishTimeSeconds * 4.0 +
-            sim2.overchargedSpires * 1.4 +
-            c2.pathResult.totalDistance * 0.12;
-          if (comp2 > curComp + 0.5 && (!bestExt || comp2 > bestExt.comp)) {
-            bestExt = { x: ex, y: ey, comp: comp2 };
-          }
-        }
-
-        if (
-          bestExt &&
-          tryPlaceWallDetailed(ctx, bestExt.x, bestExt.y, {
-            allowCliffRoot: true,
-            allowSpireRoot: false,
-          }).placed
-        ) {
-          placedPair = true;
-          break;
-        } else {
-          removeWallAtIndex(ctx, ctx.towers.length - 1);
-        }
-      }
-
-      if (placedPair) continue;
     }
 
     break;
   }
 
-  // Ultra-fast zero-sim A*-only finish pass so high-budget R6–R8 GRANDMASTER rounds spend remaining walls
-  if (difficulty === 'GRANDMASTER') {
+  // Dedicated zero-sim A*-only Full-Budget Spend Loop (populates sawtooth teeth & Keep links!)
+  if (difficulty === 'GRANDMASTER' && ctx.towers.length < ctx.maxWalls) {
+    const segScale = 1 + (ctx.round.checkpoints?.length ?? 0) * 0.5;
+    const remNeed = ctx.maxWalls - ctx.towers.length;
+    let tailAstar = Math.min(
+      52,
+      Math.max(24, Math.round((28 + remNeed * 3) / segScale))
+    );
+    let curPath = cachedPath ?? computeFullMazePath(ctx.round, ctx.towers);
     let tailSteps = 0;
+
     while (
       ctx.towers.length < ctx.maxWalls &&
-      tailSteps++ < 16 &&
-      ctx.astarRemaining > 2
+      tailSteps++ < 22 &&
+      tailAstar > 1 &&
+      curPath.valid
     ) {
-      const curPath = computeFullMazePath(ctx.round, ctx.towers);
-      if (!curPath.valid) break;
       const curCirc = computeCitadelCircuitry(ctx.round, ctx.towers);
       const curGeo = scorePathWithMapFeatures(
         ctx.round,
@@ -1677,14 +1762,21 @@ function spendAndPolishWalls(
       );
 
       const coords = collectRankedPathCandidates(ctx, curPath, true, false);
-      const cap = Math.min(coords.length, 12);
-      let best: { x: number; y: number; delta: number } | null = null;
+      let best: { x: number; y: number; delta: number; path: PathResult } | null =
+        null;
+      let validFound = 0;
 
-      for (let i = 0; i < cap && ctx.astarRemaining > 1; i++) {
+      for (
+        let i = 0;
+        i < coords.length && validFound < 7 && tailAstar > 0;
+        i++
+      ) {
+        tailAstar--;
         const c = coords[i];
-        const check = validateCounted(ctx, ctx.towers, c.x, c.y);
+        const check = validateTowerPlacement(ctx.round, ctx.towers, c.x, c.y);
         if (!check.valid || !check.pathResult) continue;
-        if (check.pathResult.totalDistance < curPath.totalDistance + 0.2) {
+        validFound++;
+        if (check.pathResult.totalDistance < curPath.totalDistance + 0.16) {
           continue;
         }
         const delta =
@@ -1693,97 +1785,261 @@ function spendAndPolishWalls(
             check.pathResult,
             curCirc.spireOverchargeTiers
           ) - curGeo;
-        if (delta > 0.25 && (!best || delta > best.delta)) {
-          best = { x: c.x, y: c.y, delta };
+        if (delta > 0.03 && (!best || delta > best.delta)) {
+          best = { x: c.x, y: c.y, delta, path: check.pathResult };
         }
       }
 
-      if (
-        best &&
-        tryPlaceWallDetailed(ctx, best.x, best.y, {
-          allowCliffRoot: true,
-          allowSpireRoot: false,
-        }).placed
-      ) {
+      if (best) {
+        commitValidatedWall(ctx, best.x, best.y);
+        curPath = best.path;
+        cachedEval = null;
         continue;
       }
+
+      // Secondary Overcharge Keep link spend (connects remaining Keeps to Spire circuits)
+      if (ctx.round.obstacles.length > 0 && tailAstar > 3) {
+        let linkedKeep = false;
+        for (let kIdx = 0; kIdx < ctx.round.obstacles.length; kIdx++) {
+          if (curCirc.linkedKeepIndices.has(kIdx) || tailAstar <= 1) continue;
+          const kp = ctx.round.obstacles[kIdx];
+          for (const [dx, dy] of CLEAN_MASONRY_DIRS) {
+            if (tailAstar <= 0) break;
+            const kx = kp.x + dx;
+            const ky = kp.y + dy;
+            if (!canFit2x2Fast(ctx, kx, ky)) continue;
+            if (!passesMasonryRules(ctx, kx, ky, { allowSpireRoot: false })) {
+              continue;
+            }
+            const nextCirc = computeCitadelCircuitry(ctx.round, [
+              ...ctx.towers,
+              { id: '__tk__', type: 'BLOCK', x: kx, y: ky, createdAt: 0 },
+            ]);
+            if (nextCirc.overchargedSpires <= curCirc.overchargedSpires) {
+              continue;
+            }
+            tailAstar--;
+            const kc = validateTowerPlacement(ctx.round, ctx.towers, kx, ky);
+            if (
+              kc.valid &&
+              kc.pathResult &&
+              kc.pathResult.totalDistance >= curPath.totalDistance - 0.05
+            ) {
+              commitValidatedWall(ctx, kx, ky);
+              curPath = kc.pathResult;
+              cachedEval = null;
+              linkedKeep = true;
+              break;
+            }
+          }
+          if (linkedKeep) break;
+        }
+        if (linkedKeep) continue;
+      }
+
+      // 2-wall slalom tooth fallback (skips BLOCKS_PATH seeds until up to 4 valid seeds are tested)
+      if (ctx.towers.length + 2 <= ctx.maxWalls && tailAstar > 6) {
+        const halo = collectRankedPathCandidates(ctx, curPath, true, true);
+        let pairCommitted = false;
+        let validSeedsTried = 0;
+
+        for (
+          let sIdx = 0;
+          sIdx < halo.length && validSeedsTried < 2 && tailAstar > 2;
+          sIdx++
+        ) {
+          const s = halo[sIdx];
+          tailAstar--;
+          const c1 = validateTowerPlacement(ctx.round, ctx.towers, s.x, s.y);
+          if (!c1.valid) continue;
+          validSeedsTried++;
+          commitValidatedWall(ctx, s.x, s.y);
+
+          let best2: {
+            x: number;
+            y: number;
+            delta: number;
+            path: PathResult;
+          } | null = null;
+          for (const [dx, dy] of CLEAN_MASONRY_DIRS) {
+            if (tailAstar <= 0) break;
+            const ex = s.x + dx;
+            const ey = s.y + dy;
+            if (!canFit2x2Fast(ctx, ex, ey)) continue;
+            if (
+              !passesMasonryRules(ctx, ex, ey, {
+                allowCliffRoot: true,
+                allowSpireRoot: false,
+              })
+            ) {
+              continue;
+            }
+            tailAstar--;
+            const c2 = validateTowerPlacement(ctx.round, ctx.towers, ex, ey);
+            if (!c2.valid || !c2.pathResult) continue;
+            if (c2.pathResult.totalDistance < curPath.totalDistance + 0.35) {
+              continue;
+            }
+            const delta =
+              scorePathWithMapFeatures(
+                ctx.round,
+                c2.pathResult,
+                curCirc.spireOverchargeTiers
+              ) - curGeo;
+            if (delta > 0.07 && (!best2 || delta > best2.delta)) {
+              best2 = { x: ex, y: ey, delta, path: c2.pathResult };
+            }
+          }
+
+          if (best2) {
+            commitValidatedWall(ctx, best2.x, best2.y);
+            curPath = best2.path;
+            cachedEval = null;
+            pairCommitted = true;
+            break;
+          } else {
+            removeWallAtIndex(ctx, ctx.towers.length - 1);
+          }
+        }
+
+        if (pairCommitted) continue;
+      }
+
       break;
     }
   }
+
+  return cachedEval;
 }
 
 /**
- * Fast <0.2ms Hygiene Pass:
- * 1. Strips zero-impact leaf walls (`Δdistance < 0.12m` AND `Δtime < 0.05s` AND `Δover <= 0` —
- *    skipping `evaluateMazeRunTime` whenever `Δdistance >= 0.15m`!)
- * 2. Unconditionally removes any freestanding wall with `0` post-Gabriel rendered bridges.
+ * Zero-Sim Local Leaf & Corner Masonry Hygiene Pass (<0.8ms):
+ * 1. Skips collinear `deg === 2` interior baffle bricks in O(1) (only leaf tips & corners can be dead spurs).
+ * 2. Strips zero-impact dead walls with ZERO 60Hz simulations (even on Waygate rounds, via Waygate exit path check).
+ * 3. Unconditionally removes any freestanding wall with `0` post-Gabriel rendered bridges.
  */
 function cleanZeroImpactAndUnbridgedWalls(
   ctx: BuilderContext,
-  stripZeroImpact: boolean
-): void {
-  if (ctx.towers.length === 0) return;
+  stripZeroImpact: boolean,
+  knownEval: MazeEvalResult | null = null
+): MazeEvalResult | null {
+  if (ctx.towers.length === 0) return knownEval;
 
-  const countRenderedBridges = (
-    target: GridPoint,
-    masonry: ReadonlyArray<GridPoint>
-  ): number => {
-    let count = 0;
-    for (let i = 0; i < masonry.length; i++) {
-      const m = masonry[i];
-      if (m.x === target.x && m.y === target.y) continue;
-      if (areMasonryNodesBridged(target.x, target.y, m.x, m.y, masonry)) {
-        count++;
+  const getLocalBridgedNeighbors = (
+    tx: number,
+    ty: number,
+    skipTowerIdx: number
+  ): GridPoint[] => {
+    const local: GridPoint[] = [];
+    for (let i = 0; i < ctx.towers.length; i++) {
+      if (i === skipTowerIdx) continue;
+      const t = ctx.towers[i];
+      if (Math.abs(t.x - tx) <= 4 && Math.abs(t.y - ty) <= 4) {
+        local.push(t);
       }
     }
-    return count;
+    for (let k = 0; k < ctx.round.obstacles.length; k++) {
+      const o = ctx.round.obstacles[k];
+      if (Math.abs(o.x - tx) <= 4 && Math.abs(o.y - ty) <= 4) {
+        local.push(o);
+      }
+    }
+
+    const bridged: GridPoint[] = [];
+    for (let i = 0; i < local.length; i++) {
+      const m = local[i];
+      if (m.x === tx && m.y === ty) continue;
+      if (Math.abs(m.x - tx) > 2 || Math.abs(m.y - ty) > 2) continue;
+      if (areMasonryNodesBridged(tx, ty, m.x, m.y, local)) {
+        bridged.push(m);
+      }
+    }
+    return bridged;
   };
+
+  let cachedBaseEval = knownEval;
 
   if (stripZeroImpact && ctx.towers.length > 3) {
     let basePath = computeFullMazePath(ctx.round, ctx.towers);
     let baseCirc = computeCitadelCircuitry(ctx.round, ctx.towers);
-    let cachedBaseEval: MazeEvalResult | null = null;
-
-    for (let i = ctx.towers.length - 1; i >= 0; i--) {
-      if (ctx.astarRemaining <= 2) break;
-      const allMasonry: GridPoint[] = [...ctx.towers, ...ctx.round.obstacles];
-      if (countRenderedBridges(ctx.towers[i], allMasonry) > 1) continue;
-
-      const without = ctx.towers.filter((_, idx) => idx !== i);
-      const nextCirc = computeCitadelCircuitry(ctx.round, without);
-      if (nextCirc.overchargedSpires < baseCirc.overchargedSpires) continue;
-
-      const nextMasonry: GridPoint[] = [...without, ...ctx.round.obstacles];
-      let orphansNeighbor = false;
-      for (let j = 0; j < without.length; j++) {
-        if (countRenderedBridges(without[j], nextMasonry) === 0) {
-          orphansNeighbor = true;
-          break;
+    const wgExitRound: RoundConfig | null = ctx.round.waygate
+      ? {
+          ...ctx.round,
+          spawn: ctx.round.waygate.exit,
+          checkpoints: [],
         }
-      }
-      if (orphansNeighbor) continue;
+      : null;
+    let baseWgPath = wgExitRound
+      ? computeFullMazePath(wgExitRound, ctx.towers)
+      : null;
 
-      ctx.astarRemaining--;
-      const pathWithout = computeFullMazePath(ctx.round, without);
-      if (!pathWithout.valid) continue;
+    let pass = 0;
+    let strippedInPass = true;
+    while (strippedInPass && pass++ < 2 && ctx.towers.length > 3) {
+      strippedInPass = false;
+      for (let i = ctx.towers.length - 1; i >= 0; i--) {
+        const target = ctx.towers[i];
+        const bridged = getLocalBridgedNeighbors(target.x, target.y, -1);
+        if (bridged.length > 2) continue;
 
-      // Fast distance short-circuit: if removing this wall shortens the A* path by >=0.18m, keep it!
-      if (basePath.totalDistance - pathWithout.totalDistance >= 0.18) {
-        continue;
-      }
+        // On pass 2, only re-check newly exposed deg <= 1 leaf tips
+        if (pass > 1 && bridged.length > 1) continue;
 
-      if (!cachedBaseEval) {
-        cachedBaseEval = evalSimCounted(ctx, ctx.towers, basePath);
-      }
-      const evalWithout = evalSimCounted(ctx, without, pathWithout);
-      if (
-        cachedBaseEval.finishTimeSeconds - evalWithout.finishTimeSeconds <
-        0.05
-      ) {
+        // Skip interior collinear baffle segments (dx1 === -dx2 && dy1 === -dy2) in O(1)!
+        if (
+          bridged.length === 2 &&
+          bridged[0].x - target.x === -(bridged[1].x - target.x) &&
+          bridged[0].y - target.y === -(bridged[1].y - target.y)
+        ) {
+          continue;
+        }
+
+        let orphansNeighbor = false;
+        for (let j = 0; j < ctx.towers.length; j++) {
+          if (j === i) continue;
+          const nb = ctx.towers[j];
+          if (Math.abs(nb.x - target.x) > 2 || Math.abs(nb.y - target.y) > 2) {
+            continue;
+          }
+          if (getLocalBridgedNeighbors(nb.x, nb.y, i).length === 0) {
+            orphansNeighbor = true;
+            break;
+          }
+        }
+        if (orphansNeighbor) continue;
+
+        const without = ctx.towers.filter((_, idx) => idx !== i);
+        const nextCirc = computeCitadelCircuitry(ctx.round, without);
+        if (nextCirc.overchargedSpires < baseCirc.overchargedSpires) continue;
+
+        const pathWithout = computeFullMazePath(ctx.round, without);
+        if (!pathWithout.valid) continue;
+
+        const distDrop = basePath.totalDistance - pathWithout.totalDistance;
+        if (distDrop >= 0.08) continue;
+
+        if (wgExitRound && baseWgPath) {
+          const wgWithout = computeFullMazePath(wgExitRound, without);
+          if (
+            wgWithout.valid &&
+            baseWgPath.totalDistance - wgWithout.totalDistance >= 0.08
+          ) {
+            continue;
+          }
+          removeWallAtIndex(ctx, i);
+          basePath = pathWithout;
+          baseCirc = nextCirc;
+          baseWgPath = wgWithout;
+          cachedBaseEval = null;
+          strippedInPass = true;
+          continue;
+        }
+
         removeWallAtIndex(ctx, i);
         basePath = pathWithout;
         baseCirc = nextCirc;
-        cachedBaseEval = evalWithout;
+        cachedBaseEval = null;
+        strippedInPass = true;
       }
     }
   }
@@ -1791,18 +2047,21 @@ function cleanZeroImpactAndUnbridgedWalls(
   let changed = true;
   while (changed && ctx.towers.length > 0) {
     changed = false;
-    const allMasonry: GridPoint[] = [...ctx.towers, ...ctx.round.obstacles];
     for (let i = ctx.towers.length - 1; i >= 0; i--) {
-      if (countRenderedBridges(ctx.towers[i], allMasonry) === 0) {
+      const t = ctx.towers[i];
+      if (getLocalBridgedNeighbors(t.x, t.y, -1).length === 0) {
         const without = ctx.towers.filter((_, idx) => idx !== i);
         if (computeFullMazePath(ctx.round, without).valid) {
           removeWallAtIndex(ctx, i);
+          cachedBaseEval = null;
           changed = true;
           break;
         }
       }
     }
   }
+
+  return cachedBaseEval;
 }
 
 function buildSingleAttempt(
@@ -1813,14 +2072,25 @@ function buildSingleAttempt(
   flipPolarity: boolean,
   attemptTag: string
 ): { towers: PlacedTower[]; evalRes: MazeEvalResult } {
-  const astarBudget =
-    difficulty === 'NOVICE'
-      ? 75
-      : difficulty === 'ARCHITECT'
-      ? 130
-      : 200 + maxWalls * 5;
+  const segScale = 1 + (round.checkpoints?.length ?? 0) * 0.45;
+  const astarBudget = Math.max(
+    24,
+    Math.round(
+      (difficulty === 'NOVICE'
+        ? 45
+        : difficulty === 'ARCHITECT'
+        ? 75
+        : 95 + maxWalls) / segScale
+    )
+  );
   const simBudget =
-    difficulty === 'NOVICE' ? 10 : difficulty === 'ARCHITECT' ? 20 : 34;
+    difficulty === 'NOVICE'
+      ? 2
+      : difficulty === 'ARCHITECT'
+      ? 3
+      : round.parTimeSeconds >= 50
+      ? 3
+      : 6;
 
   const ctx = createBuilderContext(
     round,
@@ -1831,7 +2101,7 @@ function buildSingleAttempt(
   );
 
   const scaffoldShare =
-    difficulty === 'NOVICE' ? 0.94 : difficulty === 'ARCHITECT' ? 0.9 : 0.95;
+    difficulty === 'NOVICE' ? 0.94 : difficulty === 'ARCHITECT' ? 0.9 : 0.98;
   const scaffoldBudget = Math.max(6, Math.floor(maxWalls * scaffoldShare));
 
   if (style === 'SPIRAL') {
@@ -1844,12 +2114,14 @@ function buildSingleAttempt(
 
   cleanZeroImpactAndUnbridgedWalls(ctx, true);
   bridgeKeepsForOvercharge(ctx, difficulty);
-  spendAndPolishWalls(ctx, difficulty);
-  cleanZeroImpactAndUnbridgedWalls(ctx, false);
+  let lastEval = spendAndPolishWalls(ctx, difficulty);
+  lastEval = cleanZeroImpactAndUnbridgedWalls(ctx, true, lastEval);
 
-  const evalRes = evaluateMazeRunTime(round, ctx.towers, {
-    collectClapLocations: false,
-  });
+  const evalRes =
+    lastEval ??
+    evaluateMazeRunTime(round, ctx.towers, {
+      collectClapLocations: false,
+    });
   return { towers: ctx.towers, evalRes };
 }
 
@@ -1872,8 +2144,12 @@ export function generateMazeLayout(
   );
   if (totalAvailableWalls === 0) return [];
 
+  const hasFrost = round.preplacedSpires.some(
+    (s) => s.spireType === 'FROST_OBELISK'
+  );
+  const rawStyle: BotStyle = preferredStyle ?? selectSampleMazeStyle(round);
   const resolvedStyle: BotStyle =
-    preferredStyle ?? selectSampleMazeStyle(round);
+    rawStyle === 'SPIRAL' && !hasFrost ? 'SWITCHBACK' : rawStyle;
 
   const maxWalls =
     difficulty === 'NOVICE'
@@ -1909,20 +2185,38 @@ export function generateMazeLayout(
 
   let best = primary;
   const fallbackQueue: Array<{ style: BotStyle; flip: boolean; tag: string }> =
-    [
-      {
-        style: resolvedStyle,
-        flip: true,
-        tag: `${difficulty[0]}${resolvedStyle[0]}1`,
-      },
-      {
-        style: resolvedStyle === 'SWITCHBACK' ? 'CLAP_CHAIN' : 'SWITCHBACK',
-        flip: false,
-        tag: `${difficulty[0]}F0`,
-      },
-    ];
+    round.parTimeSeconds >= 50
+      ? [
+          {
+            style: resolvedStyle === 'SWITCHBACK' ? 'CLAP_CHAIN' : 'SWITCHBACK',
+            flip: false,
+            tag: `${difficulty[0]}F0`,
+          },
+        ]
+      : [
+          {
+            style: resolvedStyle,
+            flip: true,
+            tag: `${difficulty[0]}${resolvedStyle[0]}1`,
+          },
+          {
+            style: resolvedStyle === 'SWITCHBACK' ? 'CLAP_CHAIN' : 'SWITCHBACK',
+            flip: false,
+            tag: `${difficulty[0]}F0`,
+          },
+        ];
 
-  for (const fb of fallbackQueue) {
+  for (let idx = 0; idx < fallbackQueue.length; idx++) {
+    if (
+      idx === 1 &&
+      best.evalRes.finishTimeSeconds >=
+        round.parTimeSeconds * minFloorRatio * 0.9 &&
+      best.evalRes.clapsTaken >= minClaps
+    ) {
+      break;
+    }
+
+    const fb = fallbackQueue[idx];
     const cand = buildSingleAttempt(
       round,
       maxWalls,

@@ -529,6 +529,31 @@ export class SoundEngine {
     });
   }
 
+  public playEdgeBump(): void {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.canTrigger('edgeBump', 90)) return;
+
+    const now = ctx.currentTime + 0.001;
+    // Soft low-passed wooden boundary tap for blocked mobile/iOS nudges
+    this.scheduleVoice(ctx, {
+      type: 'triangle',
+      freqStart: 145,
+      freqEnd: 105,
+      startTime: now,
+      duration: 0.044,
+      peakGain: 0.082,
+      attack: 0.002,
+      filterFreq: 520,
+    });
+    this.scheduleNoiseBurst(ctx, {
+      startTime: now,
+      duration: 0.008,
+      peakGain: 0.018,
+      bandpassFreq: 860,
+      q: 2.0,
+    });
+  }
+
   public playUiClick(): void {
     const ctx = this.ensureContext();
     if (!ctx || !this.canTrigger('ui', 24)) return;

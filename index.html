@@ -171,7 +171,7 @@
               </div>
               <div id="round-inspect-runner" class="round-inspect-runner">
                 <span class="icon-slot" data-icon="scout" data-icon-size="14"></span>
-                <span>Citadel Scout · 3.5 m/s · Standard slow duration</span>
+                <span>Citadel Scout · 3.5 m/s · Balanced runner, normal slow duration</span>
               </div>
               <p id="round-inspect-hint" class="round-inspect-hint">
                 Fold switchbacks past both Storm Spires. Link a Crimson Keep into your wall to boost Spire range and recharge.
@@ -213,7 +213,7 @@
         <div
           class="telemetry-chip time-chip"
           id="time-chip"
-          title="+2 bonus pts at 28.0s+"
+          title="Estimated run time vs. round Par (+2 bonus pts for reaching Par)"
         >
           <span class="icon-slot chip-icon" data-icon="clock" data-icon-size="14"></span>
           <span id="est-time-value" class="chip-num">
@@ -527,12 +527,25 @@
         type="button"
         id="btn-undo"
         class="dock-tool-btn undo-btn"
-        title="Undo Last Action (Z) · Redo (Ctrl+Y or Ctrl+Shift+Z)"
+        title="Undo Last Action (Z)"
+        aria-label="Undo Last Action"
         disabled
       >
         <span class="icon-slot" data-icon="undo" data-icon-size="17"></span>
         <span class="tool-label">Undo</span>
         <kbd>Z</kbd>
+      </button>
+
+      <button
+        type="button"
+        id="btn-redo"
+        class="dock-tool-btn redo-btn desktop-only-tool"
+        title="Redo Last Action (Ctrl+Y or Ctrl+Shift+Z)"
+        aria-label="Redo Last Action"
+        disabled
+      >
+        <span class="icon-slot" data-icon="redo" data-icon-size="17"></span>
+        <span class="tool-label">Redo</span>
       </button>
 
       <div class="dock-tools-menu-wrap" id="dock-tools-wrap">
@@ -1280,7 +1293,7 @@
                   <h4>1. Build Stone Walls</h4>
                 </div>
                 <p>
-                  Place <strong>2×2 Stone Walls</strong> on any open grass tile. Nearby walls connect automatically to wind the runner from the <strong>North Gate</strong> to the <strong>South Shrine</strong> and through any gilded <strong>Checkpoint</strong>. Removing walls is always free.
+                  Place <strong>2×2 Stone Walls</strong> on any open grass tile. Nearby walls connect automatically to wind the runner from the <strong>North Gate</strong> to the <strong>South Shrine</strong> and through any gilded <strong>Waystone</strong>. Removing a wall refunds +1 wall immediately.
                 </p>
               </div>
 
@@ -1310,7 +1323,7 @@
                   <h4>4. Outlast Rivals &amp; Beat Par</h4>
                 </div>
                 <p>
-                  Longest survival time wins each round (<strong>10 / 7 / 5 / 3 / 2 / 1 pts</strong> by rank). Keep the runner in your maze past the <strong><span class="icon-slot" data-icon="starFilled" data-icon-size="11"></span> Par target</strong> (such as <strong>28s+</strong>) for <strong>+2 bonus pts</strong>. Practice scaffolds via <strong>Sample Maze · Practice</strong> run unranked.
+                  Longest survival time wins each round (<strong>10 / 7 / 5 / 3 / 2 / 1 pts</strong> by rank). Keep the runner in your maze past the <strong><span class="icon-slot" data-icon="starFilled" data-icon-size="11"></span> Par target</strong> (such as <strong>28s+</strong>) for <strong>+2 bonus pts</strong>. Mazes built with <strong>Sample Maze · Practice</strong> run unranked.
                 </p>
               </div>
             </div>
@@ -1318,11 +1331,11 @@
             <div class="controls-summary-card">
               <div class="controls-row touch-only-hint">
                 <strong>Touch Controls:</strong>
-                <span>Tap grass or hold-drag to aim · Re-tap ghost or tap <strong>Place</strong> (+2-tile chain) · Tap a wall to <strong>Remove (+1)</strong> · Tap any Spire, Keep, or Runner to inspect · Pinch to zoom</span>
+                <span>Tap grass or hold-drag to aim · Re-tap ghost or tap <strong>Place</strong> (+2-tile chain) · Tap a wall to <strong>Remove (+1)</strong> · Tap any Spire, Keep, Waystone, or Runner to inspect · Pinch to zoom</span>
               </div>
               <div class="controls-row desktop-only-hint">
                 <strong>Desktop Controls:</strong>
-                <span>Left-click build (<kbd>Shift</kbd>+Drag line-paint) · Right-click remove · Scroll zoom · Drag / <kbd>WASD</kbd> pan · <kbd>Q</kbd> Build · <kbd>X</kbd> Remove · <kbd>Z</kbd> Undo · <kbd>Ctrl+Y</kbd> Redo · <kbd>R</kbd> Reset View · <kbd>Space</kbd> Ready · <kbd>Tab</kbd> / <kbd>1–6</kbd> Islands</span>
+                <span>Left-click build (<kbd>Shift</kbd>+Drag line-paint) · Right-click remove · Scroll zoom · Drag / <kbd>WASD</kbd> pan · <kbd>Q</kbd> Build · <kbd>X</kbd> Remove · <kbd>Z</kbd> Undo · <kbd>Ctrl+Y</kbd> / <kbd>Ctrl+Shift+Z</kbd> Redo · <kbd>R</kbd> Reset View · <kbd>Space</kbd> Ready · <kbd>Tab</kbd> / <kbd>1–6</kbd> Islands</span>
               </div>
             </div>
           </div>

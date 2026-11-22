@@ -56,6 +56,7 @@ export interface CitadelCircuitryResult {
   linkedKeepIndices: Set<number>;
   keepPoweredSpireCounts: number[];
   poweredNodeKeys: Set<string>;
+  overchargedNodeKeys: Set<string>;
   spireConduitLinks: SpireConduitLink[];
 }
 
@@ -81,6 +82,7 @@ let scratchCapacity = 0;
 let scratchGScore = new Float64Array(0);
 let scratchFScore = new Float64Array(0);
 let scratchCameFrom = new Int32Array(0);
+let scratchOriginSeed = new Int32Array(0);
 let scratchClosed = new Uint8Array(0);
 let scratchHeapNodes = new Int32Array(0);
 let scratchHeapPos = new Int32Array(0);
@@ -91,6 +93,7 @@ function ensureAStarScratch(requiredSlots: number): void {
   scratchGScore = new Float64Array(scratchCapacity);
   scratchFScore = new Float64Array(scratchCapacity);
   scratchCameFrom = new Int32Array(scratchCapacity);
+  scratchOriginSeed = new Int32Array(scratchCapacity);
   scratchClosed = new Uint8Array(scratchCapacity);
   scratchHeapNodes = new Int32Array(scratchCapacity);
   scratchHeapPos = new Int32Array(scratchCapacity);
@@ -341,11 +344,27 @@ function goalBoxHeuristic(
   return Math.hypot(dx, dy) * HEURISTIC_TIE_SCALE + lateralTie;
 }
 
+interface SeedCellEntry {
+  x: number;
+  y: number;
+  initialCost: number;
+}
+
+interface WaystoneArrivalBranch {
+  cell: GridPoint;
+  points: GridPoint[];
+  distance: number;
+  cumulativeCost: number;
+  originSeedIndex: number;
+}
+
 interface SegmentQueryOptions {
   startIsTopGate?: boolean;
   goalIsBottomGate?: boolean;
-  exactStartCell?: GridPoint;
+  seedCells?: ReadonlyArray<SeedCellEntry>;
   appendTerminalPoint?: boolean;
+  collectAllGoalCells?: boolean;
+  applyGatesInline?: boolean;
   nextWaypointHintX?: number;
 }
 
@@ -353,6 +372,19 @@ interface SegmentPathInternal {
   points: GridPoint[];
   distance: number;
   reachedCell: GridPoint;
+  originSeedIndex: number;
+  goalBranches?: WaystoneArrivalBranch[];
+}
+
+function computePolylineDistance(points: ReadonlyArray<GridPoint>): number {
+  let distance = 0;
+  for (let i = 1; i < points.length; i++) {
+    distance += Math.hypot(
+      points[i].x - points[i - 1].x,
+      points[i].y - points[i - 1].y
+    );
+  }
+  return distance;
 }
 
 /**
@@ -469,8 +501,12 @@ function findSegmentPath(
 
   const startIsTopGate = Boolean(options?.startIsTopGate);
   const goalIsBottomGate = Boolean(options?.goalIsBottomGate);
-  const exactStartCell = options?.exactStartCell;
+  const seedCells = options?.seedCells;
   const appendTerminalPoint = options?.appendTerminalPoint ?? true;
+  const collectAllGoalCells = Boolean(
+    options?.collectAllGoalCells && !appendTerminalPoint
+  );
+  const applyGatesInline = options?.applyGatesInline ?? true;
   const hintX = options?.nextWaypointHintX ?? goalX + 1.0;
 
   const gx0 = goalX;
@@ -478,12 +514,10 @@ function findSegmentPath(
   const gy0 = goalIsBottomGate ? height - 1 : goalY;
   const gy1 = goalIsBottomGate ? height - 1 : goalY + 1;
 
-  const startPoint: GridPoint = exactStartCell
-    ? { x: exactStartCell.x + 0.5, y: exactStartCell.y + 0.5 }
-    : {
-        x: startX + 1.0,
-        y: startIsTopGate ? 0.0 : startY + 1.0,
-      };
+  const startPoint: GridPoint = {
+    x: startX + 1.0,
+    y: startIsTopGate ? 0.0 : startY + 1.0,
+  };
 
   const endPoint: GridPoint = {
     x: goalX + 1.0,
@@ -498,6 +532,7 @@ function findSegmentPath(
   const gScore = scratchGScore;
   const fScore = scratchFScore;
   const cameFrom = scratchCameFrom;
+  const originSeed = scratchOriginSeed;
   const closed = scratchClosed;
   const heapNodes = scratchHeapNodes;
   const heapPos = scratchHeapPos;
@@ -505,6 +540,7 @@ function findSegmentPath(
   gScore.fill(Infinity, 0, slotCount);
   fScore.fill(Infinity, 0, slotCount);
   cameFrom.fill(-1, 0, slotCount);
+  originSeed.fill(0, 0, slotCount);
   closed.fill(0, 0, slotCount);
   heapPos.fill(-1, 0, slotCount);
 
@@ -577,14 +613,22 @@ function findSegmentPath(
     return topIdx;
   };
 
-  if (exactStartCell) {
-    const sx = exactStartCell.x;
-    const sy = exactStartCell.y;
-    if (sx >= 0 && sx < width && sy >= 0 && sy < height && walkable[sy][sx]) {
-      const idx = sy * width + sx;
-      gScore[idx] = 0;
-      fScore[idx] = goalBoxHeuristic(sx, sy, gx0, gx1, gy0, gy1, hintX);
-      heapPushOrUpdate(idx);
+  if (seedCells && seedCells.length > 0) {
+    for (let s = 0; s < seedCells.length; s++) {
+      const sc = seedCells[s];
+      const sx = sc.x;
+      const sy = sc.y;
+      if (sx >= 0 && sx < width && sy >= 0 && sy < height && walkable[sy][sx]) {
+        const idx = sy * width + sx;
+        if (sc.initialCost < gScore[idx]) {
+          gScore[idx] = sc.initialCost;
+          originSeed[idx] = s;
+          fScore[idx] =
+            sc.initialCost +
+            goalBoxHeuristic(sx, sy, gx0, gx1, gy0, gy1, hintX);
+          heapPushOrUpdate(idx);
+        }
+      }
     }
   } else {
     const startDyMax = startIsTopGate ? 0 : 1;
@@ -601,6 +645,7 @@ function findSegmentPath(
             sy + 0.5 - startPoint.y
           );
           gScore[idx] = entryHop;
+          originSeed[idx] = 0;
           fScore[idx] =
             entryHop + goalBoxHeuristic(sx, sy, gx0, gx1, gy0, gy1, hintX);
           heapPushOrUpdate(idx);
@@ -609,11 +654,34 @@ function findSegmentPath(
     }
   }
 
+  let expectedGoalCells = 0;
+  if (collectAllGoalCells) {
+    for (let gy = gy0; gy <= gy1; gy++) {
+      if (gy < 0 || gy >= height) continue;
+      for (let gx = gx0; gx <= gx1; gx++) {
+        if (gx >= 0 && gx < width && walkable[gy][gx]) {
+          expectedGoalCells++;
+        }
+      }
+    }
+  }
+
   let reachedGoalIdx = -1;
+  let firstGoalG = Infinity;
+  const reachedGoalIndices: number[] = [];
 
   while (heapSize > 0) {
     const bestIdx = heapPop();
     if (closed[bestIdx]) continue;
+
+    if (
+      collectAllGoalCells &&
+      reachedGoalIndices.length > 0 &&
+      fScore[bestIdx] > firstGoalG + 2.01
+    ) {
+      break;
+    }
+
     closed[bestIdx] = 1;
 
     if (bestIdx === goalSinkIdx) {
@@ -627,19 +695,30 @@ function findSegmentPath(
 
     if (cx >= gx0 && cx <= gx1 && cy >= gy0 && cy <= gy1) {
       if (!appendTerminalPoint) {
-        reachedGoalIdx = bestIdx;
-        break;
-      }
-      const exitHop = Math.hypot(
-        endPoint.x - (cx + 0.5),
-        endPoint.y - (cy + 0.5)
-      );
-      const totalGoalCost = currentG + exitHop;
-      if (totalGoalCost < gScore[goalSinkIdx]) {
-        cameFrom[goalSinkIdx] = bestIdx;
-        gScore[goalSinkIdx] = totalGoalCost;
-        fScore[goalSinkIdx] = totalGoalCost;
-        heapPushOrUpdate(goalSinkIdx);
+        if (reachedGoalIdx === -1) {
+          reachedGoalIdx = bestIdx;
+          firstGoalG = currentG;
+        }
+        if (!collectAllGoalCells) {
+          break;
+        }
+        reachedGoalIndices.push(bestIdx);
+        if (reachedGoalIndices.length >= expectedGoalCells) {
+          break;
+        }
+      } else {
+        const exitHop = Math.hypot(
+          endPoint.x - (cx + 0.5),
+          endPoint.y - (cy + 0.5)
+        );
+        const totalGoalCost = currentG + exitHop;
+        if (totalGoalCost < gScore[goalSinkIdx]) {
+          cameFrom[goalSinkIdx] = bestIdx;
+          originSeed[goalSinkIdx] = originSeed[bestIdx];
+          gScore[goalSinkIdx] = totalGoalCost;
+          fScore[goalSinkIdx] = totalGoalCost;
+          heapPushOrUpdate(goalSinkIdx);
+        }
       }
     }
 
@@ -662,6 +741,7 @@ function findSegmentPath(
       const tentativeG = currentG + d.cost;
       if (tentativeG < gScore[nIdx]) {
         cameFrom[nIdx] = bestIdx;
+        originSeed[nIdx] = originSeed[bestIdx];
         gScore[nIdx] = tentativeG;
         fScore[nIdx] =
           tentativeG + goalBoxHeuristic(nx, ny, gx0, gx1, gy0, gy1, hintX);
@@ -674,52 +754,69 @@ function findSegmentPath(
     return null;
   }
 
-  const reachedCx = reachedGoalIdx % width;
-  const reachedCy = (reachedGoalIdx - reachedCx) / width;
-  const reachedCell: GridPoint = { x: reachedCx, y: reachedCy };
+  const buildBranchForGoalIdx = (goalCellIdx: number): WaystoneArrivalBranch => {
+    const gCx = goalCellIdx % width;
+    const gCy = (goalCellIdx - gCx) / width;
+    const cellChain: GridPoint[] = [];
+    let walk = goalCellIdx;
+    while (walk !== -1) {
+      const wx = walk % width;
+      const wy = (walk - wx) / width;
+      cellChain.push({ x: wx + 0.5, y: wy + 0.5 });
+      walk = cameFrom[walk];
+    }
+    cellChain.reverse();
 
-  const rawCells: GridPoint[] = [];
-  let curr = reachedGoalIdx;
-  while (curr !== -1) {
-    const cx = curr % width;
-    const cy = (curr - cx) / width;
-    rawCells.push({ x: cx + 0.5, y: cy + 0.5 });
-    curr = cameFrom[curr];
+    if (
+      applyGatesInline &&
+      ((startIsTopGate && !seedCells) ||
+        (goalIsBottomGate && appendTerminalPoint))
+    ) {
+      alignGateSeamCenterline(
+        cellChain,
+        walkable,
+        height,
+        startX,
+        goalX,
+        startIsTopGate && !seedCells,
+        goalIsBottomGate && appendTerminalPoint
+      );
+    }
+
+    const branchPoints: GridPoint[] = seedCells
+      ? cellChain
+      : [startPoint, ...cellChain];
+    if (appendTerminalPoint) {
+      branchPoints.push(endPoint);
+    }
+
+    const segDist = computePolylineDistance(branchPoints);
+    const seedIdx = originSeed[goalCellIdx];
+    const baseCost =
+      seedCells && seedCells[seedIdx] ? seedCells[seedIdx].initialCost : 0;
+
+    return {
+      cell: { x: gCx, y: gCy },
+      points: branchPoints,
+      distance: segDist,
+      cumulativeCost: baseCost + segDist,
+      originSeedIndex: seedIdx,
+    };
+  };
+
+  const primaryBranch = buildBranchForGoalIdx(reachedGoalIdx);
+  let goalBranches: WaystoneArrivalBranch[] | undefined;
+  if (collectAllGoalCells) {
+    goalBranches = reachedGoalIndices.map((gIdx) => buildBranchForGoalIdx(gIdx));
   }
-  rawCells.reverse();
 
-  if (
-    (startIsTopGate && !exactStartCell) ||
-    (goalIsBottomGate && appendTerminalPoint)
-  ) {
-    alignGateSeamCenterline(
-      rawCells,
-      walkable,
-      height,
-      startX,
-      goalX,
-      startIsTopGate && !exactStartCell,
-      goalIsBottomGate && appendTerminalPoint
-    );
-  }
-
-  const points: GridPoint[] = exactStartCell
-    ? [...rawCells]
-    : [startPoint, ...rawCells];
-
-  if (appendTerminalPoint) {
-    points.push(endPoint);
-  }
-
-  let distance = 0;
-  for (let i = 1; i < points.length; i++) {
-    distance += Math.hypot(
-      points[i].x - points[i - 1].x,
-      points[i].y - points[i - 1].y
-    );
-  }
-
-  return { points, distance, reachedCell };
+  return {
+    points: primaryBranch.points,
+    distance: primaryBranch.distance,
+    reachedCell: primaryBranch.cell,
+    originSeedIndex: primaryBranch.originSeedIndex,
+    goalBranches,
+  };
 }
 
 function computeMazePathOnWalkable(
@@ -732,16 +829,25 @@ function computeMazePathOnWalkable(
     round.exit,
   ];
   const lastSegIdx = waypoints.length - 2;
+  const northGateActive = round.spawn.y === 0;
+  const southGateActive = round.exit.y >= round.gridHeight - 2;
 
-  const segments: PathSegment[] = [];
-  const allPoints: GridPoint[] = [];
-  let totalDistance = 0;
-  let prevReachedCell: GridPoint | undefined;
+  const stageBranches: WaystoneArrivalBranch[][] = [];
+  let finalSeg: SegmentPathInternal | null = null;
 
   for (let i = 0; i <= lastSegIdx; i++) {
     const isFirstSeg = i === 0;
     const isFinalSeg = i === lastSegIdx;
     const nextHintPad = !isFinalSeg ? waypoints[i + 2] : waypoints[i + 1];
+
+    const prevBranches = isFirstSeg ? undefined : stageBranches[i - 1];
+    const seedCells: SeedCellEntry[] | undefined = prevBranches
+      ? prevBranches.map((b) => ({
+          x: b.cell.x,
+          y: b.cell.y,
+          initialCost: b.cumulativeCost,
+        }))
+      : undefined;
 
     const seg = findSegmentPath(
       walkable,
@@ -750,10 +856,12 @@ function computeMazePathOnWalkable(
       waypoints[i],
       waypoints[i + 1],
       {
-        startIsTopGate: isFirstSeg && round.spawn.y === 0,
-        goalIsBottomGate: isFinalSeg && round.exit.y >= round.gridHeight - 2,
-        exactStartCell: isFirstSeg ? undefined : prevReachedCell,
+        startIsTopGate: isFirstSeg && northGateActive,
+        goalIsBottomGate: isFinalSeg && southGateActive,
+        seedCells,
         appendTerminalPoint: isFinalSeg,
+        collectAllGoalCells: !isFinalSeg,
+        applyGatesInline: false,
         nextWaypointHintX: nextHintPad.x + 1.0,
       }
     );
@@ -767,21 +875,91 @@ function computeMazePathOnWalkable(
       };
     }
 
-    prevReachedCell = seg.reachedCell;
+    if (isFinalSeg) {
+      finalSeg = seg;
+    } else {
+      stageBranches.push(
+        seg.goalBranches && seg.goalBranches.length > 0
+          ? seg.goalBranches
+          : [
+              {
+                cell: seg.reachedCell,
+                points: seg.points,
+                distance: seg.distance,
+                cumulativeCost: seg.distance,
+                originSeedIndex: seg.originSeedIndex,
+              },
+            ]
+      );
+    }
+  }
 
+  if (!finalSeg) {
+    return {
+      valid: false,
+      segments: [],
+      allPoints: [],
+      totalDistance: 0,
+    };
+  }
+
+  // Backtrack optimal DP Waystone transitions from final exit segment back to spawn
+  const chosenSegmentPoints: GridPoint[][] = new Array(lastSegIdx + 1);
+  chosenSegmentPoints[lastSegIdx] = finalSeg.points;
+  let activeSeedIdx = finalSeg.originSeedIndex;
+
+  for (let i = lastSegIdx - 1; i >= 0; i--) {
+    const chosenBranch =
+      stageBranches[i][activeSeedIdx] || stageBranches[i][0];
+    chosenSegmentPoints[i] = chosenBranch.points;
+    activeSeedIdx = chosenBranch.originSeedIndex;
+  }
+
+  // Share stitch-point object references across Waystone boundaries so full-path seam alignment
+  // updates both segments[i] and allPoints atomically without `10.0 -> 9.5 -> 10.0` Waystone swerves
+  const allPoints: GridPoint[] = [];
+  for (let i = 0; i <= lastSegIdx; i++) {
+    const pts = chosenSegmentPoints[i];
+    if (i === 0) {
+      allPoints.push(...pts);
+    } else {
+      const prevPts = chosenSegmentPoints[i - 1];
+      pts[0] = prevPts[prevPts.length - 1];
+      allPoints.push(...pts.slice(1));
+    }
+  }
+
+  if (northGateActive || southGateActive) {
+    const interiorStart = northGateActive ? 1 : 0;
+    const interiorEnd = southGateActive
+      ? allPoints.length - 1
+      : allPoints.length;
+    if (interiorEnd > interiorStart) {
+      const interiorCells = allPoints.slice(interiorStart, interiorEnd);
+      alignGateSeamCenterline(
+        interiorCells,
+        walkable,
+        round.gridHeight,
+        round.spawn.x,
+        round.exit.x,
+        northGateActive,
+        southGateActive
+      );
+    }
+  }
+
+  const segments: PathSegment[] = [];
+  let totalDistance = 0;
+  for (let i = 0; i <= lastSegIdx; i++) {
+    const pts = chosenSegmentPoints[i];
+    const dist = computePolylineDistance(pts);
     segments.push({
       fromIndex: i,
       toIndex: i + 1,
-      points: seg.points,
-      distance: seg.distance,
+      points: pts,
+      distance: dist,
     });
-
-    if (isFirstSeg) {
-      allPoints.push(...seg.points);
-    } else {
-      allPoints.push(...seg.points.slice(1));
-    }
-    totalDistance += seg.distance;
+    totalDistance += dist;
   }
 
   return {
@@ -1302,6 +1480,7 @@ export function computeCitadelCircuitry(
   const visited = new Uint8Array(nodeCount);
   const linkedKeepIndices = new Set<number>();
   const poweredNodeKeys = new Set<string>();
+  const overchargedNodeKeys = new Set<string>();
   const keepCount = round.obstacles.length;
   const spireCount = round.preplacedSpires.length;
 
@@ -1364,6 +1543,7 @@ export function computeCitadelCircuitry(
       poweredNodeKeys.add(`${n.x},${n.y}`);
     }
 
+    let compPowersAnySpire = false;
     for (let sIdx = 0; sIdx < spireCount; sIdx++) {
       const spire = round.preplacedSpires[sIdx];
       let bestSourceIdx = -1;
@@ -1390,6 +1570,7 @@ export function computeCitadelCircuitry(
       }
 
       if (bestSourceIdx !== -1) {
+        compPowersAnySpire = true;
         for (let k = 0; k < compKeeps.length; k++) {
           const keepIdx = compKeeps[k];
           spireKeepSets[sIdx].add(keepIdx);
@@ -1403,6 +1584,13 @@ export function computeCitadelCircuitry(
           fromX: src.x,
           fromY: src.y,
         });
+      }
+    }
+
+    if (compPowersAnySpire) {
+      for (let c = 0; c < comp.length; c++) {
+        const n = nodes[comp[c]];
+        overchargedNodeKeys.add(`${n.x},${n.y}`);
       }
     }
   }
@@ -1439,6 +1627,7 @@ export function computeCitadelCircuitry(
     linkedKeepIndices,
     keepPoweredSpireCounts,
     poweredNodeKeys,
+    overchargedNodeKeys,
     spireConduitLinks,
   };
 }

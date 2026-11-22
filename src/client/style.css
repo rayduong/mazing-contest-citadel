@@ -215,12 +215,14 @@ body[data-input='mouse'] .touch-only-hint {
 }
 
 body[data-input='touch'] kbd,
+body[data-input='touch'] .desktop-only-tool,
 body[data-input='touch'] .desktop-only-hint {
   display: none !important;
 }
 
 @media (hover: none), (pointer: coarse) {
   kbd,
+  .desktop-only-tool,
   .desktop-only-hint {
     display: none !important;
   }
@@ -670,8 +672,9 @@ input:disabled,
 .standings-pill-btn {
   padding: 0 11px;
   gap: 6px;
-  min-width: 0;
+  min-width: 44px;
   max-width: 100%;
+  flex-shrink: 0;
 }
 
 .player-swatch {
@@ -804,6 +807,8 @@ input:disabled,
   gap: 6px;
   padding: 0 10px;
   min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
   max-width: calc(100vw - 16px);
 }
 
@@ -834,6 +839,11 @@ input:disabled,
   white-space: nowrap;
 }
 
+.time-chip {
+  min-width: 0;
+  flex-shrink: 1;
+}
+
 .telemetry-chip.interactive {
   position: relative;
   min-height: 38px;
@@ -845,7 +855,7 @@ input:disabled,
 .telemetry-chip.interactive::after {
   content: '';
   position: absolute;
-  inset: -4px -2px;
+  inset: -4px -5px;
 }
 
 .telemetry-chip.interactive.active {
@@ -881,15 +891,19 @@ input:disabled,
 
 .chip-icon {
   color: var(--accent-sky);
+  flex-shrink: 0;
 }
 
 .chip-num {
   font-variant-numeric: tabular-nums;
   font-size: var(--text-xs);
   font-weight: 700;
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
+  display: inline-block;
+  vertical-align: middle;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .par-short {
@@ -1292,9 +1306,16 @@ input:disabled,
 }
 
 .room-code-badge.clickable-code {
+  position: relative;
   cursor: pointer;
   user-select: text;
   -webkit-user-select: text;
+}
+
+.room-code-badge.clickable-code::after {
+  content: '';
+  position: absolute;
+  inset: -12px -4px;
 }
 
 .room-controls {
@@ -1837,6 +1858,12 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
   white-space: nowrap;
 }
 
+.dock-ready-btn > span:not(.icon-slot) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .dock-ready-btn .ready-kbd {
   background: rgba(255, 255, 255, 0.2);
   border-color: rgba(255, 255, 255, 0.38);
@@ -1979,7 +2006,7 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
   width: min(680px, 100%);
 }
 
-/* Peek-Minimized Mode: Unblurs 3D Board & Provides Quick Island Focus Bar */
+/* Peek-Minimized Mode: Unblurs 3D Board & Collapses Into Single 56px Pill Row */
 .modal-backdrop.peek-minimized {
   background: transparent;
   backdrop-filter: none;
@@ -1990,15 +2017,42 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 
 .modal-backdrop.peek-minimized .results-modal-card {
   pointer-events: auto;
-  width: min(620px, 100%);
-  padding: 10px 14px;
-  gap: 8px;
+  width: auto;
+  max-width: calc(100vw - var(--safe-left) - var(--safe-right) - 16px);
+  padding: 6px 8px;
+  border-radius: 999px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
 }
 
+.modal-backdrop.peek-minimized .modal-header {
+  margin: 0;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.modal-backdrop.peek-minimized .results-header-row {
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.modal-backdrop.peek-minimized .mini-action-btn,
+.modal-backdrop.peek-minimized .dock-ready-btn {
+  height: 44px;
+  min-height: 44px;
+  border-radius: 999px;
+}
+
+.modal-backdrop.peek-minimized .results-title-group,
 .modal-backdrop.peek-minimized #results-subtitle,
 .modal-backdrop.peek-minimized #results-podium,
 .modal-backdrop.peek-minimized #results-record-callout,
-.modal-backdrop.peek-minimized #results-table {
+.modal-backdrop.peek-minimized #results-table,
+.modal-backdrop.peek-minimized #btn-results-leaderboard {
   display: none !important;
 }
 
@@ -2011,8 +2065,8 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 }
 
 .peek-pill-btn {
-  min-height: 38px;
-  padding: 0 11px;
+  min-height: 44px;
+  padding: 0 12px;
   border-radius: 999px;
   background: var(--surface-subtle);
   border: 1px solid var(--surface-border);
@@ -2261,11 +2315,16 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
   flex-wrap: wrap;
 }
 
-.modal-backdrop.peek-minimized .modal-actions {
+.modal-backdrop.peek-minimized .modal-actions,
+.modal-backdrop.peek-minimized .results-actions {
+  display: flex;
   position: static;
   margin: 0;
   padding: 0;
   background: transparent;
+  gap: 6px;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
 }
 
 /* ============================================================================
@@ -2392,7 +2451,7 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
   align-items: center;
   gap: 7px;
   min-width: 0;
-  flex-shrink: 0;
+  flex-shrink: 1;
 }
 
 /* Keep #hub-active-room-badge in DOM for Contract Compatibility Without 3x ARENA1 Clutter */
@@ -2402,6 +2461,8 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 
 .hub-name-box {
   min-height: 44px;
+  min-width: 0;
+  flex-shrink: 1;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2413,10 +2474,12 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 
 .hub-name-icon {
   color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 .hub-name-box input {
   width: 106px;
+  min-width: 56px;
   background: transparent;
   border: none;
   outline: none;
@@ -2429,11 +2492,13 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 
 .hub-mute-btn {
   background: var(--surface-elevated);
+  flex-shrink: 0;
 }
 
 .hub-resume-btn {
   min-height: 44px;
   padding: 0 13px;
+  flex-shrink: 0;
 }
 
 /* Hub Tab Bodies */
@@ -3413,11 +3478,52 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   }
 }
 
+/* Collapse Room Controls Globally ONLY When Virtual Keyboard Opens on Chat (Portrait & Landscape) */
+body.keyboard-open .lobby-drawer.chat-input-focused .room-controls,
+body.keyboard-open .lobby-drawer:has(#chat-input:focus) .room-controls,
+body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
+  display: none;
+}
+
 /* Narrow Desktop & Tablet (<= 1040px): Compact Round Subtitle */
 @media (max-width: 1040px) {
   .round-mini-title,
   .hub-brand-sub {
     display: none;
+  }
+}
+
+/* Narrow 1-Row Desktop Hub Header (861px - 980px): Zero Right-Edge Clipping */
+@media (max-width: 980px) {
+  .hub-header {
+    padding: 10px 14px;
+    gap: 8px;
+  }
+
+  .hub-emblem,
+  .hub-name-box .icon-slot {
+    display: none;
+  }
+
+  .hub-title {
+    font-size: var(--text-md);
+  }
+
+  .hub-tab-btn {
+    padding: 0 9px;
+    gap: 5px;
+  }
+
+  .hub-name-box {
+    padding: 0 9px;
+  }
+
+  .hub-name-box input {
+    width: 82px;
+  }
+
+  .hub-resume-btn {
+    padding: 0 11px;
   }
 }
 
@@ -3520,7 +3626,7 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   .leaderboard-hud-btn,
   .mute-hud-btn,
   .guide-hud-btn,
-  .phase-label {
+  .desktop-only-tool {
     display: none !important;
   }
 
@@ -3625,7 +3731,9 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
 /* Compact Est/Par Format & Virtual-Keyboard Bottom Sheet on <= 640px */
 @media (max-width: 640px) {
   .time-verb,
-  .par-full {
+  .par-full,
+  .standings-score,
+  .round-runner-badge {
     display: none;
   }
 
@@ -3652,15 +3760,6 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
     padding-bottom: 10px;
   }
 
-  /* Collapse Room Controls ONLY When Typing in Chat (Never When Editing Name!) */
-  body.keyboard-open .lobby-drawer.chat-input-focused .room-controls,
-  body.keyboard-open .lobby-drawer:has(#chat-input:focus) .room-controls,
-  body.keyboard-open
-    .lobby-drawer:has(#chat-input:focus)
-    .drawer-player-roster {
-    display: none;
-  }
-
   .chat-messages {
     flex: 1;
     height: auto;
@@ -3681,10 +3780,9 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
     gap: 4px;
   }
 
-  .standings-score,
-  .round-runner-badge,
+  .phase-label,
   .time-chip .chip-icon {
-    display: none;
+    display: none !important;
   }
 
   .standings-pill-btn {
@@ -3789,7 +3887,7 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   }
 
   .modal-backdrop.peek-minimized .results-modal-card {
-    padding: 8px 10px;
+    padding: 6px 8px;
   }
 
   /* Keep Hub Header & Hero Strip Clean on Compact Screens */
@@ -3853,8 +3951,8 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   }
 }
 
-/* Ultra-Narrow 360px-430px Top HUD & Dock Fit (0px Overflow Guaranteed) */
-@media (max-width: 430px) {
+/* Compact 360px-495px Portrait Top HUD Fit (Covers 440px-490px Phones Cleanly) */
+@media (max-width: 495px) {
   .standings-pill-btn .caret-slot,
   #btn-round-picker .caret-slot,
   .rank-who {
@@ -3866,8 +3964,9 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   }
 
   .standings-pill-btn {
-    padding: 0 7px;
+    min-width: 44px;
     max-width: 50px;
+    padding: 0 7px;
   }
 
   .standings-summary {
@@ -3876,7 +3975,7 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
 
   .hud-top-pill {
     padding: 0 6px;
-    gap: 3px;
+    gap: 4px;
     overflow: hidden;
   }
 
@@ -3896,12 +3995,66 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
 
   #est-time-value {
     max-width: 78px;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 }
 
+/* Single-Row 56px Peek Bar Fit on Narrow Phones (360px - 440px) */
+@media (max-width: 440px) {
+  .modal-backdrop.peek-minimized .results-modal-card {
+    padding: 5px 6px;
+    gap: 4px;
+  }
+
+  .modal-backdrop.peek-minimized .results-header-row,
+  .modal-backdrop.peek-minimized .results-actions {
+    gap: 4px;
+  }
+
+  .modal-backdrop.peek-minimized .mini-action-btn,
+  .modal-backdrop.peek-minimized .dock-ready-btn {
+    padding: 0 9px;
+    font-size: var(--text-xs);
+  }
+
+  .modal-backdrop.peek-minimized #btn-next-round .icon-slot {
+    display: none;
+  }
+}
+
+/* Ultra-Narrow 360px-400px Zero-Clip Top HUD & Armed Dock Fit */
 @media (max-width: 400px) {
+  .hud-top-pill {
+    padding: 0 5px;
+    gap: 4px;
+  }
+
+  .hud-top-pill .pill-divider {
+    display: none;
+  }
+
+  #btn-round-picker {
+    padding: 0 2px;
+  }
+
+  .time-chip {
+    padding: 0 2px;
+  }
+
+  #btn-round-picker .chip-accent,
+  .timer-display,
+  #est-time-value {
+    font-size: var(--text-2xs);
+    letter-spacing: -0.02em;
+  }
+
+  .timer-display {
+    min-width: 30px;
+  }
+
+  #est-time-value {
+    max-width: 68px;
+  }
+
   .dock-tool-btn,
   .dock-more-btn {
     min-width: 44px;
@@ -3918,6 +4071,8 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
     padding: 0 8px;
   }
 
+  .hud-bottom-dock .dock-ready-btn.armed-confirm > .icon-slot,
+  .hud-bottom-dock .dock-ready-btn[data-armed='true'] > .icon-slot,
   .touch-confirm-btn > .icon-slot:first-child {
     display: none;
   }
@@ -3938,13 +4093,19 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   .leaderboard-hud-btn,
   .mute-hud-btn,
   .guide-hud-btn,
+  .desktop-only-tool,
   .hub-pill-btn .btn-label,
   .overview-toggle .btn-label,
+  .hub-emblem,
   .hub-brand-sub,
   .hub-name-box .icon-slot,
   .hub-resume-btn .resume-btn-text,
   .hub-hero-tagline {
     display: none !important;
+  }
+
+  .island-3d-badge {
+    max-width: 112px;
   }
 
   .hub-pill-btn,
@@ -4075,12 +4236,37 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   .hub-header {
     padding: calc(var(--safe-top) + 6px) calc(var(--safe-right) + 12px) 6px
       calc(var(--safe-left) + 12px);
+    gap: 8px;
     flex-wrap: nowrap;
+  }
+
+  .hub-title {
+    font-size: var(--text-md);
+    letter-spacing: 0.03em;
   }
 
   .hub-nav-tabs {
     order: initial;
     width: auto;
+  }
+
+  .hub-tab-btn {
+    padding: 0 9px;
+    gap: 5px;
+  }
+
+  .hub-profile-cluster {
+    gap: 6px;
+    flex-shrink: 1;
+  }
+
+  .hub-name-box {
+    padding: 0 9px;
+  }
+
+  .hub-name-box input {
+    width: 80px;
+    min-width: 52px;
   }
 
   .hub-hero-strip {
@@ -4093,8 +4279,18 @@ body:has(#round-brief-banner:not(.hidden)) .toast-container {
   }
 }
 
-/* Ultra-Short Narrow Landscape Safety (e.g. 667x375 iPhone SE) */
-@media (max-width: 700px) and (max-height: 500px) and (orientation: landscape) {
+/* Narrow & Notched Landscape Safety (<= 780px, e.g. 740x360 Notched & 667x375) */
+@media (max-width: 780px) and (max-height: 500px) and (orientation: landscape) {
+  .hub-brand > div {
+    display: none;
+  }
+
+  .hub-emblem {
+    display: grid !important;
+    width: 36px;
+    height: 36px;
+  }
+
   .touch-precision-tray {
     bottom: calc(var(--safe-bottom) + 58px);
   }

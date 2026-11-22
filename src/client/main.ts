@@ -177,6 +177,9 @@ class MazingContestClient {
   private localParAchievedThisRun = false;
   private localFinishPlayedThisRun = false;
   private lastRunDomCache = new Map<string, string>();
+  private lastLobbySignature = '';
+  private lastChatSignature = '';
+  private lastSampleToastRoundSig = '';
 
   private armedTimers = new Map<HTMLElement, ArmedButtonEntry>();
   private lastPillSignature = '';
@@ -387,9 +390,15 @@ class MazingContestClient {
       }
 
       const bottomPx = Math.max(16, Math.round(h - minBottomTop + 6));
+      // Live inset includes the open precision tray so ghost auto-pan / offscreen checks clear it,
+      // while the framing inset stays locked (zero camera bob on tray toggle).
+      const liveBottomPx =
+        trayTop < h
+          ? Math.max(bottomPx, Math.round(h - trayTop + 6))
+          : bottomPx;
       this.cachedTopHudBottom = topPx;
       this.cachedBottomHudInset = bottomPx;
-      this.renderer3d.setHudSafeInsets(topPx, bottomPx);
+      this.renderer3d.setHudSafeInsets(topPx, bottomPx, liveBottomPx);
     });
   }
 
@@ -974,12 +983,23 @@ class MazingContestClient {
 
     // Trigger Round Brief at start of each round's BUILD phase
     if (state.phase === 'BUILD') {
+      if (prevPhase && prevPhase !== 'BUILD') {
+        // Fresh BUILD round: return camera to the local island, North-up
+        this.renderer3d.resetToMyIsland();
+      }
       const briefSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
         state.roundConfig.seed ?? ''
       }`;
       if (briefSig !== this.lastBriefRoundSignature) {
         this.lastBriefRoundSignature = briefSig;
         this.triggerRoundBriefBanner();
+      }
+      const meNow = state.players.find((p) => p.id === this.localPlayerId);
+      if (meNow?.usedSampleMaze && this.lastSampleToastRoundSig !== briefSig) {
+        this.lastSampleToastRoundSig = briefSig;
+        this.showToast(
+          'Sample Maze · Practice: this round runs unranked for you.'
+        );
       }
     } else {
       this.dismissRoundBrief();
@@ -1032,6 +1052,7 @@ class MazingContestClient {
     this.updateTopBarAndResources();
     this.updateScoreboardDOM();
     this.renderDrawerRoster();
+    this.syncHostOnlyControls();
     this.updateHubHeroStatus();
     this.renderChat();
     this.renderLobbyBrowser();
@@ -1052,6 +1073,17 @@ class MazingContestClient {
       }
       this.simulators.set(p.id, sim);
     }
+    // Reconnecting mid-run past Par must not re-trigger the Par celebration
+    const localSim = this.localPlayerId
+      ? this.simulators.get(this.localPlayerId)
+      : undefined;
+    if (localSim) {
+      const localSecs = localSim.state.finished
+        ? localSim.state.finishTimeSeconds
+        : localSim.elapsedSeconds;
+      this.localParAchievedThisRun =
+        initialElapsed > 0.2 && localSecs >= state.roundConfig.parTimeSeconds;
+    }
     if (initialElapsed < 0.2) {
       soundEngine.playRunStart();
     }
@@ -1068,9 +1100,17 @@ class MazingContestClient {
 
   private reconcileRunDrift(serverElapsed: number) {
     if (!this.runPhaseActive || !this.roomState || serverElapsed <= 0) return;
+    const smallDrifts: number[] = [];
     for (const p of this.roomState.players) {
-      const sim = this.simulators.get(p.id);
-      if (!sim || sim.state.finished) continue;
+      let sim = this.simulators.get(p.id);
+      if (!sim) {
+        // Mid-RUN joiner / late bot: build its simulator at the authoritative clock
+        sim = new MazeRunnerSimulator(p.id, this.roomState.roundConfig, p.towers);
+        sim.fastForwardTo(serverElapsed);
+        this.simulators.set(p.id, sim);
+        continue;
+      }
+      if (sim.state.finished) continue;
       const drift = serverElapsed - sim.elapsedSeconds;
       if (drift > 1.25) {
         sim.fastForwardTo(serverElapsed);
@@ -1082,8 +1122,19 @@ class MazingContestClient {
         );
         fresh.fastForwardTo(serverElapsed);
         this.simulators.set(p.id, fresh);
-      } else if (Math.abs(drift) > 0.18) {
-        this.simAccumulator = Math.max(0, this.simAccumulator + drift * 0.25);
+      } else {
+        smallDrifts.push(drift);
+      }
+    }
+    // Shared accumulator: apply ONE symmetric slew from the mean drift (never 6x per player)
+    if (smallDrifts.length > 0) {
+      const meanDrift =
+        smallDrifts.reduce((s, d) => s + d, 0) / smallDrifts.length;
+      if (Math.abs(meanDrift) > 0.18) {
+        this.simAccumulator = Math.max(
+          -SIM_DT * 8,
+          this.simAccumulator + meanDrift * 0.25
+        );
       }
     }
   }
@@ -1149,7 +1200,12 @@ class MazingContestClient {
       const watchId = this.localPlayerId || focusId || '';
       const watchSim = this.simulators.get(watchId);
       const parSecs = this.roomState.roundConfig.parTimeSeconds;
-      if (watchSim && watchSim.elapsedSeconds >= parSecs) {
+      const watchSecs = watchSim
+        ? watchSim.state.finished
+          ? watchSim.state.finishTimeSeconds
+          : watchSim.elapsedSeconds
+        : 0;
+      if (watchSim && watchSecs >= parSecs) {
         this.localParAchievedThisRun = true;
         soundEngine.playParAchieved();
         soundEngine.haptic('ready');
@@ -1765,6 +1821,7 @@ class MazingContestClient {
       const moved = this.renderer3d.nudgeTouchGhost(dx, dy);
       if (!moved) {
         soundEngine.haptic('error');
+        soundEngine.playEdgeBump?.();
         this.stopNudgeHold();
       }
     };
@@ -1845,6 +1902,37 @@ class MazingContestClient {
         this.hideCursorPill();
       }
     });
+
+    // Dismiss the mobile touch inspect card as soon as the player pans or pinches the board
+    const viewportEl = document.getElementById('viewport-container');
+    let inspectTouchStart: { x: number; y: number } | null = null;
+    viewportEl?.addEventListener(
+      'touchstart',
+      (e) => {
+        const t = e.touches[0];
+        inspectTouchStart = t ? { x: t.clientX, y: t.clientY } : null;
+      },
+      { passive: true }
+    );
+    viewportEl?.addEventListener(
+      'touchmove',
+      (e) => {
+        if (!pill.classList.contains('touch-inspect-card')) return;
+        if (pill.classList.contains('hidden')) return;
+        const t = e.touches[0];
+        const movedFar =
+          inspectTouchStart && t
+            ? Math.hypot(
+                t.clientX - inspectTouchStart.x,
+                t.clientY - inspectTouchStart.y
+              ) > 14
+            : false;
+        if (e.touches.length >= 2 || movedFar) {
+          this.hideCursorPill();
+        }
+      },
+      { passive: true }
+    );
 
     this.renderer3d.onHoverStatusChange = (info: HoverStatusInfo) => {
       if (this.renderer3d.modalOpen || !this.roomState) {
@@ -2061,7 +2149,7 @@ class MazingContestClient {
             ? `<span class="overcharge-pips">+${dOver}${icon(
                 'diamondFilled',
                 11
-              )}</span>`
+              )} Overcharge</span>`
             : dKeeps > 0
             ? `<span class="overcharge-pips">+${dKeeps} Keep</span>`
             : '';
@@ -2097,7 +2185,11 @@ class MazingContestClient {
     const pillW = pill.offsetWidth || 140;
     const pillH = pill.offsetHeight || 34;
     const minTop = this.cachedTopHudBottom + 8;
-    const maxTop = Math.max(minTop, window.innerHeight - pillH - 18);
+    // Clamp above the bottom dock so the pill never slides under #hud-bottom-dock
+    const maxTop = Math.max(
+      minTop,
+      window.innerHeight - this.cachedBottomHudInset - pillH - 8
+    );
 
     let offsetX = screenX + 18;
     if (offsetX + pillW > window.innerWidth - 12) {
@@ -2122,11 +2214,10 @@ class MazingContestClient {
       this.scheduleHudSafeInsetsSync();
     }
 
+    // In BLOCK mode keep nudges visible on an existing-wall selection (enables +2 step-over)
     const nudgeCluster = tray.querySelector<HTMLElement>('.touch-nudge-cluster');
     const hideNudges =
-      Boolean(info.existingTower) ||
-      this.renderer3d.activeTool === 'SELL' ||
-      Boolean(info.isTouchInspect);
+      this.renderer3d.activeTool === 'SELL' || Boolean(info.isTouchInspect);
     if (nudgeCluster) {
       nudgeCluster.style.display = hideNudges ? 'none' : '';
     }
@@ -2139,11 +2230,22 @@ class MazingContestClient {
     let btnHtml = '';
 
     if (info.existingTower) {
+      const dt = info.deltaTime;
+      const dOver = info.deltaOvercharge ?? 0;
+      const dtPart =
+        typeof dt === 'number' ? ` · ${dt >= 0 ? '+' : ''}${dt.toFixed(1)}s` : '';
+      const overLoss =
+        dOver < 0
+          ? `<span class="overcharge-pips">${dOver}${icon(
+              'diamondFilled',
+              11
+            )}</span>`
+          : '';
       btnClass = 'touch-confirm-btn reclaim-action';
       btnHtml = `${icon(
         'reclaim',
         15
-      )}<span id="touch-confirm-label">Remove (+1)</span>`;
+      )}<span id="touch-confirm-label">Remove${dtPart}</span>${overLoss}`;
     } else if (this.renderer3d.activeTool === 'SELL') {
       btnClass = 'touch-confirm-btn invalid';
       btnDisabled = true;
@@ -2154,6 +2256,7 @@ class MazingContestClient {
     } else if (info.valid) {
       const dt = info.deltaTime ?? 0;
       const dOver = info.deltaOvercharge ?? 0;
+      const dKeeps = info.deltaKeeps ?? 0;
       const sign = dt >= 0 ? '+' : '';
       const overBadge =
         dOver > 0
@@ -2161,6 +2264,8 @@ class MazingContestClient {
               'diamondFilled',
               11
             )}</span>`
+          : dKeeps > 0
+          ? `<span class="overcharge-pips">+${dKeeps} Keep</span>`
           : '';
       btnClass = 'touch-confirm-btn';
       btnHtml = `${icon(
@@ -2232,7 +2337,9 @@ class MazingContestClient {
           eff.slowPercent * 100
         )}% slow (${eff.slowDuration.toFixed(1)}s) / ${eff.effectiveCooldown.toFixed(
           1
-        )}s · -${eff.cdrPulseSeconds.toFixed(1)}s spire recharge`;
+        )}s · ${eff.effectiveRange.toFixed(2)}m · -${eff.cdrPulseSeconds.toFixed(
+          1
+        )}s Spire recharge`;
       } else {
         statsLine = `${Math.round(
           eff.slowPercent * 100
@@ -2242,13 +2349,16 @@ class MazingContestClient {
       }
 
       const isRun = this.roomState?.phase === 'RUN';
+      const armorNote = eff.armoredReduced
+        ? ' · Armor resists until 1◆'
+        : '';
       const metaLine = isRun
-        ? `Spire Hits this run: ${f.projectedOrLiveHits}`
+        ? `Spire Hits this run: ${f.projectedOrLiveHits}${armorNote}`
         : `Projected Spire Hits: ${f.projectedOrLiveHits}${
             f.overchargeTier < 3
               ? ' · Link Crimson Keeps within 1 tile for +1◆'
               : ' · Max Overcharge'
-          }`;
+          }${armorNote}`;
 
       return `
         <div class="inspect-head">
@@ -2294,12 +2404,15 @@ class MazingContestClient {
       const statusPart = f.statusLabel
         ? `<span class="inspect-meta">· ${escapeHtml(f.statusLabel)}</span>`
         : '';
-      const subText =
-        this.roomState?.phase === 'RUN'
-          ? `Speed ${f.currentSpeed.toFixed(2)} m/s (base ${f.baseSpeed.toFixed(
-              2
-            )} m/s)`
-          : arch.traitSummary;
+      const isRunPhase = this.roomState?.phase === 'RUN';
+      const subText = isRunPhase
+        ? `Speed ${f.currentSpeed.toFixed(2)} m/s (base ${f.baseSpeed.toFixed(
+            2
+          )} m/s)`
+        : arch.traitSummary;
+      const traitLine = isRunPhase
+        ? `<div class="inspect-meta">${escapeHtml(arch.traitSummary)}</div>`
+        : '';
       return `
         <div class="inspect-head">
           ${getRunnerIcon(f.archetype, 14)}
@@ -2308,6 +2421,50 @@ class MazingContestClient {
           ${closeBtn}
         </div>
         <div class="inspect-sub">${escapeHtml(subText)}</div>
+        ${traitLine}
+      `;
+    }
+
+    if (f.kind === 'CHECKPOINT') {
+      const total = Math.max(1, f.totalCheckpoints);
+      const label =
+        total > 1 ? `Waystone ${f.checkpointIndex + 1} of ${total}` : 'Waystone';
+      const isRun = this.roomState?.phase === 'RUN';
+      const badge = isRun
+        ? f.reached
+          ? `<span class="overcharge-pips">${icon('check', 11)} Reached</span>`
+          : `<span class="inspect-meta">Not yet reached</span>`
+        : '';
+      return `
+        <div class="inspect-head">
+          ${icon('target', 14)}
+          <span>${escapeHtml(label)}</span>
+          ${badge}
+          ${closeBtn}
+        </div>
+        <div class="inspect-sub">The runner must touch every Waystone before heading to the South Shrine. Route your maze through it to add distance.</div>
+      `;
+    }
+
+    if (f.kind === 'WAYGATE') {
+      const roleLabel =
+        f.role === 'ENTRY' ? 'Waygate · Entrance' : 'Waygate · Exit';
+      const usedBadge =
+        this.roomState?.phase === 'RUN' && f.used
+          ? `<span class="inspect-meta">· Used</span>`
+          : '';
+      const desc =
+        f.role === 'ENTRY'
+          ? 'Warps the runner once to its paired exit. Keep it off the runner path to avoid the shortcut.'
+          : 'Runners warped through the paired entrance continue from here.';
+      return `
+        <div class="inspect-head">
+          ${icon('chrono', 14)}
+          <span>${escapeHtml(roleLabel)}</span>
+          ${usedBadge}
+          ${closeBtn}
+        </div>
+        <div class="inspect-sub">${escapeHtml(desc)}</div>
       `;
     }
 
@@ -2366,8 +2523,12 @@ class MazingContestClient {
     const bar = document.getElementById('spectator-bar');
     const nameEl = document.getElementById('spectator-target-name');
     if (bar) {
+      const phase = this.roomState?.phase;
+      // Desktop also shows the bar during RUN (touch uses #hud-run-dock's My Island toggle)
       const showBar =
-        spectating && Boolean(this.roomState && this.roomState.phase === 'BUILD');
+        spectating &&
+        (phase === 'BUILD' ||
+          (phase === 'RUN' && document.body.dataset.input !== 'touch'));
       bar.classList.toggle('hidden', !showBar);
       if (showBar && nameEl && this.roomState) {
         const target = this.roomState.players.find(
@@ -2687,12 +2848,19 @@ class MazingContestClient {
         if (hubNameInput) hubNameInput.value = clean;
         if (drawerNameInput) drawerNameInput.value = clean;
         this.send({ type: 'SET_NAME', playerName: clean });
+      } else {
+        // Blank name restores the last committed name instead of leaving an empty field
+        if (hubNameInput) hubNameInput.value = this.playerName;
+        if (drawerNameInput) drawerNameInput.value = this.playerName;
       }
     };
 
     hubNameInput?.addEventListener('change', () =>
       commitName(hubNameInput.value)
     );
+    hubNameInput?.addEventListener('blur', () => {
+      if (!hubNameInput.value.trim()) commitName('');
+    });
     hubNameInput?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -2716,7 +2884,6 @@ class MazingContestClient {
         this.showToast('Enter a room code (for example ARENA1)');
         return;
       }
-      this.roomCode = code;
       this.pendingJoinToast = `Joined room ${code}`;
       this.send({
         type: 'JOIN_ROOM',
@@ -2753,7 +2920,6 @@ class MazingContestClient {
         () => {
           soundEngine.playUiClick();
           const soloCode = `SOLO${Math.floor(10 + Math.random() * 89)}`;
-          this.roomCode = soloCode;
           this.pendingJoinToast = `Started solo match (${soloCode})`;
           this.send({
             type: 'CREATE_ROOM',
@@ -2824,6 +2990,7 @@ class MazingContestClient {
               .querySelectorAll<HTMLButtonElement>('.seg-btn')
               .forEach((b) => b.classList.remove('active'));
             btn.classList.add('active');
+            this.syncBotSkillRow();
             this.syncRulesDirtyHighlight();
           });
         });
@@ -2855,24 +3022,35 @@ class MazingContestClient {
         this.closeHub();
       });
 
-    // Create New Custom Room
-    document
-      .getElementById('btn-create-custom-room')
-      ?.addEventListener('click', () => {
-        if (!this.ensureConnectedForAction()) return;
-        soundEngine.playUiClick();
-        const settings = this.readConfigFormSettings();
-        const customCode = `ROOM${Math.floor(100 + Math.random() * 899)}`;
-        this.roomCode = customCode;
-        this.pendingJoinToast = `Created room ${customCode}`;
-        this.send({
-          type: 'CREATE_ROOM',
-          roomCode: customCode,
-          playerName: this.playerName,
-          sessionId: this.sessionId,
-          settings,
-        });
-      });
+    // Create New Custom Room (Guests may configure + host their own room; 2-tap guard mid-build)
+    const createRoomBtn = document.getElementById('btn-create-custom-room');
+    createRoomBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
+      const me = this.getLocalPlayer();
+      const hasWalls = Boolean(
+        this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
+      );
+      this.armDestructiveButton(
+        createRoomBtn,
+        hasWalls,
+        'Leave Maze?',
+        'plus',
+        () => {
+          soundEngine.playUiClick();
+          const settings = this.readConfigFormSettings();
+          const customCode = `ROOM${Math.floor(100 + Math.random() * 899)}`;
+          this.pendingJoinToast = `Created room ${customCode}`;
+          this.send({
+            type: 'CREATE_ROOM',
+            roomCode: customCode,
+            playerName: this.playerName,
+            sessionId: this.sessionId,
+            settings,
+          });
+        }
+      );
+    });
 
     // Leaderboard Mode Switcher
     const lbModeGroup = document.getElementById('leaderboard-mode-group');
@@ -2943,8 +3121,51 @@ class MazingContestClient {
     };
   }
 
-  private syncConfigFormFromSettings(settings: RoomSettings) {
+  private syncBotSkillRow() {
+    const zeroBots =
+      Number(
+        document.querySelector<HTMLButtonElement>(
+          '#cfg-botcount-group .seg-btn.active'
+        )?.dataset.val ?? '3'
+      ) === 0;
+    document.getElementById('row-bot-skill')?.classList.toggle('hidden', zeroBots);
+  }
+
+  private syncHostOnlyControls() {
     const canEditRules = this.canControlRoomRules();
+    const hostTitle = 'Only the room host can change this';
+
+    const fogChk = document.getElementById(
+      'chk-fog'
+    ) as HTMLInputElement | null;
+    if (fogChk) {
+      fogChk.checked = Boolean(this.roomState?.settings?.fogOfWar);
+      fogChk.disabled = !canEditRules;
+    }
+
+    const applyBtn = document.getElementById(
+      'btn-apply-room-settings'
+    ) as HTMLButtonElement | null;
+    if (applyBtn) {
+      applyBtn.disabled = !canEditRules;
+      applyBtn.title = canEditRules ? 'Update Rules in Current Room' : hostTitle;
+      if (!canEditRules) applyBtn.classList.remove('is-dirty');
+    }
+
+    const restartBtn = document.getElementById(
+      'btn-hub-restart-match'
+    ) as HTMLButtonElement | null;
+    if (restartBtn) {
+      restartBtn.disabled = !canEditRules;
+      restartBtn.title = canEditRules
+        ? 'Restart Current Match from Round 1'
+        : hostTitle;
+    }
+  }
+
+  private syncConfigFormFromSettings(settings: RoomSettings) {
+    // Guests keep Room Rules editable so they can host a New Room with custom rules;
+    // only Update Room / Restart Match / drawer host controls are host-locked.
     const nameInput = document.getElementById(
       'cfg-room-name'
     ) as HTMLInputElement | null;
@@ -2952,10 +3173,7 @@ class MazingContestClient {
       nameInput.value = settings.roomName;
     }
     if (nameInput) {
-      nameInput.disabled = !canEditRules;
-      nameInput.title = canEditRules
-        ? 'Room Name'
-        : 'Host controls current room rules';
+      nameInput.disabled = false;
     }
 
     const setSegVal = (groupId: string, val: string) => {
@@ -2963,12 +3181,7 @@ class MazingContestClient {
       if (!group) return;
       group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.val === val);
-        btn.disabled = !canEditRules;
-        if (!canEditRules) {
-          btn.title = 'Host controls current room rules';
-        } else if (groupId !== 'cfg-buildtime-group' || btn.dataset.val !== '0') {
-          btn.title = '';
-        }
+        btn.disabled = false;
       });
     };
 
@@ -2980,28 +3193,11 @@ class MazingContestClient {
     setSegVal('cfg-botdiff-group', settings.botDifficulty || 'ARCHITECT');
     setSegVal('cfg-fog-group', String(Boolean(settings.fogOfWar)));
 
-    const fogChk = document.getElementById(
-      'chk-fog'
-    ) as HTMLInputElement | null;
-    if (fogChk) {
-      fogChk.checked = Boolean(settings.fogOfWar);
-      fogChk.disabled = !canEditRules;
-    }
-
-    const applyBtn = document.getElementById(
-      'btn-apply-room-settings'
-    ) as HTMLButtonElement | null;
-    if (applyBtn) {
-      applyBtn.disabled = !canEditRules;
-      applyBtn.classList.remove('is-dirty');
-    }
-
-    const restartBtn = document.getElementById(
-      'btn-hub-restart-match'
-    ) as HTMLButtonElement | null;
-    if (restartBtn) {
-      restartBtn.disabled = !canEditRules;
-    }
+    this.syncBotSkillRow();
+    this.syncHostOnlyControls();
+    document
+      .getElementById('btn-apply-room-settings')
+      ?.classList.remove('is-dirty');
   }
 
   // ==========================================================================
@@ -3015,6 +3211,25 @@ class MazingContestClient {
     if (!listEl) return;
 
     const rooms = this.lobbies;
+    // Dirty-check: skip DOM rebuild when nothing visible changed (ROOM_STATE fires every 500ms)
+    const lobbySig = `${this.roomCode}|${JSON.stringify(
+      rooms.map((r) => [
+        r.roomCode,
+        r.roomName,
+        r.hostName,
+        r.phase,
+        r.currentRound,
+        r.totalRounds,
+        r.humanCount,
+        r.botCount,
+        r.maxPlayers,
+        r.settings.buildTimeSeconds,
+        r.settings.fogOfWar,
+      ])
+    )}`;
+    if (lobbySig === this.lastLobbySignature) return;
+    this.lastLobbySignature = lobbySig;
+
     if (countEl) {
       countEl.textContent = `${rooms.length} Open`;
     }
@@ -3030,6 +3245,7 @@ class MazingContestClient {
 
     for (const r of rooms) {
       const isCurrent = r.roomCode === this.roomCode;
+      const isFull = !isCurrent && r.humanCount >= r.maxPlayers;
       const card = document.createElement('div');
       card.className = `lobby-card${isCurrent ? ' current-room' : ''}`;
 
@@ -3051,6 +3267,7 @@ class MazingContestClient {
       const subtitleText = `Host: ${escapeHtml(r.hostName)} · ${
         r.totalRounds
       } Rounds · ${paceDesc}${hiddenSuffix}`;
+      const botsLabel = `${r.botCount} ${r.botCount === 1 ? 'Bot' : 'Bots'}`;
 
       card.innerHTML = `
         <div class="lobby-card-main">
@@ -3064,18 +3281,18 @@ class MazingContestClient {
           <div class="lobby-card-subtitle">${subtitleText}</div>
         </div>
         <div class="lobby-card-right">
-          <span class="capacity-pill" title="${r.humanCount} Players · ${
-        r.botCount
-      } Bots">
+          <span class="capacity-pill" title="${r.humanCount} Players · ${botsLabel}">
             ${icon('users', 14)}
-            <span>${r.playerCount}/${r.maxPlayers}</span>
+            <span>${r.humanCount}/${r.maxPlayers} · ${botsLabel}</span>
           </span>
           <button type="button" class="hub-action-pill ${
             isCurrent ? 'sage' : 'gold'
-          }">
+          }"${isFull ? ' disabled' : ''}>
             ${
               isCurrent
                 ? `${icon('check', 14)}<span>Active</span>`
+                : isFull
+                ? `<span>Full</span>`
                 : `<span>Join</span>`
             }
           </button>
@@ -3083,13 +3300,19 @@ class MazingContestClient {
       `;
 
       const btn = card.querySelector('button')!;
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
         soundEngine.playUiClick();
         if (isCurrent) {
           this.closeHub();
-        } else {
-          if (!this.ensureConnectedForAction()) return;
-          this.roomCode = r.roomCode;
+          return;
+        }
+        if (!this.ensureConnectedForAction()) return;
+        const me = this.getLocalPlayer();
+        const hasWalls = Boolean(
+          this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
+        );
+        this.armDestructiveButton(btn, hasWalls, 'Leave Maze?', 'arrowRight', () => {
           this.pendingJoinToast = `Joined ${r.roomName} (${r.roomCode})`;
           this.send({
             type: 'JOIN_ROOM',
@@ -3097,7 +3320,7 @@ class MazingContestClient {
             playerName: this.playerName,
             sessionId: this.sessionId,
           });
-        }
+        });
       });
 
       listEl.appendChild(card);
@@ -3480,6 +3703,58 @@ class MazingContestClient {
       }
 
       if (e.code === 'Escape') {
+        // Layered Escape: Hub -> Help -> Drawer -> armed/popovers -> ghost/inspect
+        // -> Remove tool back to Build -> rival spectate/Overview -> Results peek
+        if (this.isHubOpen()) {
+          this.closeHub();
+          return;
+        }
+        if (this.isHelpOpen()) {
+          document.getElementById('help-modal')?.classList.add('hidden');
+          this.syncModalOpenState();
+          return;
+        }
+        const lobbyDrawerEl = document.getElementById('lobby-drawer');
+        if (lobbyDrawerEl && !lobbyDrawerEl.classList.contains('hidden')) {
+          this.dismissAllTransientOverlays();
+          return;
+        }
+        if (this.armedTimers.size > 0) {
+          this.disarmAllButtons();
+          return;
+        }
+        if (this.dismissAllTransientOverlays()) {
+          return;
+        }
+        const pillEl = document.getElementById('cursor-telemetry-pill');
+        if (
+          this.renderer3d.hasActiveTouchGhost() ||
+          Boolean(
+            pillEl &&
+              !pillEl.classList.contains('hidden') &&
+              pillEl.classList.contains('touch-inspect-card')
+          )
+        ) {
+          this.renderer3d.cancelTouchGhost();
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          return;
+        }
+        if (
+          this.roomState?.phase === 'BUILD' &&
+          this.renderer3d.activeTool === 'SELL'
+        ) {
+          this.selectTool('BLOCK');
+          return;
+        }
+        if (
+          (this.isSpectatingRival() || this.renderer3d.arenaOverviewMode) &&
+          this.localPlayerId &&
+          !this.isResultsBlocking()
+        ) {
+          this.toggleOverviewOrReturnHome();
+          return;
+        }
         const resultsModal = document.getElementById('results-modal');
         if (
           resultsModal &&
@@ -3490,36 +3765,6 @@ class MazingContestClient {
           this.syncPeekMazesButton(false);
           this.syncModalOpenState();
           this.scheduleHudSafeInsetsSync();
-          return;
-        }
-        if (this.isHelpOpen()) {
-          document.getElementById('help-modal')?.classList.add('hidden');
-          this.syncModalOpenState();
-          return;
-        }
-        if (this.armedTimers.size > 0) {
-          this.disarmAllButtons();
-          return;
-        }
-        const pillEl = document.getElementById('cursor-telemetry-pill');
-        if (
-          this.renderer3d.hasActiveTouchGhost() ||
-          Boolean(pillEl && pillEl.classList.contains('touch-inspect-card'))
-        ) {
-          this.renderer3d.cancelTouchGhost();
-          this.hideTouchPrecisionTray();
-          this.hideCursorPill();
-          return;
-        }
-        if (this.dismissAllTransientOverlays()) {
-          return;
-        }
-        if (this.isHubOpen()) {
-          this.closeHub();
-          return;
-        }
-        if (this.renderer3d.activeTool !== 'BLOCK') {
-          this.selectTool('BLOCK');
         }
         return;
       }
@@ -3535,13 +3780,35 @@ class MazingContestClient {
         return;
       }
 
-      // Suppress arena hotkeys while Hub or Guide modal is open
-      if (this.isHubOpen() || this.isHelpOpen()) {
+      // Hub hotkeys: M mute · H close · L Leaderboard tab · ? How to Play tab
+      if (this.isHubOpen()) {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        const hubKey = e.key.toUpperCase();
+        if (hubKey === 'M') {
+          soundEngine.toggleMuted();
+          this.syncAudioMuteButtons();
+        } else if (hubKey === 'H') {
+          this.closeHub();
+        } else if (hubKey === 'L') {
+          this.switchHubTab('leaderboard');
+        } else if (e.key === '?') {
+          this.switchHubTab('codex');
+        }
+        return;
+      }
+
+      // Suppress arena hotkeys while Guide modal is open
+      if (this.isHelpOpen()) {
+        if (e.key.toUpperCase() === 'M') {
+          soundEngine.toggleMuted();
+          this.syncAudioMuteButtons();
+        }
         return;
       }
 
       const key = e.key.toUpperCase();
 
+      // Redo: Ctrl+Y / Ctrl+Shift+Z (Cmd on macOS). Bare Shift+Z is intentionally unbound.
       if (
         (e.ctrlKey || e.metaKey) &&
         (key === 'Y' || (key === 'Z' && e.shiftKey))
@@ -3560,14 +3827,12 @@ class MazingContestClient {
       if (key === 'Z' && !e.shiftKey) {
         e.preventDefault();
         this.performUndo();
-      } else if (key === 'Z' && e.shiftKey) {
-        e.preventDefault();
-        this.performRedo();
       } else if (key === 'Q' || key === 'B') {
         this.selectTool('BLOCK');
       } else if (key === 'X' || key === 'E') {
         this.selectTool('SELL');
       } else if (key === 'R') {
+        this.hideTransientPopovers();
         this.renderer3d.resetToMyIsland();
         this.syncSpectatorStateDOM();
         this.updateUndoAndToolAvailability();
@@ -3774,7 +4039,7 @@ class MazingContestClient {
       this.armDestructiveButton(
         readyBtn,
         isEmptySoloStart,
-        'Start Empty?',
+        window.innerWidth <= 385 ? 'Empty?' : 'Start Empty?',
         'play',
         () => {
           const nextReady = !me.ready;
@@ -4128,6 +4393,14 @@ class MazingContestClient {
     if (chronoCount > 0)
       featureParts.push(`${chronoCount} ${icon('chrono', 12)}`);
     featureParts.push(`${round.obstacles.length} ${icon('keep', 12)}`);
+    const waystoneCount = round.checkpoints?.length ?? 0;
+    if (waystoneCount > 0) {
+      featureParts.push(
+        `${waystoneCount} ${icon('target', 12)} ${
+          waystoneCount === 1 ? 'Waystone' : 'Waystones'
+        }`
+      );
+    }
 
     const featuresEl = document.getElementById('map-features-summary');
     if (featuresEl) {
@@ -4203,7 +4476,7 @@ class MazingContestClient {
       if (timeChip && evalRun) {
         timeChip.title = `Estimated Run: ${estSecs.toFixed(
           1
-        )}s (Par ${parLabel}) · Spire Hits: ${
+        )}s · Par ${parLabel} for +2 bonus pts · Spire Hits: ${
           evalRun.clapsTaken
         } · Linked Keeps: ${evalRun.linkedKeeps}/${
           round.obstacles.length
@@ -4227,14 +4500,27 @@ class MazingContestClient {
       }
     }
 
+    const canSwitchRounds = this.canControlRoomRules();
     document
       .querySelectorAll<HTMLButtonElement>('.round-pill-btn')
       .forEach((btn, idx) => {
-        btn.classList.toggle(
-          'active',
-          idx === this.roomState?.currentRoundIndex
+        const isActive = idx === this.roomState?.currentRoundIndex;
+        btn.classList.toggle('active', isActive);
+        // Guests can inspect rounds but only the host can switch them
+        btn.classList.toggle('disabled', !canSwitchRounds && !isActive);
+        btn.setAttribute(
+          'aria-disabled',
+          String(!canSwitchRounds && !isActive)
         );
       });
+    const switcherNote = document.querySelector<HTMLElement>(
+      '#round-switcher-header .dropdown-subtle-note'
+    );
+    if (switcherNote) {
+      switcherNote.textContent = canSwitchRounds
+        ? 'Host · Resets current walls'
+        : 'Host only';
+    }
   }
 
   private updateTimerDOM(fromTick: boolean) {
@@ -4297,7 +4583,10 @@ class MazingContestClient {
     }
 
     const sorted = [...this.roomState.players].sort(
-      (a, b) => b.totalScore - a.totalScore
+      (a, b) =>
+        b.totalScore - a.totalScore ||
+        (b.parStarsEarned || 0) - (a.parStarsEarned || 0) ||
+        b.bestMazeTime - a.bestMazeTime
     );
     this.sortedStandingsIds = sorted.map((p) => p.id);
 
@@ -4622,7 +4911,9 @@ class MazingContestClient {
 
       const overallRanked = [...state.players].sort(
         (a, b) =>
-          b.totalScore - a.totalScore || b.bestMazeTime - a.bestMazeTime
+          b.totalScore - a.totalScore ||
+          (b.parStarsEarned || 0) - (a.parStarsEarned || 0) ||
+          b.bestMazeTime - a.bestMazeTime
       );
       podiumEl.classList.remove('hidden');
       podiumEl.innerHTML = '';
@@ -4648,9 +4939,11 @@ class MazingContestClient {
       });
     } else {
       titleEl.textContent = `Round ${round.roundNumber} · ${round.title}`;
-      subEl.textContent = `Par Target: ${parLabel} (+2 bonus pts for beating Par) · Skill: ${formatBotSkillLabel(
-        state.settings?.botDifficulty
-      )}`;
+      const hasBots = state.players.some((p) => p.isBot);
+      const skillSuffix = hasBots
+        ? ` · Skill: ${formatBotSkillLabel(state.settings?.botDifficulty)}`
+        : '';
+      subEl.textContent = `Par Target: ${parLabel} (+2 bonus pts for beating Par)${skillSuffix}`;
       this.updateResultsCountdownDOM();
       podiumEl.classList.add('hidden');
     }
@@ -4671,20 +4964,32 @@ class MazingContestClient {
     `;
     table.appendChild(tableHead);
 
+    const compareRoundRes = (a: PlayerState, b: PlayerState) =>
+      (a.lastRoundRank ?? 99) - (b.lastRoundRank ?? 99) ||
+      (b.lastRoundTime || 0) - (a.lastRoundTime || 0) ||
+      (b.lastRoundOvercharge || 0) - (a.lastRoundOvercharge || 0) ||
+      (b.lastRoundClaps || 0) - (a.lastRoundClaps || 0) ||
+      (b.gold || 0) - (a.gold || 0);
+
     const ranked = [...state.players].sort((a, b) =>
       isGameOver
-        ? b.totalScore - a.totalScore || b.bestMazeTime - a.bestMazeTime
-        : (b.lastRoundTime || 0) - (a.lastRoundTime || 0)
+        ? b.totalScore - a.totalScore ||
+          (b.parStarsEarned || 0) - (a.parStarsEarned || 0) ||
+          b.bestMazeTime - a.bestMazeTime
+        : compareRoundRes(a, b)
     );
 
     ranked.forEach((p, idx) => {
       const row = document.createElement('div');
       const isMe = p.id === this.localPlayerId;
-      row.className = `result-row${idx === 0 ? ' winner' : ''}${
+      const displayRank = isGameOver ? idx + 1 : p.lastRoundRank ?? idx + 1;
+      row.className = `result-row${displayRank === 1 ? ' winner' : ''}${
         isMe ? ' is-me' : ''
       }`;
       const rankHtml =
-        idx < 3 ? getMedalBadge((idx + 1) as 1 | 2 | 3, 20) : `#${idx + 1}`;
+        displayRank <= 3
+          ? getMedalBadge(displayRank as 1 | 2 | 3, 20)
+          : `#${displayRank}`;
       const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
       const botBadge = p.isBot ? `<span class="bot-badge">BOT</span>` : '';
 
@@ -4775,8 +5080,19 @@ class MazingContestClient {
   private renderChat() {
     if (!this.roomState) return;
     const box = document.getElementById('chat-messages')!;
+    const chat = this.roomState.chat;
+    const last = chat[chat.length - 1];
+    const chatSig = `${this.roomState.roomCode}|${chat.length}|${
+      last ? `${last.id}|${last.text}` : ''
+    }`;
+    if (chatSig === this.lastChatSignature) return;
+    this.lastChatSignature = chatSig;
+
+    const prevScrollTop = box.scrollTop;
+    const stickToBottom =
+      box.scrollHeight - box.scrollTop - box.clientHeight < 48;
     box.innerHTML = '';
-    for (const m of this.roomState.chat) {
+    for (const m of chat) {
       const div = document.createElement('div');
       div.className = `chat-line${m.isSystem ? ' system' : ''}`;
       if (m.isSystem) {
@@ -4800,11 +5116,21 @@ class MazingContestClient {
       }
       box.appendChild(div);
     }
-    box.scrollTop = box.scrollHeight;
+    if (stickToBottom) {
+      box.scrollTop = box.scrollHeight;
+    } else {
+      box.scrollTop = prevScrollTop;
+    }
   }
 
   private showToast(message: string, isPositive = false) {
     const container = document.getElementById('toast-container')!;
+    // Cap stacked toasts at 3 (drop oldest) and skip exact duplicates already on screen
+    const existing = Array.from(container.children) as HTMLElement[];
+    if (existing.some((t) => t.textContent === message)) return;
+    while (container.children.length >= 3) {
+      container.firstElementChild?.remove();
+    }
     const toast = document.createElement('div');
     toast.className = `toast-msg${isPositive ? ' positive' : ''}`;
     toast.textContent = message;

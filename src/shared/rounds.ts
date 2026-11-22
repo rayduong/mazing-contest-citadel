@@ -54,7 +54,7 @@ export const ROUNDS: RoundConfig[] = [
   {
     roundNumber: 3,
     title: 'Switchback Court',
-    subtitle: '2 Storm · 1 Frost · 5 Keeps · Waystone · Citadel Scout',
+    subtitle: '2 Storm · 1 Frost · 5 Keeps · 1 Waystone · Citadel Scout',
     hint: 'Runners must visit the Waystone before the South Shrine. Chain three Crimson Keeps into one wall for max Overcharge.',
     runnerType: 'SCOUT',
     gridWidth: GRID_WIDTH,
@@ -118,13 +118,13 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 48.0,
+    parTimeSeconds: 50.0,
   },
   {
     roundNumber: 6,
     title: 'Crosswind Spiral',
-    subtitle: '1 Storm · 2 Frost · 1 Chrono · 5 Keeps · Waystone · Royal Outrider',
-    hint: 'Route past Storm and Frost first, then trigger the Chrono Spire to cut 1.2s off their active cooldowns.',
+    subtitle: '1 Storm · 2 Frost · 1 Chrono · 5 Keeps · 1 Waystone · Royal Outrider',
+    hint: 'Route past Storm and Frost on the way to the Waystone, then trigger the Chrono Spire to cut 1.2s off active cooldowns.',
     runnerType: 'OUTRIDER',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
@@ -164,12 +164,12 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 57.0,
+    parTimeSeconds: 59.0,
   },
   {
     roundNumber: 8,
     title: 'The High Citadel',
-    subtitle: '2 Storm · 2 Frost · 1 Chrono · 6 Keeps · Waystone · Wind Herald',
+    subtitle: '2 Storm · 2 Frost · 1 Chrono · 6 Keeps · 1 Waystone · Wind Herald',
     hint: 'Final round. Route the Wind Herald through the Waystone and all five Spires without leaving a 3.2-second Tailwind gap.',
     runnerType: 'HERALD',
     gridWidth: GRID_WIDTH,
@@ -187,7 +187,7 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 60.0,
+    parTimeSeconds: 62.0,
   },
 ];
 
@@ -273,8 +273,8 @@ export function computeEffectivePar(
       ? goldMultiplier
       : 1.0;
 
-  // Normalized campaign density factor in [0..1] across basePar 28s..60s
-  const densityT = Math.max(0, Math.min(1, (baseParSeconds - 28) / 32));
+  // Normalized campaign density factor in [0..1] across basePar 28s..62s
+  const densityT = Math.max(0, Math.min(1, (baseParSeconds - 28) / 34));
   const targetAt80 = 0.86 + 0.02 * densityT;
   const targetAt125 = 1.10 - 0.04 * densityT;
 
@@ -371,17 +371,17 @@ function buildSpireZoneBands(
     ];
   }
 
-  // 5+ Spires: widened across y in [3..21] with separated L/R/C lateral windows so
-  // Slot 0..4 always maintain strict monotonic Y-order and minimal AoE ring overlap.
-  const minY5 = 3;
-  const maxY5 = Math.max(minY5, gridHeight - 5); // 21 on height 26
+  // 5+ Spires: distributed across y in [4..20] (avoiding y in {3,21} 3-tile border slivers)
+  // with separated L/R/C lateral windows so Slot 0..4 maintain strict monotonic Y-order.
+  const minY5 = 4;
+  const maxY5 = Math.max(minY5, gridHeight - 6); // 20 on height 26
   const pattern: Array<'L' | 'C' | 'R'> = ['L', 'R', 'C', 'L', 'R'];
   const yBands: Array<[number, number]> = [
-    [3, 5],
+    [4, 5],
     [7, 9],
     [11, 13],
     [15, 17],
-    [19, 21],
+    [19, 20],
   ];
 
   const bands: SpireZoneBand[] = [];
@@ -400,9 +400,9 @@ function buildSpireZoneBands(
 
 /**
  * Generates a deterministic, sliver-free 20x26 layout of 2x2 Elemental Spires,
- * optional Gilded Checkpoint Waystones (R3, R6, R8), and 4-7 Crimson Keeps using `mulberry32(seed)`.
- * - Spires sit across widened longitudinal bands (strictly ordered North-to-South) so full 360-degree
- *   1-tile corridor wraps and 2x2 outer walls always fit inside the island.
+ * optional Gilded Waystones (R3, R6, R8), and 4-7 Crimson Keeps using `mulberry32(seed)`.
+ * - Spires sit across longitudinal bands in y in [4..20] (strictly ordered North-to-South) so full
+ *   360-degree 1-tile corridor wraps and 2x2 outer walls always fit inside the island with >= 4-tile border gaps.
  * - Keeps forbid 3-tile cliff-sliver coordinates (`x in {3,15}`, `y in {3,21}`), either forming
  *   clean 2-block orthogonal bastions (`gap = 0`) or leaving >= 2 walkable tiles of clearance.
  * - Deterministic per-Spire round-robin guarantees reachable Keep anchors near Spires.
@@ -454,7 +454,7 @@ export function generateRandomRoundLayout(
     return true;
   };
 
-  // Orient 5-Spire lateral phase away from corner gates so y=3 / y=21 slots never collide with gates
+  // Orient 5-Spire lateral phase away from corner gates for balanced field flow
   let mirrorX = rng() < 0.5;
   if (round.spireCount >= 5) {
     if (round.spawn.x <= 5) {
@@ -464,14 +464,11 @@ export function generateRandomRoundLayout(
     }
   }
 
-  // 1. Stratified 2x2 Elemental Spires in strict North-to-South longitudinal order
+  // 1. Stratified 2x2 Elemental Spires in strict North-to-South longitudinal order (x in [4..14], y in [4..20])
   const spireMinX = 4;
   const spireMaxX = Math.max(spireMinX, round.gridWidth - 6); // 14
-  const spireMinY = round.spireCount >= 5 ? 3 : 4;
-  const spireMaxY = Math.max(
-    spireMinY,
-    round.gridHeight - (round.spireCount >= 5 ? 5 : 6)
-  ); // 21 for 5 spires, 20 otherwise
+  const spireMinY = 4;
+  const spireMaxY = Math.max(spireMinY, round.gridHeight - 6); // 20
 
   const zoneBands = buildSpireZoneBands(
     round.spireCount,
@@ -560,7 +557,7 @@ export function generateRandomRoundLayout(
     }
   }
 
-  // 2. Seeded 2x2 Gilded Checkpoint Waystone on signature rounds (R3, R6, R8)
+  // 2. Seeded 2x2 Gilded Waystone on signature rounds (R3, R6, R8)
   if (wantsCheckpoint) {
     const cpCandidates: GridPoint[] = [];
     const preferWestFlank =

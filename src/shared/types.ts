@@ -145,7 +145,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowDuration: 2.0,
     cdrPulseSeconds: 1.2,
     description:
-      'Pulses every 3.8s (3.65m), slowing runners by 55% for 2.0s and shaving 1.2s off other Spires’ recharge.',
+      'Pulses every 3.8s (3.65m), slowing runners by 55% for 2.0s and shaving 1.2s off other Spires’ cooldown.',
     accentColor: '#c084fc',
   },
 };
@@ -161,6 +161,7 @@ export interface EffectiveSpireStats {
   slowDuration: number;
   auraSlowPercent: number;
   cdrPulseSeconds: number;
+  armoredReduced?: boolean;
 }
 
 export function getEffectiveSpireStats(
@@ -170,25 +171,35 @@ export function getEffectiveSpireStats(
 ): EffectiveSpireStats {
   const spec = TOWER_SPECS[spireType];
   const tier = Math.max(0, Math.min(3, Math.floor(overchargeTier || 0)));
-  const runnerMult = runnerType
-    ? RUNNER_ARCHETYPES[runnerType].slowDurationMult
-    : 1.0;
+  const runnerSpec = runnerType ? RUNNER_ARCHETYPES[runnerType] : undefined;
+  const runnerMult = runnerSpec ? runnerSpec.slowDurationMult : 1.0;
+  const runnerResist =
+    tier === 0 && runnerSpec ? runnerSpec.slowResist : 0.0;
+  const resistFactor = 1.0 - runnerResist;
+  const armoredReduced = runnerResist > 0;
+
+  const rawSlow = spec.slowPercent + tier * 0.03;
+  const rawAura =
+    spireType === 'FROST_OBELISK'
+      ? (spec.auraSlowPercent || 0.22) + tier * 0.02
+      : 0;
 
   return {
     effectiveRange: Number((spec.range + tier * 0.25).toFixed(2)),
     effectiveCooldown: Number(
       (spec.cooldown * (1 - OVERCHARGE_CDR[tier])).toFixed(2)
     ),
-    slowPercent: Number((spec.slowPercent + tier * 0.03).toFixed(4)),
+    slowPercent: Number((rawSlow * resistFactor).toFixed(4)),
     slowDuration: Number(
       ((spec.slowDuration + tier * 0.25) * runnerMult).toFixed(2)
     ),
     auraSlowPercent:
       spireType === 'FROST_OBELISK'
-        ? Number(((spec.auraSlowPercent || 0.22) + tier * 0.02).toFixed(2))
+        ? Number((rawAura * resistFactor).toFixed(4))
         : 0,
     cdrPulseSeconds:
       spireType === 'CHRONO_SPIRE' ? spec.cdrPulseSeconds || 1.2 : 0,
+    armoredReduced: armoredReduced ? true : undefined,
   };
 }
 
@@ -305,11 +316,16 @@ export interface RunnerSimState {
   towers: Record<string, TowerSimState>;
 }
 
+export interface ClapLocationPoint extends GridPoint {
+  spireType?: SpireType;
+  spireIndex?: number;
+}
+
 export interface MazeEvalResult {
   finishTimeSeconds: number;
   distance: number;
   clapsTaken: number;
-  clapLocations: GridPoint[];
+  clapLocations: ClapLocationPoint[];
   perSpireClaps: Record<string, number>;
   linkedKeeps: number;
   overchargedSpires: number;
@@ -347,6 +363,7 @@ export interface PlayerState {
   totalScore: number;
   lastRoundTime: number | null;
   lastRoundPoints: number;
+  lastRoundRank?: number;
   lastRoundClaps?: number;
   lastRoundOvercharge?: number;
   lastRoundKeeps?: number;

@@ -4,12 +4,14 @@ import {
   computeSingleSegmentPath,
 } from './pathfinding.js';
 import {
+  ClapLocationPoint,
   EffectiveSpireStats,
   getEffectiveSpireStats,
   GridPoint,
   MazeEvalResult,
   OVERCHARGE_CDR,
   PathResult,
+  PathSegment,
   PlacedTower,
   RoundConfig,
   RUNNER_ARCHETYPES,
@@ -22,7 +24,7 @@ import {
 } from './types.js';
 
 export { getEffectiveSpireStats, OVERCHARGE_CDR };
-export type { EffectiveSpireStats };
+export type { ClapLocationPoint, EffectiveSpireStats };
 
 export const SIM_TICK_RATE = 60;
 export const SIM_DT = 1 / SIM_TICK_RATE;
@@ -48,6 +50,7 @@ interface InternalSpire {
   baseSlowDuration: number;
   auraSlowPercent: number;
   cdrPulseSeconds: number;
+  chronoBankSec: number;
   isFrost: boolean;
 }
 
@@ -153,6 +156,7 @@ export class MazeRunnerSimulator {
         baseSlowDuration: spec.slowDuration + tier * 0.25,
         auraSlowPercent: effectiveStats.auraSlowPercent,
         cdrPulseSeconds: effectiveStats.cdrPulseSeconds,
+        chronoBankSec: 0,
         isFrost: spireType === 'FROST_OBELISK',
       });
     }
@@ -236,7 +240,7 @@ export class MazeRunnerSimulator {
   public stepInternal(
     dt: number,
     eventsOut: SimEvent[] | null,
-    clapLocationsOut: GridPoint[] | null
+    clapLocationsOut: ClapLocationPoint[] | null
   ): void {
     if (this.state.finished || dt <= 0) return;
 
@@ -297,7 +301,7 @@ export class MazeRunnerSimulator {
     let rx = this.state.x;
     let ry = this.state.y;
 
-    // 3. Optional Waygate Portal trigger (only consumes waygateUsed if reroute succeeds)
+    // 3. Optional Waygate Portal trigger (reroutes across all remaining unvisited Waystones)
     if (this.round.waygate && !this.state.waygateUsed) {
       const entryX = this.round.waygate.entry.x + 1.0;
       const entryY = this.round.waygate.entry.y + 1.0;
@@ -307,40 +311,108 @@ export class MazeRunnerSimulator {
         const exitPad = this.round.waygate.exit;
         const exitX = exitPad.x + 1.0;
         const exitY = exitPad.y + 1.0;
+        const segIdx = this.state.currentSegmentIndex;
+        const remCheckpoints = this.round.checkpoints.slice(segIdx);
 
-        const waypoints: GridPoint[] = [
-          this.round.spawn,
-          ...this.round.checkpoints,
-          this.round.exit,
-        ];
-        const targetPad =
-          waypoints[this.state.currentSegmentIndex + 1] || this.round.exit;
-        const rerouted = computeSingleSegmentPath(
-          this.round,
-          this.towers,
-          exitPad,
-          targetPad
-        );
-
-        const seg = this.pathResult.segments[this.state.currentSegmentIndex];
-        if (rerouted && seg) {
-          this.state.waygateUsed = true;
-          const prevSegDist = seg.distance;
-          seg.points = rerouted.points;
-          seg.distance = rerouted.distance;
-          this.pathResult.totalDistance = Math.max(
-            0,
-            this.pathResult.totalDistance - prevSegDist + rerouted.distance
+        let newTailSegments: PathSegment[] | null = null;
+        if (remCheckpoints.length === 0) {
+          const single = computeSingleSegmentPath(
+            this.round,
+            this.towers,
+            exitPad,
+            this.round.exit
           );
-          this.state.currentWaypointIndex = 0;
-          this.state.x = exitX;
-          this.state.y = exitY;
-          rx = exitX;
-          ry = exitY;
+          if (single) {
+            newTailSegments = [
+              {
+                fromIndex: segIdx,
+                toIndex: segIdx + 1,
+                points: single.points,
+                distance: single.distance,
+              },
+            ];
+          }
+        } else if (exitPad.y > 0) {
+          const tailPath = computeFullMazePath(
+            {
+              ...this.round,
+              spawn: exitPad,
+              checkpoints: remCheckpoints,
+            },
+            this.towers
+          );
+          if (tailPath.valid && tailPath.segments.length > 0) {
+            newTailSegments = tailPath.segments.map((s, k) => ({
+              fromIndex: segIdx + k,
+              toIndex: segIdx + k + 1,
+              points: [...s.points],
+              distance: s.distance,
+            }));
+          }
+        } else {
+          const chainPads: GridPoint[] = [
+            exitPad,
+            ...remCheckpoints,
+            this.round.exit,
+          ];
+          const built: PathSegment[] = [];
+          let ok = true;
+          for (let k = 0; k < chainPads.length - 1; k++) {
+            const part = computeSingleSegmentPath(
+              this.round,
+              this.towers,
+              chainPads[k],
+              chainPads[k + 1]
+            );
+            if (!part) {
+              ok = false;
+              break;
+            }
+            built.push({
+              fromIndex: segIdx + k,
+              toIndex: segIdx + k + 1,
+              points: part.points,
+              distance: part.distance,
+            });
+          }
+          if (ok && built.length > 0) {
+            newTailSegments = built;
+          }
+        }
 
-          if (rerouted.points.length > 1) {
-            const ndx = rerouted.points[1].x - exitX;
-            const ndy = rerouted.points[1].y - exitY;
+        if (newTailSegments && newTailSegments.length > 0) {
+          this.state.waygateUsed = true;
+          const updatedSegments = [
+            ...this.pathResult.segments.slice(0, segIdx),
+            ...newTailSegments,
+          ];
+          const rebuiltAll: GridPoint[] = [];
+          let rebuiltDist = 0;
+          for (let s = 0; s < updatedSegments.length; s++) {
+            const pts = updatedSegments[s].points;
+            if (s === 0) {
+              rebuiltAll.push(...pts);
+            } else {
+              rebuiltAll.push(...pts.slice(1));
+            }
+            rebuiltDist += updatedSegments[s].distance;
+          }
+          this.pathResult.segments = updatedSegments;
+          this.pathResult.allPoints = rebuiltAll;
+          this.pathResult.totalDistance = rebuiltDist;
+
+          const firstNewPts = newTailSegments[0].points;
+          const landX = firstNewPts.length > 0 ? firstNewPts[0].x : exitX;
+          const landY = firstNewPts.length > 0 ? firstNewPts[0].y : exitY;
+          this.state.currentWaypointIndex = 0;
+          this.state.x = landX;
+          this.state.y = landY;
+          rx = landX;
+          ry = landY;
+
+          if (firstNewPts.length > 1) {
+            const ndx = firstNewPts[1].x - landX;
+            const ndy = firstNewPts[1].y - landY;
             if (ndx * ndx + ndy * ndy > 1e-8) {
               this.state.facingAngle = Math.atan2(ndy, ndx);
             }
@@ -438,7 +510,12 @@ export class MazeRunnerSimulator {
         if (!shouldFire) continue;
 
         const hadActiveSlow = this.state.clapSlowRemaining > 0;
-        ts.cooldownRemaining = ts.effectiveCooldown;
+        const banked = sp.chronoBankSec;
+        sp.chronoBankSec = 0;
+        ts.cooldownRemaining =
+          banked > TIME_EPS
+            ? Number(Math.max(0.6, ts.effectiveCooldown - banked).toFixed(4))
+            : ts.effectiveCooldown;
         ts.triggeredCount++;
         this.state.clapsTaken++;
         this.state.exposureStacks = Math.min(5, this.state.exposureStacks + 1);
@@ -465,33 +542,54 @@ export class MazeRunnerSimulator {
 
         this.insertBurstSlow(rawSlow, duration, ts.id);
 
-        // Chrono Spire pulse: shave cooldown ONLY off sibling Spires actually recharging (cooldownRemaining > 0)
+        // Chrono Spire pulse: shave active cooldowns first, and pre-charge up to 1.2s toward siblings' next shot
         let cdrApplied: number | undefined;
         let cdrTargetIds: string[] | undefined;
         if (sp.cdrPulseSeconds > 0) {
+          const pulse = sp.cdrPulseSeconds;
           for (let j = 0; j < spireCount; j++) {
             if (j === i) continue;
-            const other = spires[j].state;
-            if (other.cooldownRemaining > TIME_EPS) {
-              const nextCd = decayTimer(
-                other.cooldownRemaining,
-                sp.cdrPulseSeconds
-              );
+            const otherSp = spires[j];
+            const other = otherSp.state;
+            const prevCd = other.cooldownRemaining;
+            const shavedCd = prevCd > TIME_EPS ? Math.min(pulse, prevCd) : 0;
+            if (shavedCd > 0) {
+              const nextCd = decayTimer(prevCd, shavedCd);
               other.cooldownRemaining = nextCd;
-              cdrApplied = sp.cdrPulseSeconds;
+              if (nextCd === 0 && j < i) {
+                rechargedEarlierSpire = true;
+              }
+            }
+
+            const remainder = pulse - shavedCd;
+            const bankRoom = Math.max(0, pulse - otherSp.chronoBankSec);
+            const bankAdded =
+              remainder > TIME_EPS && bankRoom > TIME_EPS
+                ? Math.min(remainder, bankRoom)
+                : 0;
+            if (bankAdded > 0) {
+              otherSp.chronoBankSec = Number(
+                Math.min(pulse, otherSp.chronoBankSec + bankAdded).toFixed(4)
+              );
+            }
+
+            if (shavedCd + bankAdded > TIME_EPS) {
+              cdrApplied = pulse;
               if (eventsOut) {
                 if (!cdrTargetIds) cdrTargetIds = [];
                 cdrTargetIds.push(other.id);
-              }
-              if (nextCd === 0 && j < i) {
-                rechargedEarlierSpire = true;
               }
             }
           }
         }
 
         if (clapLocationsOut) {
-          clapLocationsOut.push({ x: rx, y: ry });
+          clapLocationsOut.push({
+            x: rx,
+            y: ry,
+            spireType: ts.type,
+            spireIndex: i,
+          });
         }
 
         if (eventsOut) {
@@ -815,7 +913,7 @@ export function evaluateMazeRunTime(
     towers,
     precomputedPath
   );
-  const clapLocations: GridPoint[] = [];
+  const clapLocations: ClapLocationPoint[] = [];
   const clapSink = collectClapLocations ? clapLocations : null;
   let maxTicks = SIM_TICK_RATE * MAX_SIM_SECONDS;
 
