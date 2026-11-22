@@ -33,7 +33,7 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
     slowDurationMult: 1.0,
     slowResist: 0.0,
     hasMomentum: false,
-    traitSummary: '3.5 m/s · Standard slow duration',
+    traitSummary: '3.5 m/s · Balanced runner, full slow effect',
   },
   OUTRIDER: {
     type: 'OUTRIDER',
@@ -43,7 +43,7 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
     slowDurationMult: 1.25,
     slowResist: 0.0,
     hasMomentum: false,
-    traitSummary: '3.85 m/s · Slows last 25% longer',
+    traitSummary: '3.85 m/s · Fast sprinter, but Spire slows last 25% longer',
   },
   JUGGERNAUT: {
     type: 'JUGGERNAUT',
@@ -60,10 +60,11 @@ export const RUNNER_ARCHETYPES: Record<RunnerArchetype, RunnerArchetypeSpec> = {
     name: 'Wind Herald',
     icon: 'herald',
     baseSpeed: 3.55,
-    slowDurationMult: 1.05,
+    slowDurationMult: 1.0,
     slowResist: 0.0,
     hasMomentum: true,
-    traitSummary: '3.55 m/s · Gains +28% speed after 3.2s un-slowed outside Spires',
+    traitSummary:
+      '3.55 m/s · Gains +28% Tailwind speed after 3.2s unslowed outside Spires',
   },
 };
 
@@ -97,7 +98,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowPercent: 0,
     slowDuration: 0,
     description:
-      '2×2 stone wall. Connects to nearby walls and links Crimson Keeps to Overcharge Spires.',
+      '2×2 stone wall. Touching walls link Crimson Keeps to Overcharge Spires up to 1 tile away.',
     accentColor: '#38bdf8',
   },
   THUNDERCLAP: {
@@ -112,7 +113,7 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowPercent: 0.5,
     slowDuration: 2.4,
     description:
-      'Pulses every 3.0s, slowing runners by 50% for 2.4s. Strongest on multi-pass switchbacks.',
+      'Pulses every 3.0s (3.45m), slowing runners by 50% for 2.4s. Strongest on switchbacks.',
     accentColor: '#f59e0b',
   },
   FROST_OBELISK: {
@@ -122,13 +123,13 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     goldCost: 0,
     footprint: 2,
     walkable: false,
-    range: 3.25,
+    range: 3.3,
     cooldown: 3.4,
     slowPercent: 0.45,
     slowDuration: 2.2,
     auraSlowPercent: 0.22,
     description:
-      'Chills runners by 22% inside its ring and bursts for a 45% slow every 3.4s. Rewards tight spirals.',
+      'Chills runners in its 3.3m ring by 22%, plus a 45% slow for 2.2s every 3.4s. Rewards tight spirals.',
     accentColor: '#38bdf8',
   },
   CHRONO_SPIRE: {
@@ -144,10 +145,52 @@ export const TOWER_SPECS: Record<TowerType, TowerSpec> = {
     slowDuration: 2.0,
     cdrPulseSeconds: 1.2,
     description:
-      'Slows runners by 55% every 3.8s and cuts 1.2s off every other Spire cooldown.',
+      'Pulses every 3.8s (3.65m), slowing runners by 55% for 2.0s and shaving 1.2s off other Spires’ recharge.',
     accentColor: '#c084fc',
   },
 };
+
+export const OVERCHARGE_CDR: readonly [number, number, number, number] = [
+  0, 0.12, 0.22, 0.3,
+];
+
+export interface EffectiveSpireStats {
+  effectiveRange: number;
+  effectiveCooldown: number;
+  slowPercent: number;
+  slowDuration: number;
+  auraSlowPercent: number;
+  cdrPulseSeconds: number;
+}
+
+export function getEffectiveSpireStats(
+  spireType: SpireType,
+  overchargeTier: number,
+  runnerType?: RunnerArchetype
+): EffectiveSpireStats {
+  const spec = TOWER_SPECS[spireType];
+  const tier = Math.max(0, Math.min(3, Math.floor(overchargeTier || 0)));
+  const runnerMult = runnerType
+    ? RUNNER_ARCHETYPES[runnerType].slowDurationMult
+    : 1.0;
+
+  return {
+    effectiveRange: Number((spec.range + tier * 0.25).toFixed(2)),
+    effectiveCooldown: Number(
+      (spec.cooldown * (1 - OVERCHARGE_CDR[tier])).toFixed(2)
+    ),
+    slowPercent: Number((spec.slowPercent + tier * 0.03).toFixed(4)),
+    slowDuration: Number(
+      ((spec.slowDuration + tier * 0.25) * runnerMult).toFixed(2)
+    ),
+    auraSlowPercent:
+      spireType === 'FROST_OBELISK'
+        ? Number(((spec.auraSlowPercent || 0.22) + tier * 0.02).toFixed(2))
+        : 0,
+    cdrPulseSeconds:
+      spireType === 'CHRONO_SPIRE' ? spec.cdrPulseSeconds || 1.2 : 0,
+  };
+}
 
 export interface PlacedTower {
   id: string;
@@ -214,6 +257,7 @@ export interface SimEvent {
   spireType?: SpireType;
   overchargeTier?: number;
   cdrAppliedSeconds?: number;
+  cdrTargetIds?: string[];
   armoredResisted?: boolean;
   checkpointIndex?: number;
   timeSeconds: number;
@@ -293,6 +337,7 @@ export interface PlayerState {
   botStyle?: 'SWITCHBACK' | 'SPIRAL' | 'CLAP_CHAIN';
   isHost: boolean;
   ready: boolean;
+  nextRoundReady?: boolean;
   gold: number;
   towers: PlacedTower[];
   pathDistance: number;
@@ -391,6 +436,8 @@ export interface RoomState {
   roundConfig: RoundConfig;
   phaseTimeRemaining: number;
   runElapsed?: number;
+  lastAckedSeq?: number;
+  buildTimerPaused?: boolean;
   simSpeedMultiplier: 1 | 2 | 4;
   players: PlayerState[];
   chat: ChatMessage[];
@@ -413,13 +460,31 @@ export type ClientToServerMessage =
       settings: Partial<RoomSettings>;
     }
   | { type: 'SET_NAME'; playerName: string }
-  | { type: 'PLACE_TOWER'; x: number; y: number; clientId?: string }
-  | { type: 'SELL_TOWER'; towerId: string; x?: number; y?: number }
-  | { type: 'RESTORE_TOWERS'; towers: GridPoint[] }
-  | { type: 'CLEAR_TOWERS' }
-  | { type: 'LOAD_PRESET_DEMO' }
+  | {
+      type: 'PLACE_TOWER';
+      x: number;
+      y: number;
+      clientId?: string;
+      clientSeq?: number;
+    }
+  | {
+      type: 'SELL_TOWER';
+      towerId: string;
+      x?: number;
+      y?: number;
+      clientSeq?: number;
+    }
+  | {
+      type: 'RESTORE_TOWERS';
+      towers: GridPoint[];
+      usedSampleMaze?: boolean;
+      clientSeq?: number;
+    }
+  | { type: 'CLEAR_TOWERS'; clientSeq?: number }
+  | { type: 'LOAD_PRESET_DEMO'; clientSeq?: number }
   | { type: 'REROLL_MAP' }
-  | { type: 'TOGGLE_READY' }
+  | { type: 'TOGGLE_READY'; clientSeq?: number }
+  | { type: 'CLIENT_ARENA_ACTIVE'; active: boolean }
   | { type: 'START_GAME'; roundIndex?: number }
   | { type: 'NEXT_ROUND' }
   | { type: 'RESTART_MATCH' }
@@ -439,8 +504,14 @@ export type ServerToClientMessage =
       phaseTimeRemaining: number;
       phase?: GamePhase;
       runElapsed?: number;
+      buildTimerPaused?: boolean;
     }
   | { type: 'LOBBY_LIST'; rooms: LobbyRoomSummary[] }
   | { type: 'LEADERBOARD_DATA'; leaderboard: LeaderboardPayload }
   | { type: 'CHAT_MESSAGE'; message: ChatMessage }
-  | { type: 'ERROR_TOAST'; message: string };
+  | {
+      type: 'ERROR_TOAST';
+      message: string;
+      rejectedSeq?: number;
+      state?: RoomState;
+    };

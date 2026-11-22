@@ -49,6 +49,7 @@ export type IconName =
   | 'juggernaut'
   | 'herald'
   | 'undo'
+  | 'redo'
   | 'pan'
   | 'arrowLeft'
   | 'arrowUp'
@@ -58,10 +59,10 @@ export type IconName =
   | 'share';
 
 const SVG_PATHS: Record<IconName, string> = {
-  // Battlemented Citadel Keep Crest (Menu / Hub)
+  // Battlemented Citadel Keep Crest (3.2-unit embrasures prevent stroke fusion at 16-18px)
   hub: `
-    <path d="M4 20h16" />
-    <path d="M5 20V8h3v2.2h2V8h4v2.2h2V8h3v12" />
+    <path d="M3 20h18" />
+    <path d="M4.2 20V7.5h3.2v2.8h3.2V7.5h2.8v2.8h3.2V7.5h3.2V20" />
     <path d="M10 20v-4a2 2 0 0 1 4 0v4" />
   `,
   // Navigation Compass
@@ -135,9 +136,9 @@ const SVG_PATHS: Record<IconName, string> = {
   star: `
     <polygon points="12,3 14.7,8.5 20.8,9.4 16.4,13.7 17.4,19.8 12,16.9 6.6,19.8 7.6,13.7 3.2,9.4 9.3,8.5" />
   `,
-  // Solid Gilded Star (Round Par bonus)
+  // Solid Gilded Star (Round Par bonus — stroke="none" prevents 10-11px point bloat)
   starFilled: `
-    <polygon fill="currentColor" points="12,3 14.7,8.5 20.8,9.4 16.4,13.7 17.4,19.8 12,16.9 6.6,19.8 7.6,13.7 3.2,9.4 9.3,8.5" />
+    <polygon fill="currentColor" stroke="none" points="12,2.6 14.4,8.9 21.1,9.2 15.9,13.5 17.6,20 12,16.3 6.4,20 8.1,13.5 2.9,9.2 9.6,8.9" />
   `,
   // Leaderboard Trophy Chalice
   trophy: `
@@ -172,10 +173,10 @@ const SVG_PATHS: Record<IconName, string> = {
     <polygon points="4.5,9.5 8.5,9.5 13.5,5.5 13.5,18.5 8.5,14.5 4.5,14.5" />
     <path d="M17 9.5l4.5 5M21.5 9.5l-4.5 5" />
   `,
-  // Open Guide Book
+  // Open Guide Book (single shared center spine prevents 15px double-stroke blotch)
   book: `
-    <path d="M3.5 5.5A2.5 2.5 0 0 1 6 3h5.5v16.5H6a2.5 2.5 0 0 0-2.5 2V5.5z" />
-    <path d="M20.5 5.5A2.5 2.5 0 0 0 18 3h-5.5v16.5H18a2.5 2.5 0 0 1 2.5 2V5.5z" />
+    <path d="M3 5.5C5.5 4.3 9 4.5 12 6c3-1.5 6.5-1.7 9-.5v13.5c-2.5-1.2-6-1-9 .5-3-1.5-6.5-1.7-9-.5V5.5z" />
+    <path d="M12 6v13.5" />
   `,
   // Guide Question Emblem
   help: `
@@ -215,9 +216,9 @@ const SVG_PATHS: Record<IconName, string> = {
   check: `
     <path d="M4.5 12.5l5 5 10-10.5" />
   `,
-  // Play Triangle
+  // Play Triangle (stroke="none" & optically centered at cx = 12)
   play: `
-    <polygon fill="currentColor" points="7,4.8 19,12 7,19.2" />
+    <polygon fill="currentColor" stroke="none" points="8,4.6 20,12 8,19.4" />
   `,
   // Refresh / Restart
   refresh: `
@@ -319,10 +320,15 @@ const SVG_PATHS: Record<IconName, string> = {
     <path d="M3.5 13.5h14a2.8 2.8 0 1 1-2.8 2.8" />
     <path d="M5.5 17.5h5" />
   `,
-  // Counter-Clockwise Undo Arrow
+  // Counter-Clockwise Undo Arrow (Z / Ctrl+Z)
   undo: `
     <path d="M4.5 9.5h10a4.5 4.5 0 1 1 0 9H9" />
     <path d="M8.5 5.5l-4 4 4 4" />
+  `,
+  // Clockwise Redo Arrow (Ctrl+Shift+Z / Ctrl+Y)
+  redo: `
+    <path d="M19.5 9.5h-10a4.5 4.5 0 1 0 0 9H15" />
+    <path d="M15.5 5.5l4 4-4 4" />
   `,
   // 4-Direction Camera Pan Cross
   pan: `
@@ -344,13 +350,13 @@ const SVG_PATHS: Record<IconName, string> = {
   arrowDown: `
     <path d="M12 5v14M6 13l6 6 6-6" />
   `,
-  // Outline Overcharge Pip (◇)
+  // Symmetric Outline Overcharge Pip (◇)
   diamond: `
-    <polygon points="12,3.2 20.2,12 12,20.8 3.8,12" />
+    <polygon points="12,3.5 20.5,12 12,20.5 3.5,12" />
   `,
-  // Solid Overcharge Pip (◆ — distinct from ★ Par!)
+  // Symmetric Solid Overcharge Pip (◆ — stroke="none" keeps sharp 90° facets at 10-11px)
   diamondFilled: `
-    <polygon fill="currentColor" points="12,3.2 20.2,12 12,20.8 3.8,12" />
+    <polygon fill="currentColor" stroke="none" points="12,2.8 21.2,12 12,21.2 2.8,12" />
   `,
   // Mobile Native Share Sheet Icon
   share: `
@@ -404,12 +410,13 @@ export function getSpireIcon(spireType: SpireType, size = 14): string {
 const MEDAL_RANK_PATHS: Record<1 | 2 | 3, string> = {
   1: `<path d="M10.7 7.8L12.1 6.7v5.6M10.6 12.3h3" />`,
   2: `<path d="M10.2 8.1a1.85 1.6 0 0 1 3.65 0.3c0 1.05-.9 1.8-3.65 3.9h3.75" />`,
-  3: `<path d="M10.4 7.35c.4-.45 1-.7 1.7-.7 1.05 0 1.75.55 1.75 1.35 0 .78-.65 1.35-1.75 1.4 1.15.05 1.85.65 1.85 1.5 0 .9-.78 1.5-1.9 1.5-.78 0-1.42-.25-1.82-.72M11.45 9.4h.65" />`,
+  3: `<path d="M10.35 7.35c.42-.48 1.02-.72 1.75-.72 1.05 0 1.75.54 1.75 1.32 0 .78-.68 1.38-1.95 1.48 1.32.1 2.05.68 2.05 1.52 0 .92-.8 1.52-1.95 1.52-.8 0-1.45-.26-1.85-.75" />`,
 };
 
 /**
  * Renders a high-contrast gilded tactile SVG medal badge for 1st, 2nd, or 3rd place
- * using platform-invariant geometric vector <path> numerals (WCAG AAA contrast, zero <text> font drift).
+ * using platform-invariant geometric vector <path> numerals (WCAG AAA contrast, zero <text> font drift,
+ * split swallowtail ribbons, and single-stroke waist geometry).
  */
 export function getMedalBadge(rank: 1 | 2 | 3, size = 22): string {
   const palette =
@@ -435,8 +442,8 @@ export function getMedalBadge(rank: 1 | 2 | 3, size = 22): string {
         };
 
   return `<svg class="svg-icon medal-svg medal-rank-${rank}" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-    <path d="M8.5 14.5L6.5 21.5L10.5 19.5L12 21.5V15" fill="${palette.ribbon}" />
-    <path d="M15.5 14.5L17.5 21.5L13.5 19.5L12 21.5V15" fill="${palette.ribbon}" />
+    <path d="M8.2 14.6L6.4 21.4l2.7-1.5 2.15 1.9V15.2" fill="${palette.ribbon}" />
+    <path d="M15.8 14.6l1.8 6.8-2.7-1.5-2.15 1.9V15.2" fill="${palette.ribbon}" />
     <circle cx="12" cy="9.5" r="6.8" fill="${palette.fill}" stroke="${palette.rim}" stroke-width="1.5" />
     <circle cx="12" cy="9.5" r="5.3" stroke="rgba(255,255,255,0.48)" stroke-width="0.7" />
     <g stroke="${palette.numeral}" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${MEDAL_RANK_PATHS[rank]}</g>

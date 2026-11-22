@@ -5,6 +5,7 @@ import {
   computeFullMazePath,
   do2x2Overlap,
   isCellIn2x2,
+  isCellPlacementBlocked,
   resolveSmart2x2Placement,
   SpireConduitLink,
   validateTowerPlacement,
@@ -12,6 +13,7 @@ import {
 import { evaluateMazeRunTime, OVERCHARGE_CDR } from '../shared/simulation.js';
 import {
   ActiveBuildTool,
+  getEffectiveSpireStats,
   GridPoint,
   MazeEvalResult,
   PathResult,
@@ -50,6 +52,7 @@ export type InspectedWorldFeature =
       x: number;
       y: number;
       linked: boolean;
+      poweredSpireCount?: number; // 0 = Wall-linked only, >=1 = ◆ Powering N Spire(s)
     }
   | {
       kind: 'RUNNER';
@@ -86,6 +89,7 @@ export interface HoverStatusInfo {
   isGestureMoving?: boolean;
   placeNearTopEdge?: boolean;
   offscreen?: boolean;
+  isTouchInspect?: boolean; // true when mobile clean-tap inspected a Spire/Keep/Runner/Gate
 }
 
 const ISLAND_SPACING_X = 40;
@@ -137,6 +141,55 @@ function mergeSimpleGeometries(geos: THREE.BufferGeometry[]): THREE.BufferGeomet
   merged.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
   merged.computeBoundingSphere();
   return merged;
+}
+
+/**
+ * Crisp non-indexed 8-sided chamfered-square prism (flat per-face normals, zero
+ * Gouraud "pillow" shading). Centered on the origin, `h` tall along +Y.
+ */
+function createChamferedSquarePrism(
+  span: number,
+  bevel: number,
+  h: number
+): THREE.BufferGeometry {
+  const s = span / 2;
+  const b = Math.min(bevel, s * 0.45);
+  const ring: Array<[number, number]> = [
+    [-s + b, -s],
+    [s - b, -s],
+    [s, -s + b],
+    [s, s - b],
+    [s - b, s],
+    [-s + b, s],
+    [-s, s - b],
+    [-s, -s + b],
+  ];
+  const y0 = -h / 2;
+  const y1 = h / 2;
+  const pos: number[] = [];
+  const pushTri = (
+    a: [number, number, number],
+    c: [number, number, number],
+    d: [number, number, number]
+  ) => {
+    pos.push(...a, ...c, ...d);
+  };
+  for (let i = 0; i < ring.length; i++) {
+    const [ax, az] = ring[i];
+    const [bx, bz] = ring[(i + 1) % ring.length];
+    // Side quad (CCW seen from outside)
+    pushTri([ax, y0, az], [bx, y1, bz], [bx, y0, bz]);
+    pushTri([ax, y0, az], [ax, y1, az], [bx, y1, bz]);
+    // Top fan
+    pushTri([0, y1, 0], [bx, y1, bz], [ax, y1, az]);
+    // Bottom fan
+    pushTri([0, y0, 0], [ax, y0, az], [bx, y0, bz]);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.computeVertexNormals();
+  g.computeBoundingSphere();
+  return g;
 }
 
 function createContactShadowTexture(): THREE.CanvasTexture {
@@ -203,13 +256,18 @@ function createTranquilSeaShader(): THREE.ShaderMaterial {
       uCoastalAqua: { value: new THREE.Color('#5cb8db') },
       uDeepCerulean: { value: new THREE.Color('#3b83a8') },
       uHorizonColor: { value: new THREE.Color('#d4ebf7') },
+      uFogNear: { value: 230.0 },
+      uFogFar: { value: 480.0 },
     },
     vertexShader: `
       varying vec2 vWorldXZ;
+      varying float vViewDepth;
       void main() {
         vec4 worldPos = modelMatrix * vec4(position, 1.0);
         vWorldXZ = worldPos.xz;
-        gl_Position = projectionMatrix * viewMatrix * worldPos;
+        vec4 mvPos = viewMatrix * worldPos;
+        vViewDepth = -mvPos.z;
+        gl_Position = projectionMatrix * mvPos;
       }
     `,
     fragmentShader: `
@@ -218,7 +276,10 @@ function createTranquilSeaShader(): THREE.ShaderMaterial {
       uniform vec3 uCoastalAqua;
       uniform vec3 uDeepCerulean;
       uniform vec3 uHorizonColor;
+      uniform float uFogNear;
+      uniform float uFogFar;
       varying vec2 vWorldXZ;
+      varying float vViewDepth;
 
       void main() {
         float distFromCenter = length(vWorldXZ - uArenaCenter);
@@ -234,7 +295,8 @@ function createTranquilSeaShader(): THREE.ShaderMaterial {
         gl_FragColor = vec4(col, 1.0);
         #include <tonemapping_fragment>
 
-        float horizonMist = smoothstep(145.0, 325.0, distFromCenter);
+        // Camera-depth mist identical to THREE.Fog (islands & sea fog together, zero seam)
+        float horizonMist = smoothstep(uFogNear, uFogFar, vViewDepth);
         gl_FragColor.rgb = mix(gl_FragColor.rgb, uHorizonColor, horizonMist);
 
         #include <colorspace_fragment>
@@ -479,7 +541,10 @@ function createGrasslandFloorMaterial(coarsePointer: boolean): {
 
               vec3 railCol = uReticleMode < 1.5
                 ? vec3(0.76, 0.99, 0.83)
-                : (uReticleMode < 2.5 ? vec3(1.0, 0.72, 0.76) : vec3(1.0, 0.91, 0.52));
+                : (uReticleMode < 2.5
+                    ? vec3(1.0, 0.72, 0.76)
+                    : (uReticleMode < 3.5 ? vec3(0.98, 0.62, 0.24) : vec3(1.0, 0.90, 0.42)));
+              railCol = pow(railCol, vec3(2.2));
 
               grassCol = mix(grassCol, railCol, insideBox * 0.11 * uBuildAlpha);
               grassCol = mix(grassCol, railCol, clamp(rails * 0.46, 0.0, 0.65) * uBuildAlpha);
@@ -588,20 +653,26 @@ function createReticlePadShader(): THREE.ShaderMaterial {
           ? vec3(0.52, 0.94, 0.67)
           : (uMode < 2.5
               ? vec3(0.98, 0.35, 0.45)
-              : (uMode < 3.5 ? vec3(0.98, 0.68, 0.22) : vec3(0.99, 0.82, 0.22)));
+              : (uMode < 3.5
+                  ? vec3(0.98, 0.62, 0.24)
+                  : (uMode < 4.5 ? vec3(1.0, 0.90, 0.42) : vec3(0.98, 0.95, 0.86))));
+        // Linearize sRGB literals before <colorspace_fragment> (crisp mint/gold, never chalk-bleached)
+        baseCol = pow(baseCol, vec3(2.2));
 
-        float pulse = 0.92 + 0.08 * sin(uTime * 5.0);
+        float pulse = uMode > 4.5 ? 1.0 : 0.92 + 0.08 * sin(uTime * 5.0);
         vec3 col = baseCol;
         float alpha = clamp(brackets * 0.95 + thinFrame + subCross, 0.0, 0.96) * pulse;
+        // Calm post-budget (NO_PILLARS) hover: soft warm-ivory outline only
+        if (uMode > 4.5) alpha *= 0.30;
 
         if (blockedMask > 0.01) {
           float stripe = 0.78 + 0.22 * step(0.5, fract((p.x + p.y) * 3.0));
-          col = mix(col, vec3(0.96, 0.24, 0.37), 0.75);
+          col = mix(col, pow(vec3(0.96, 0.24, 0.37), vec3(2.2)), 0.75);
           alpha = max(alpha, blockedMask * 0.42 * stripe);
         }
 
         if (slashMask > 0.01) {
-          col = vec3(0.98, 0.32, 0.38);
+          col = pow(vec3(0.98, 0.32, 0.38), vec3(2.2));
           alpha = max(alpha, slashMask * 0.88);
         }
 
@@ -900,10 +971,15 @@ function createSpireAoEShader(
     uniforms: {
       uRange: { value: range },
       uBaseColor: { value: baseColor },
-      uOverchargeGold: { value: new THREE.Color('#fbbf24') },
+      // Frost shifts toward crisp glacier-white `#e0f2fe` instead of yellow (zero muddy RGB green!)
+      uOverchargeGold: {
+        value: new THREE.Color(
+          spireType === 'FROST_OBELISK' ? '#e0f2fe' : '#fbbf24'
+        ),
+      },
       uShadowRim: { value: new THREE.Color('#1e3a24') },
-      uRingAlpha: { value: 0.28 },
-      uInnerFillAlpha: { value: spireType === 'FROST_OBELISK' ? 0.05 : 0.0 },
+      uRingAlpha: { value: 0.2 },
+      uInnerFillAlpha: { value: spireType === 'FROST_OBELISK' ? 0.045 : 0.0 },
       uOverchargeTier: { value: 0.0 },
     },
     vertexShader: `
@@ -994,7 +1070,8 @@ function createSpireBaseCooldownShader(
       void main() {
         float r = length(vUv);
         float aa = max(fwidth(r), 0.008);
-        float band = smoothstep(0.82 - aa, 0.82 + aa, r) * (1.0 - smoothstep(0.96 - aa, 0.96 + aa, r));
+        // spireCooldownPlane is 2.28m (half = 1.14m), so 0.74..0.84 = r 0.84..0.96m (inside 1.06..1.20m tier arcs)
+        float band = smoothstep(0.74 - aa, 0.74 + aa, r) * (1.0 - smoothstep(0.84 - aa, 0.84 + aa, r));
         if (band < 0.005) discard;
 
         // Clockwise progress starting from 12 o'clock North (-Z -> vUv.y > 0)
@@ -1046,14 +1123,63 @@ function createFrostHexNovaShader(): THREE.ShaderMaterial {
       void main() {
         float r = length(vUv);
         float ang = atan(vUv.y, vUv.x);
-        float hexMod = 0.90 + 0.09 * cos(ang * 6.0);
+        // Max reach 0.78 + 0.08 + 0.11 = 0.97 < 1.0 so snowflake tips never clip the unit quad edge
+        float hexMod = 0.78 + 0.08 * cos(ang * 6.0);
         float dist = abs(r - hexMod);
         float ring = 1.0 - smoothstep(0.02, 0.11, dist);
-        float spokes = (1.0 - smoothstep(0.0, 0.06, abs(sin(ang * 3.0)))) * smoothstep(0.35, 0.9, r) * step(r, hexMod);
+        float spokes = (1.0 - smoothstep(0.0, 0.06, abs(sin(ang * 3.0)))) * smoothstep(0.32, 0.84, r) * step(r, hexMod);
         float mask = clamp(ring + spokes * 0.35, 0.0, 1.0);
         if (mask < 0.01) discard;
 
         vec3 col = mix(uCyan, uIceWhite, ring * 0.65);
+        gl_FragColor = vec4(col, mask * uOpacity);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
+/**
+ * Chrono Spire Temporal Implosion -> Outburst Shader (`gfx-vfx` §4.4):
+ * `uProgress ∈ [0, 0.32]` contracts violet-gold ring from perimeter -> core, then expands to full range.
+ */
+function createChronoTemporalWaveShader(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    toneMapped: true,
+    side: THREE.DoubleSide,
+    uniforms: {
+      uProgress: { value: 0.0 },
+      uOpacity: { value: 0.88 },
+      uViolet: { value: new THREE.Color('#c084fc') },
+      uGold: { value: new THREE.Color('#fde047') },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv * 2.0 - 1.0;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform float uProgress;
+      uniform float uOpacity;
+      uniform vec3 uViolet;
+      uniform vec3 uGold;
+      varying vec2 vUv;
+      void main() {
+        float r = length(vUv);
+        if (r > 0.99) discard;
+        float targetR = uProgress < 0.32
+          ? mix(0.94, 0.16, uProgress / 0.32)
+          : mix(0.16, 0.96, (uProgress - 0.32) / 0.68);
+        float ring = 1.0 - smoothstep(0.018, 0.095, abs(r - targetR));
+        float ticks = (1.0 - smoothstep(0.0, 0.08, abs(sin(atan(vUv.y, vUv.x) * 6.0)))) * ring * 0.55;
+        float mask = clamp(ring + ticks, 0.0, 1.0);
+        if (mask < 0.01) discard;
+        vec3 col = mix(uViolet, uGold, uProgress < 0.32 ? 0.55 : ring * 0.35);
         gl_FragColor = vec4(col, mask * uOpacity);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -1140,7 +1266,7 @@ interface ShockwaveEffect {
   maxAge: number;
   startRadius: number;
   maxRadius: number;
-  isShaderMat: boolean;
+  poolKind: 'basic' | 'frost' | 'chrono';
 }
 
 interface RelayArcEffect {
@@ -1186,6 +1312,7 @@ interface RuinVisualRig {
   corniceMesh: THREE.Mesh;
   gridX: number;
   gridY: number;
+  linkState?: number; // 0 = dormant, 1 = wall-linked, 2 = powering spire(s)
 }
 
 interface RunnerRig {
@@ -1197,7 +1324,7 @@ interface RunnerRig {
   rightArm: THREE.Group;
   leftWing: THREE.Mesh | null;
   rightWing: THREE.Mesh | null;
-  pennantMesh: THREE.Mesh | null;
+  pennantMesh: THREE.Object3D | null;
   accentMesh: THREE.Mesh | null;
   leftLeg: THREE.Group;
   rightLeg: THREE.Group;
@@ -1205,10 +1332,10 @@ interface RunnerRig {
   statusRingMat: THREE.ShaderMaterial;
   walkPhase: number;
   currentYaw: number;
+  heraldWingFlare?: number;
 }
 
 interface WallVisualEntry {
-  group: THREE.Group;
   born: number;
   x: number;
   y: number;
@@ -1217,6 +1344,58 @@ interface WallVisualEntry {
 interface BridgeVisualEntry {
   group: THREE.Group;
   born: number;
+}
+
+/** Persistent per-island `THREE.InstancedMesh` layer (zero per-build Mesh/Group GC churn). */
+interface InstLayer {
+  mesh: THREE.InstancedMesh;
+  capacity: number;
+  geo: THREE.BufferGeometry;
+  mat: THREE.Material;
+  castShadow: boolean;
+  receiveShadow: boolean;
+  renderOrder: number;
+  useColor: boolean;
+}
+
+/** One instanced masonry part (bridge span wall/cap, keystone, step-pier, corner bollard). */
+interface MasonryInstanceRec {
+  layer: InstLayer;
+  idx: number;
+  px: number;
+  py: number;
+  pz: number;
+  rotY: number;
+  sx: number;
+  sy: number;
+  sz: number;
+  born: number;
+}
+
+interface WallInstLayers {
+  ao: InstLayer;
+  plinth: InstLayer;
+  shaft: InstLayer;
+  cap: InstLayer;
+  emblem: InstLayer;
+}
+
+interface BridgeInstLayers {
+  ao: InstLayer;
+  wall: InstLayer;
+  cap: InstLayer;
+  keyBody: InstLayer;
+  keyCap: InstLayer;
+  bollardPost: InstLayer;
+  bollardCap: InstLayer;
+  pierBody: InstLayer;
+  pierCap: InstLayer;
+}
+
+interface CheckpointRig {
+  group: THREE.Group;
+  chimes: THREE.Mesh[];
+  lit: boolean;
 }
 
 interface IslandBadgeRefs {
@@ -1261,6 +1440,12 @@ interface IslandVisuals {
   bridgeEntries: BridgeVisualEntry[];
   clapMarkerGroup: THREE.Group;
   towerMeshes: Map<string, WallVisualEntry>;
+  wallLayers: WallInstLayers;
+  wallOrder: string[];
+  bridgeLayers: BridgeInstLayers;
+  bridgeRecs: MasonryInstanceRec[];
+  checkpointRigs: CheckpointRig[];
+  worldBounds: THREE.Box3;
   spireRigs: SpireVisualRig[];
   ruinRigs: RuinVisualRig[];
   pathMesh: THREE.Mesh | null;
@@ -1303,6 +1488,8 @@ export class Arena3DRenderer {
   private renderer: THREE.WebGLRenderer;
   private sunLight!: THREE.DirectionalLight;
   private lastShadowFrustumD = 0;
+  private lastShadowSnapX = Number.NaN;
+  private lastShadowSnapZ = Number.NaN;
   private currentShadowRes = 1024;
   private seaMesh!: THREE.Mesh;
   private voidSeaMat!: THREE.ShaderMaterial;
@@ -1319,6 +1506,11 @@ export class Arena3DRenderer {
   private viewportH = 720;
   private hudSafeTopPx = 56;
   private hudSafeBottomPx = 84;
+  private hudSafeBottomLivePx = 84; // live (unlocked) bottom inset for edge auto-pan
+  private buildInsetLocked = false;
+  private lockedBuildBottomPx = 84;
+  private lastInsetViewportKey = '';
+  private lastFramedRadius = 0;
   private hasCustomHudInsets = false;
 
   // Rolling FPS governor for sustained 60fps on mobile/high-DPI screens
@@ -1369,6 +1561,24 @@ export class Arena3DRenderer {
   private loupeCurrentOffset = { x: 0, y: -54 };
   private loupeHoldStartMs = 0;
   private loupeSavedBeforeGesture: GridPoint | null = null;
+  private loupeSavedTowerBeforeGesture: string | null = null;
+  private loupeLiftTargetY = 0; // smooth hold-lift target (animated in renderFrame)
+  private touchDownMs = 0;
+  private lastTouchAimMs = 0; // when pendingTouchCell was last aimed (>=180ms re-tap confirm)
+  private lastBuildVector: { dx: number; dy: number } = { dx: 0, dy: 1 };
+  private lastPaintedCell: GridPoint | null = null;
+  private paintedStrokeTowers: PlacedTower[] = [];
+  private sweptTowerIds = new Set<string>();
+  private lastHoverInspected: InspectedWorldFeature | null = null;
+  private currentCanvasCursor = 'default';
+  private piercedHitRemaining = new Map<string, number>();
+  private lastBurstSpireType = new Map<string, SpireType>();
+  private readonly _frustum = new THREE.Frustum();
+  private readonly _projScreenMatrix = new THREE.Matrix4();
+  private readonly _tmpBox = new THREE.Box3();
+  private readonly _tmpBoxHit = new THREE.Vector3();
+  private dprFastWindows = 0;
+  private lastOverviewCols = 3;
   private touchHoldTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPinchDist = 0;
   private lastPinchMid = { x: 0, y: 0 };
@@ -1437,17 +1647,9 @@ export class Arena3DRenderer {
       g.rotateX(-Math.PI / 2);
       return g;
     })(),
-    // 1. Player Stone Wall (`BLOCK`): Chamfered Square Ivory Turret (`1.66m` plinth, `h = 1.38m`)
-    pillarPlinth: (() => {
-      const g = new THREE.CylinderGeometry(1.12, 1.18, 0.22, 4);
-      g.rotateY(Math.PI / 4);
-      return g;
-    })(),
-    pillarShaft: (() => {
-      const g = new THREE.CylinderGeometry(0.98, 1.03, 0.96, 4);
-      g.rotateY(Math.PI / 4);
-      return g;
-    })(),
+    // 1. Player Stone Wall (`BLOCK`): Crisp flat-faceted chamfered-square ivory turret (`1.64m` plinth, `h = 1.38m`)
+    pillarPlinth: createChamferedSquarePrism(1.64, 0.16, 0.22),
+    pillarShaft: createChamferedSquarePrism(1.44, 0.14, 0.96),
     pillarCapMerlons: (() => {
       const baseCap = new THREE.BoxGeometry(1.52, 0.14, 1.52);
       baseCap.translate(0, 1.25, 0);
@@ -1474,10 +1676,11 @@ export class Arena3DRenderer {
       const base = new THREE.CylinderGeometry(0.86, 0.96, 0.28, 8);
       base.rotateY(Math.PI / 8);
       base.translate(0, 0.14, 0);
-      const spurX = new THREE.BoxGeometry(1.82, 0.54, 0.52);
-      spurX.translate(0, 0.27, 0);
-      const spurZ = new THREE.BoxGeometry(0.52, 0.54, 1.82);
-      spurZ.translate(0, 0.27, 0);
+      // Stepped non-coplanar `0.88m × 0.60m` basalt buttresses (wider than 0.72m bridges so spans socket in!)
+      const spurX = new THREE.BoxGeometry(1.78, 0.6, 0.88);
+      spurX.translate(0, 0.3, 0);
+      const spurZ = new THREE.BoxGeometry(0.88, 0.58, 1.78);
+      spurZ.translate(0, 0.29, 0);
       const merged = mergeSimpleGeometries([base, spurX, spurZ]);
       base.dispose();
       spurX.dispose();
@@ -1515,7 +1718,12 @@ export class Arena3DRenderer {
     spirePlinth: new THREE.CylinderGeometry(0.86, 0.96, 0.26, 12),
     spirePedestal: new THREE.CylinderGeometry(0.72, 0.82, 0.72, 12),
     spireCollar: new THREE.CylinderGeometry(0.8, 0.75, 0.16, 12),
-    spireCollarRim: new THREE.CylinderGeometry(0.85, 0.87, 0.07, 12),
+    // Hollow outer collar bezel ring (frames, never floods Frost/Chrono cores with gold)
+    spireCollarRim: (() => {
+      const g = new THREE.TorusGeometry(0.82, 0.046, 8, 16);
+      g.rotateX(Math.PI / 2);
+      return g;
+    })(),
     spirePipBezel: (() => {
       const g = new THREE.OctahedronGeometry(0.2, 0);
       g.scale(1.05, 0.42, 1.05);
@@ -1530,8 +1738,8 @@ export class Arena3DRenderer {
     })(),
     spireGroundArc: (() => {
       const g = new THREE.RingGeometry(
-        1.02,
-        1.15,
+        1.06,
+        1.2,
         10,
         1,
         -Math.PI * 0.5 - 0.25,
@@ -1561,7 +1769,7 @@ export class Arena3DRenderer {
     })(),
     chronoHorn: new THREE.CylinderGeometry(0.08, 0.15, 1.12, 8),
     chronoHalo: (() => {
-      const g = new THREE.TorusGeometry(0.5, 0.036, 8, 24);
+      const g = new THREE.TorusGeometry(0.41, 0.032, 8, 24);
       g.rotateX(Math.PI / 2);
       return g;
     })(),
@@ -1668,12 +1876,65 @@ export class Arena3DRenderer {
       g.rotateX(Math.PI / 2);
       return g;
     })(),
-    runnerWeaponShaft: new THREE.CylinderGeometry(0.032, 0.038, 0.9, 6),
+    runnerWeaponShaft: new THREE.CylinderGeometry(0.042, 0.048, 0.9, 6),
     runnerSpearTip: new THREE.ConeGeometry(0.07, 0.26, 6),
-    runnerPennantPole: new THREE.CylinderGeometry(0.024, 0.028, 1.18, 6),
+    runnerPennantPole: new THREE.CylinderGeometry(0.038, 0.042, 1.18, 6),
     runnerPennantFlag: new THREE.BoxGeometry(0.03, 0.28, 0.44),
     runnerMaceHead: new THREE.DodecahedronGeometry(0.18, 0),
     runnerOrbGem: new THREE.OctahedronGeometry(0.14, 0),
+
+    // Iter 2 Masonry Grammar: `(±2,±2)` vertex Corner Bollards + `(±2,±1)` orthogonal Step-Seam Piers
+    bollardPost: (() => {
+      const g = new THREE.CylinderGeometry(0.27, 0.32, 1.06, 8);
+      g.rotateY(Math.PI / 8);
+      g.translate(0, 0.53, 0);
+      return g;
+    })(),
+    bollardCap: (() => {
+      const g = new THREE.CylinderGeometry(0.32, 0.3, 0.14, 8);
+      g.rotateY(Math.PI / 8);
+      g.translate(0, 1.13, 0);
+      return g;
+    })(),
+    stepPierBody: (() => {
+      const g = new THREE.BoxGeometry(0.52, 0.98, 0.68);
+      g.translate(0, 0.49, 0);
+      return g;
+    })(),
+    stepPierCap: (() => {
+      const g = new THREE.BoxGeometry(0.6, 0.14, 0.76);
+      g.translate(0, 1.05, 0);
+      return g;
+    })(),
+
+    // Iter 2 Flush Gate Aprons (`top = 0.018m`) + Limestone Cliff Corbels under gate overhangs
+    gateApronFlush: new THREE.BoxGeometry(2.8, 0.028, 1.18),
+    gateCliffCorbel: new THREE.BoxGeometry(3.04, 1.08, 0.64),
+
+    // Iter 2 Gilded Checkpoint Waystone (`round.checkpoints`) — open-center walkable rune ring
+    checkpointRuneRing: (() => {
+      const g = new THREE.RingGeometry(0.78, 0.94, 8, 1);
+      g.rotateX(-Math.PI / 2);
+      g.rotateY(Math.PI / 8);
+      return g;
+    })(),
+    checkpointInnerMosaic: (() => {
+      const g = new THREE.CircleGeometry(0.74, 8);
+      g.rotateX(-Math.PI / 2);
+      g.rotateY(Math.PI / 8);
+      return g;
+    })(),
+    checkpointPillar: (() => {
+      const g = new THREE.CylinderGeometry(0.075, 0.1, 0.86, 6);
+      g.translate(0, 0.43, 0);
+      return g;
+    })(),
+    checkpointChime: (() => {
+      const g = new THREE.OctahedronGeometry(0.11, 0);
+      g.scale(1.0, 1.35, 1.0);
+      g.translate(0, 0.98, 0);
+      return g;
+    })(),
   };
 
   // Protected Singleton Materials
@@ -1740,6 +2001,20 @@ export class Arena3DRenderer {
     emissiveIntensity: 0.12,
     roughness: 0.65,
     metalness: 0.18,
+  });
+  private readonly keepBrazierAmberMat = new THREE.MeshStandardMaterial({
+    color: '#fb923c',
+    emissive: '#d97706',
+    emissiveIntensity: 0.45,
+    roughness: 0.36,
+    metalness: 0.18,
+  });
+  private readonly keepAmberCorniceMat = new THREE.MeshStandardMaterial({
+    color: '#fcd34d',
+    emissive: '#b45309',
+    emissiveIntensity: 0.16,
+    roughness: 0.52,
+    metalness: 0.16,
   });
   private readonly keepBrazierLinkedMat = new THREE.MeshStandardMaterial({
     color: '#fde047',
@@ -1895,11 +2170,41 @@ export class Arena3DRenderer {
   private readonly exitCoralMat = new THREE.MeshBasicMaterial({
     color: '#fb7185',
   });
-  private readonly fogVeilMat = new THREE.MeshBasicMaterial({
-    color: '#e6eff6',
+  // Feathered drifting mist veil (SDF edge-feathered; floats above every prop so nothing is guillotined)
+  private readonly fogVeilMat = new THREE.ShaderMaterial({
     transparent: true,
-    opacity: 0.72,
     depthWrite: false,
+    uniforms: {
+      uTime: { value: 0 },
+      uColor: { value: new THREE.Color('#e6eff6') },
+      uOpacity: { value: 0.8 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      varying vec2 vWorldXZ;
+      void main() {
+        vUv = uv;
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldXZ = wp.xz;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: `
+      uniform float uTime;
+      uniform vec3 uColor;
+      uniform float uOpacity;
+      varying vec2 vUv;
+      varying vec2 vWorldXZ;
+      void main() {
+        float edge = min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y));
+        float feather = smoothstep(0.0, 0.07, edge);
+        float drift = 0.88 + 0.12 * sin(vWorldXZ.x * 0.35 + uTime * 0.3) * cos(vWorldXZ.y * 0.29 - uTime * 0.23);
+        float a = uOpacity * feather * drift;
+        if (a < 0.004) discard;
+        gl_FragColor = vec4(uColor, a);
+        #include <colorspace_fragment>
+      }
+    `,
   });
   private readonly clapPipRimMat = new THREE.MeshBasicMaterial({
     color: '#1e293b',
@@ -1930,6 +2235,58 @@ export class Arena3DRenderer {
     transparent: true,
     opacity: 0.92,
     depthWrite: false,
+  });
+
+  // Iter 2 white-base instanced masonry materials (per-instance `setColorAt` ivory / crimson / cream / gold)
+  private readonly instMasonryWallMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.78,
+    metalness: 0.02,
+  });
+  private readonly instMasonryCapMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.56,
+    metalness: 0.08,
+  });
+  private readonly _colIvoryWall = new THREE.Color('#efe9dd');
+  private readonly _colCrimsonWall = new THREE.Color('#a8382b');
+  private readonly _colCreamCap = new THREE.Color('#fcfaf5');
+  private readonly _colCreamStone = new THREE.Color('#f3ede1');
+  private readonly _colGoldTrim = new THREE.Color('#fbbf24');
+  private readonly _dummyObj = new THREE.Object3D();
+
+  // Iter 2 Gilded Checkpoint Waystone Materials (dormant gold -> ignited emerald)
+  private readonly checkpointRuneGoldMat = new THREE.MeshStandardMaterial({
+    color: '#e8b64a',
+    emissive: '#b45309',
+    emissiveIntensity: 0.22,
+    roughness: 0.42,
+    metalness: 0.34,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
+  });
+  private readonly checkpointMosaicMat = new THREE.MeshStandardMaterial({
+    color: '#efe6d2',
+    roughness: 0.86,
+    metalness: 0.02,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  private readonly checkpointChimeDormantMat = new THREE.MeshStandardMaterial({
+    color: '#fcd34d',
+    emissive: '#d97706',
+    emissiveIntensity: 0.35,
+    roughness: 0.3,
+    metalness: 0.3,
+  });
+  private readonly checkpointChimeLitMat = new THREE.MeshStandardMaterial({
+    color: '#6ee7b7',
+    emissive: '#34d399',
+    emissiveIntensity: 1.05,
+    roughness: 0.22,
+    metalness: 0.2,
   });
 
   // Shared Runner Materials (Zero per-reroll leaks)
@@ -1972,11 +2329,15 @@ export class Arena3DRenderer {
     if (this._activeTool !== val) {
       this._activeTool = val;
       this.cachedHoverPreview = null;
-      if (val === 'PAN' || this.pendingTouchCell || this.pendingTouchTowerId) {
+      if (val === 'PAN' || this.pendingTouchCell) {
         this.cancelTouchGhost();
+      } else if (this.pendingTouchTowerId) {
+        // Preserve already-selected wall across BLOCK <-> SELL tool toggle
+        this.applyTouchSelectionVisuals();
       } else {
         this.updateBuildHover(true);
       }
+      this.refreshCanvasCursor(this.lastPointerScreen.x, this.lastPointerScreen.y);
     }
   }
 
@@ -2011,6 +2372,7 @@ export class Arena3DRenderer {
   public onTouchSnapChange?: (cell: GridPoint, valid: boolean) => void;
   public dismissTransientUI?: () => boolean;
   public onFocusChange?: () => void;
+  public onDesktopMouseActive?: () => void;
 
   private currentRoomState: RoomState | null = null;
   private lastRoomPhase: string = '';
@@ -2081,17 +2443,25 @@ export class Arena3DRenderer {
       this.runnerSteelDarkMat,
       this.runnerLegMat,
       this.runnerGoldAccentMat,
+      this.checkpointRuneGoldMat,
+      this.checkpointMosaicMat,
+      this.checkpointChimeDormantMat,
+      this.checkpointChimeLitMat,
+      this.instMasonryWallMat,
+      this.instMasonryCapMat,
+      this.keepBrazierAmberMat,
+      this.keepAmberCorniceMat,
     ]);
 
-    // 1. Airy Mediterranean Sky Mist + Distance-Started Linear Horizon Fog (0% haze on islands!)
+    // 1. Airy Mediterranean Sky Mist + camera-depth horizon fog (pushed past 6-island Overview depth)
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#d4ebf7');
-    this.scene.fog = new THREE.Fog('#d4ebf7', 150, 340);
+    this.scene.fog = new THREE.Fog('#d4ebf7', 230, 480);
 
     const initW = this.container.clientWidth || window.innerWidth;
     const initH = this.container.clientHeight || window.innerHeight;
     // Telephoto 35° Diorama Lens (cuts edge tower splay & mobile parallax by ~26%!)
-    this.camera = new THREE.PerspectiveCamera(35, initW / initH, 1.0, 440);
+    this.camera = new THREE.PerspectiveCamera(35, initW / initH, 1.0, 620);
 
     // Khronos PBR NeutralToneMapping + Hardware MSAA
     this.renderer = new THREE.WebGLRenderer({
@@ -2335,7 +2705,8 @@ export class Arena3DRenderer {
   }
 
   private updateSunShadowFrustum(forceProjection = false) {
-    const d = this.arenaOverviewMode ? 66 : 18;
+    // Island-clamped diagonal shadow frustum (`d = 21.5` covers the full 20×26 plateau + cliffs)
+    const d = this.arenaOverviewMode ? 66 : 21.5;
     if (forceProjection || d !== this.lastShadowFrustumD) {
       this.lastShadowFrustumD = d;
       const cam = this.sunLight.shadow.camera;
@@ -2343,18 +2714,53 @@ export class Arena3DRenderer {
       cam.right = d;
       cam.top = d;
       cam.bottom = -d;
+      if (this.arenaOverviewMode) {
+        cam.near = 4;
+        cam.far = 165;
+        this.sunLight.shadow.bias = -0.00025;
+      } else {
+        cam.near = 18;
+        cam.far = 96;
+        this.sunLight.shadow.bias = -0.00015;
+      }
       cam.updateProjectionMatrix();
+      this.lastShadowSnapX = Number.NaN;
+    }
+
+    // Clamp the shadow target within ±2m of the focused island center so pans / zBias never un-shadow it
+    let tx = this.camTarget.x;
+    let tz = this.camTarget.z;
+    if (!this.arenaOverviewMode && this.currentRoomState) {
+      const pid = this.focusedPlayerId || this.localPlayerId;
+      const island = pid ? this.islands.get(pid) : undefined;
+      if (island) {
+        const cx = island.offsetX + this.currentRoomState.roundConfig.gridWidth * 0.5;
+        const cz = island.offsetZ + this.currentRoomState.roundConfig.gridHeight * 0.5;
+        tx = Math.max(cx - 2.0, Math.min(cx + 2.0, tx));
+        tz = Math.max(cz - 2.0, Math.min(cz + 2.0, tz));
+      }
     }
 
     const mapW = this.sunLight.shadow.mapSize.width || 1024;
     const texelWorld = (d * 2) / mapW;
-    const snapX = Math.round(this.camTarget.x / texelWorld) * texelWorld;
-    const snapZ = Math.round(this.camTarget.z / texelWorld) * texelWorld;
+    const snapX = Math.round(tx / texelWorld) * texelWorld;
+    const snapZ = Math.round(tz / texelWorld) * texelWorld;
+    if (snapX === this.lastShadowSnapX && snapZ === this.lastShadowSnapZ) return;
+    this.lastShadowSnapX = snapX;
+    this.lastShadowSnapZ = snapZ;
 
     this.sunLight.target.position.set(snapX, 0, snapZ);
     this.sunLight.target.updateMatrixWorld();
     // 58° NW/SW cross-key raking crisp directional shadows across adjacent corridors!
     this.sunLight.position.set(snapX - 28, 48, snapZ + 18);
+  }
+
+  /** Portrait viewports lay out the multi-island Overview as `2 cols × 3 rows` (landscape: 3 cols). */
+  private getOverviewCols(count: number): number {
+    const aspect =
+      Math.max(280, this.viewportW || window.innerWidth) /
+      Math.max(240, this.viewportH || window.innerHeight);
+    return Math.max(1, Math.min(aspect < 0.95 ? 2 : 3, count));
   }
 
   // ==========================================================================
@@ -2364,11 +2770,35 @@ export class Arena3DRenderer {
   public setHudSafeInsets(topPx: number, bottomPx: number): void {
     const clampedTop = Math.max(24, Math.min(240, topPx));
     const clampedBottom = Math.max(8, Math.min(280, bottomPx));
+    this.hudSafeBottomLivePx = clampedBottom;
+
+    // Zero Camera Bob: during touch `BUILD`, `#touch-precision-tray` show/hide must NEVER shift
+    // `camGoalTarget.z`. Lock the framing inset for the phase (reset on phase/viewport/layout change).
+    const viewportKey = `${Math.round(this.viewportW)}x${Math.round(this.viewportH)}`;
+    const isTouchBuild =
+      this.currentRoomState?.phase === 'BUILD' && this.isCoarseOrCompactDevice();
+    let framingBottom = clampedBottom;
+    if (isTouchBuild) {
+      if (
+        this.buildInsetLocked &&
+        this.lastInsetViewportKey === viewportKey &&
+        Math.abs(clampedTop - this.hudSafeTopPx) <= 2
+      ) {
+        framingBottom = this.lockedBuildBottomPx;
+      } else {
+        this.buildInsetLocked = true;
+        this.lockedBuildBottomPx = clampedBottom;
+      }
+    } else {
+      this.buildInsetLocked = false;
+    }
+    this.lastInsetViewportKey = viewportKey;
+
     const changed =
       Math.abs(clampedTop - this.hudSafeTopPx) > 2 ||
-      Math.abs(clampedBottom - this.hudSafeBottomPx) > 2;
+      Math.abs(framingBottom - this.hudSafeBottomPx) > 2;
     this.hudSafeTopPx = clampedTop;
-    this.hudSafeBottomPx = clampedBottom;
+    this.hudSafeBottomPx = framingBottom;
     this.hasCustomHudInsets = true;
 
     if (changed && this.currentRoomState && !this.isLoupeDragging) {
@@ -2385,10 +2815,18 @@ export class Arena3DRenderer {
               this.camGoalTarget.x - (island.offsetX + gw * 0.5),
               this.camGoalTarget.z - (island.offsetZ + gh * 0.5)
             );
-            // Smoothly recenter if player hasn't manually panned away
+            // Smoothly recenter (and re-zoom when un-zoomed) if player hasn't manually panned away
             if (distFromCenter < 4.5) {
               const frame = this.computeIdealFraming(gw + 2.0, gh + 3.4, 1.6);
               this.camGoalTarget.z = island.offsetZ + gh * 0.5 + frame.zBias;
+              if (
+                this.lastFramedRadius > 0 &&
+                Math.abs(this.camGoalRadius - this.lastFramedRadius) < 1.5
+              ) {
+                this.camGoalRadius = this.clampCameraRadius(frame.radius);
+                this.lastFramedRadius = this.camGoalRadius;
+                this.updateZoomCoupledPolar();
+              }
               this.clampCameraTarget();
             }
           }
@@ -2419,24 +2857,35 @@ export class Arena3DRenderer {
       (spanW * 0.5) / (usableX * tanHalfH) + nearZDepthOffset;
 
     const isRunPhase = this.currentRoomState?.phase === 'RUN';
+    const isShortMobileLandscape =
+      !isPortrait && h <= 500 && !this.arenaOverviewMode;
     const topHudPx = this.hasCustomHudInsets
       ? this.hudSafeTopPx
       : w <= 768
       ? 58
       : 56;
-    const bottomHudPx = this.hasCustomHudInsets
+    // In 800×360 mobile landscape, side-split docks sit in the ocean margins and leave the center open!
+    const rawBottomPx = this.hasCustomHudInsets
       ? this.hudSafeBottomPx
       : isRunPhase
       ? w <= 768
         ? 62
         : 18
       : 82;
+    const bottomHudPx = isShortMobileLandscape
+      ? Math.min(rawBottomPx, 16)
+      : rawBottomPx;
 
     const clearFracY = Math.max(0.52, (h - topHudPx - bottomHudPx - 14) / h);
-    const usableY = Math.min(isPortrait ? 0.8 : 0.85, clearFracY);
+    const usableY = Math.min(
+      isPortrait ? 0.8 : isShortMobileLandscape ? 0.88 : 0.85,
+      clearFracY
+    );
 
+    // Include downward South cliff skirt (`1.42m` drop * `sin(polar) * 0.45`) so ultra-wide docks never overlap
+    const effSpanH = isShortMobileLandscape ? Math.max(20, spanH - 1.8) : spanH;
     const projectedHalfH =
-      spanH * 0.5 * Math.cos(polar) + reliefH * Math.sin(polar);
+      effSpanH * 0.5 * Math.cos(polar) + (reliefH + 0.65) * Math.sin(polar);
     const distForHeight = projectedHalfH / (usableY * tanHalfV);
 
     const radius = Math.max(distForWidth, distForHeight);
@@ -2450,7 +2899,7 @@ export class Arena3DRenderer {
 
   private clampCameraRadius(r: number): number {
     const maxR = this.arenaOverviewMode
-      ? Math.max(135, this.camGoalRadius, 195)
+      ? Math.max(135, this.camGoalRadius, 340)
       : 128;
     const minR = 16;
     return Math.max(minR, Math.min(maxR, r));
@@ -2478,8 +2927,8 @@ export class Arena3DRenderer {
 
     if (this.arenaOverviewMode) {
       const count = Math.max(1, this.currentRoomState.players.length);
-      const cols = Math.min(3, count);
-      const rows = Math.ceil(count / 3);
+      const cols = this.getOverviewCols(count);
+      const rows = Math.ceil(count / cols);
       const maxX = (cols - 1) * ISLAND_SPACING_X + gw + 4;
       const maxZ = (rows - 1) * ISLAND_SPACING_Z + gh + 5;
       this.camGoalTarget.x = Math.max(-4, Math.min(maxX, this.camGoalTarget.x));
@@ -2505,7 +2954,7 @@ export class Arena3DRenderer {
   private panCameraByScreenDelta(dxPx: number, dyPx: number) {
     const h = Math.max(240, this.viewportH);
     const vFovRad = THREE.MathUtils.degToRad(this.camera.fov);
-    const worldPerPx = (2 * this.camRadius * Math.tan(vFovRad * 0.5)) / h;
+    const worldPerPx = (2 * this.camGoalRadius * Math.tan(vFovRad * 0.5)) / h;
 
     const cosA = Math.cos(this.camAzimuth);
     const sinA = Math.sin(this.camAzimuth);
@@ -2542,6 +2991,7 @@ export class Arena3DRenderer {
       island.offsetZ + gh / 2 + frame.zBias
     );
     this.camGoalRadius = this.clampCameraRadius(frame.radius);
+    this.lastFramedRadius = this.camGoalRadius;
     this.camGoalPolar = frame.polar;
     this.camGoalAzimuth = 0;
 
@@ -2564,8 +3014,8 @@ export class Arena3DRenderer {
     if (!this.currentRoomState) return;
 
     const count = Math.max(1, this.currentRoomState.players.length);
-    const cols = Math.min(3, count);
-    const rows = Math.ceil(count / 3);
+    const cols = this.getOverviewCols(count);
+    const rows = Math.ceil(count / cols);
     const gw = this.currentRoomState.roundConfig.gridWidth;
     const gh = this.currentRoomState.roundConfig.gridHeight;
 
@@ -2578,7 +3028,7 @@ export class Arena3DRenderer {
     this.camBasePolar = frame.polar;
     this.camGoalTarget.set(centerX, 0, centerZ + frame.zBias * 0.55);
     this.camGoalPolar = frame.polar;
-    this.camGoalRadius = Math.max(30, Math.min(195, frame.radius));
+    this.camGoalRadius = Math.max(30, Math.min(340, frame.radius));
     this.camGoalAzimuth = 0;
 
     if (snapImmediate) {
@@ -2590,12 +3040,62 @@ export class Arena3DRenderer {
     this.updateSunShadowFrustum();
   }
 
-  public resetCameraView(): void {
+  public resetCameraView(forceLocalIsland = false): void {
+    if (forceLocalIsland && this.localPlayerId && this.islands.has(this.localPlayerId)) {
+      this.focusOnPlayerIsland(this.localPlayerId);
+      this.onFocusChange?.();
+      return;
+    }
     if (this.arenaOverviewMode) {
       this.focusArenaOverview();
     } else if (this.focusedPlayerId || this.localPlayerId) {
       this.focusOnPlayerIsland((this.focusedPlayerId || this.localPlayerId)!);
     }
+  }
+
+  /** Convenience alias: focuses `localPlayerId` (North-up), exiting Overview / rival spectating. */
+  public resetToMyIsland(): void {
+    if (this.localPlayerId && this.islands.has(this.localPlayerId)) {
+      this.resetCameraView(true);
+    } else {
+      this.resetCameraView();
+    }
+  }
+
+  /**
+   * Focuses the round/match leader's island (Results `[Winner's Maze]` peek).
+   * Returns the focused player id (or null when no room state / players exist).
+   */
+  public focusWinnerIsland(): string | null {
+    const state = this.currentRoomState;
+    if (!state || state.players.length === 0) return null;
+    const phase = state.phase;
+    let best: PlayerState | null = null;
+    let bestKey = -Infinity;
+    for (const p of state.players) {
+      if (!this.islands.has(p.id)) continue;
+      let key: number;
+      if (phase === 'GAME_OVER') {
+        key = p.totalScore * 1000 + (p.lastRoundTime ?? 0) * 0.001;
+      } else if (phase === 'RUN') {
+        const sim = this.latestSimStates.get(p.id);
+        key = sim
+          ? sim.finished
+            ? sim.finishTimeSeconds
+            : sim.elapsedSeconds ?? sim.distanceTraveled
+          : p.lastRoundTime ?? 0;
+      } else {
+        key = p.lastRoundPoints * 100000 + (p.lastRoundTime ?? 0);
+      }
+      if (key > bestKey) {
+        bestKey = key;
+        best = p;
+      }
+    }
+    if (!best) return null;
+    this.focusOnPlayerIsland(best.id);
+    this.onFocusChange?.();
+    return best.id;
   }
 
   public getLocalMazeEval(): MazeEvalResult | null {
@@ -2645,30 +3145,33 @@ export class Arena3DRenderer {
   }
 
   /**
-   * 3D Mesh-First Raycast against existing player Stone Walls (`towerGroup.children`)
-   * so clicking or tapping a `1.38m` wall cap never suffers perspective ground parallax!
+   * Analytical 3D `Box3` slab raycast against existing player Stone Walls (`1.38m` tall,
+   * `[x+0.12 .. x+1.88]`) — `<0.005ms`, InstancedMesh-compatible, zero `aoQuad` overhang or cap parallax!
    */
   private raycastExistingWallMesh(
     island: IslandVisuals,
     player: PlayerState
   ): PlacedTower | null {
-    if (island.towerGroup.children.length === 0) return null;
-    const hits = this.raycaster.intersectObjects(
-      island.towerGroup.children,
-      true
-    );
-    for (const hit of hits) {
-      let curr: THREE.Object3D | null = hit.object;
-      while (curr && curr !== island.towerGroup) {
-        const tid = curr.userData?.towerId as string | undefined;
-        if (tid) {
-          const found = player.towers.find((t) => t.id === tid);
-          if (found) return found;
+    const towers = player.towers;
+    if (towers.length === 0) return null;
+    const ox = island.offsetX;
+    const oz = island.offsetZ;
+    const ray = this.raycaster.ray;
+    let best: PlacedTower | null = null;
+    let bestDistSq = Infinity;
+    for (let i = 0; i < towers.length; i++) {
+      const t = towers[i];
+      this._tmpBox.min.set(ox + t.x + 0.12, 0, oz + t.y + 0.12);
+      this._tmpBox.max.set(ox + t.x + 1.88, 1.38, oz + t.y + 1.88);
+      if (ray.intersectBox(this._tmpBox, this._tmpBoxHit)) {
+        const dSq = ray.origin.distanceToSquared(this._tmpBoxHit);
+        if (dSq < bestDistSq) {
+          bestDistSq = dSq;
+          best = t;
         }
-        curr = curr.parent;
       }
     }
-    return null;
+    return best;
   }
 
   /**
@@ -2707,9 +3210,13 @@ export class Arena3DRenderer {
       const h = this.container.clientHeight || window.innerHeight;
       this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
-      this.renderer.setPixelRatio(this.computeAdaptivePixelRatio());
+      const nextDpr = this.computeAdaptivePixelRatio();
+      if (Math.abs(nextDpr - this.renderer.getPixelRatio()) > 0.001) {
+        this.renderer.setPixelRatio(nextDpr);
+      }
       this.renderer.setSize(w, h);
       this.updateViewportBounds();
+      this.relayoutIslandOffsets();
 
       const desiredShadowRes = this.isCoarseOrCompactDevice() ? 1024 : 2048;
       if (desiredShadowRes !== this.currentShadowRes) {
@@ -2744,17 +3251,38 @@ export class Arena3DRenderer {
 
     window.addEventListener('resize', handleResize);
     window.visualViewport?.addEventListener('resize', handleResize);
-    window.addEventListener('blur', () => {
+    const resetTransientInput = () => {
       this.keysDown.clear();
       this.isShiftPainting = false;
       this.isSweepSelling = false;
+      this.lastPaintedCell = null;
+      // Clear zombie touches (OS shade / app switch without `pointercancel`)
+      this.activeTouches.clear();
+      this.clearTouchHoldTimer();
+      this.postPinchGuard = false;
+      this.canGrabExistingGhost = false;
+      if (this.isLoupeDragging) {
+        this.isLoupeDragging = false;
+        if (this.pendingTouchCell) this.applyTouchSelectionVisuals();
+      }
+      this.isLeftMouseDown = false;
+      this.isRightMouseDown = false;
+      this.isMiddleOrAltDragging = false;
+      this.setCanvasCursor('default');
+    };
+    window.addEventListener('blur', resetTransientInput);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') resetTransientInput();
     });
 
     window.addEventListener('keydown', (e) => {
       if (this._modalOpen) return;
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (e.ctrlKey || e.metaKey) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) {
+        if (e.metaKey) this.keysDown.clear(); // macOS Cmd+Key swallows keyup
+        return;
+      }
       this.keysDown.add(e.key.toLowerCase());
     });
 
@@ -2785,11 +3313,13 @@ export class Arena3DRenderer {
         });
 
         if (this.activeTouches.size === 1) {
+          this.dismissTransientUI?.();
           this.touchGestureMoved = false;
           this.postPinchGuard = false;
           this.isLoupeDragging = false;
           this.canGrabExistingGhost = false;
           this.clearTouchHoldTimer();
+          this.touchDownMs = performance.now();
 
           const isSpectatingOther =
             this.focusedPlayerId !== null &&
@@ -2806,8 +3336,9 @@ export class Arena3DRenderer {
             this.loupeSavedBeforeGesture = this.pendingTouchCell
               ? { ...this.pendingTouchCell }
               : null;
+            this.loupeSavedTowerBeforeGesture = this.pendingTouchTowerId;
 
-            // Check if pressing within <= 56px of an active ghost for instant Loupe Grab!
+            // Pressing within <= 32px of an active ghost = instant 1:1 Loupe Grab (no hold timer!)
             if (this.pendingTouchCell && this.localPlayerId) {
               const localIsl = this.islands.get(this.localPlayerId);
               if (localIsl) {
@@ -2821,38 +3352,43 @@ export class Arena3DRenderer {
                   e.clientX - proj.x,
                   e.clientY - proj.y
                 );
-                if (distToGhost <= 56) {
+                if (distToGhost <= 32) {
                   this.canGrabExistingGhost = true;
+                  // Pure 1:1 delta: aim = proj0 + (finger - finger0)
                   this.loupeGrabInitOffset = {
                     x: proj.x - e.clientX,
                     y: proj.y - e.clientY,
                   };
                   this.loupeCurrentOffset = { ...this.loupeGrabInitOffset };
+                  this.loupeLiftTargetY = this.loupeGrabInitOffset.y;
                 }
               }
             }
 
-            // 155ms stationary hold on island enters Loupe Ghost Drag
-            const holdStartX = e.clientX;
-            const holdStartY = e.clientY;
-            this.touchHoldTimer = setTimeout(() => {
-              this.touchHoldTimer = null;
-              if (
-                this.activeTouches.size !== 1 ||
-                this.touchGestureMoved ||
-                this.postPinchGuard ||
-                this._activeTool !== 'BLOCK'
-              ) {
-                return;
-              }
-              if (this.tryStartHoldLoupeDrag(holdStartX, holdStartY)) {
-                this.isLoupeDragging = true;
-                this.touchGestureMoved = true;
-                this.loupeHoldStartMs = performance.now();
-                this.loupeCurrentOffset = { x: 0, y: 0 };
-                this.updateLoupeDragAtScreen(holdStartX, holdStartY, true);
-              }
-            }, 155);
+            if (!this.canGrabExistingGhost) {
+              // 220ms stationary hold on island enters Loupe Ghost Drag (smooth viewport-clamped lift)
+              const holdStartX = e.clientX;
+              const holdStartY = e.clientY;
+              this.touchHoldTimer = setTimeout(() => {
+                this.touchHoldTimer = null;
+                if (
+                  this.activeTouches.size !== 1 ||
+                  this.touchGestureMoved ||
+                  this.postPinchGuard ||
+                  this._activeTool !== 'BLOCK'
+                ) {
+                  return;
+                }
+                if (this.tryStartHoldLoupeDrag(holdStartX, holdStartY)) {
+                  this.isLoupeDragging = true;
+                  this.touchGestureMoved = true;
+                  this.loupeHoldStartMs = performance.now();
+                  this.loupeCurrentOffset = { x: 0, y: 0 };
+                  this.loupeLiftTargetY = -Math.min(46, this.viewportH * 0.11);
+                  this.updateLoupeDragAtScreen(holdStartX, holdStartY, true);
+                }
+              }, 220);
+            }
           }
         } else if (this.activeTouches.size >= 2) {
           this.clearTouchHoldTimer();
@@ -2860,6 +3396,11 @@ export class Arena3DRenderer {
             this.isLoupeDragging = false;
             if (this.loupeSavedBeforeGesture) {
               this.pendingTouchCell = { ...this.loupeSavedBeforeGesture };
+              this.pendingTouchTowerId = null;
+              this.applyTouchSelectionVisuals();
+            } else if (this.loupeSavedTowerBeforeGesture) {
+              this.pendingTouchCell = null;
+              this.pendingTouchTowerId = this.loupeSavedTowerBeforeGesture;
               this.applyTouchSelectionVisuals();
             } else {
               this.cancelTouchGhost();
@@ -2903,6 +3444,7 @@ export class Arena3DRenderer {
         if (this.dismissTransientUI?.()) return;
         if (this.pendingTouchCell || this.pendingTouchTowerId) {
           this.cancelTouchGhost();
+          this.onDesktopMouseActive?.();
         }
 
         const isSpectatingOther =
@@ -2921,18 +3463,32 @@ export class Arena3DRenderer {
           if (e.shiftKey && this._activeTool === 'BLOCK') {
             this.isShiftPainting = true;
             this.lastPaintedCellKey = '';
-            if (this.hoveredCell && this.lastHoverValid) {
-              this.lastPaintedCellKey = `${this.hoveredCell.x},${this.hoveredCell.y}`;
+            this.lastPaintedCell = null;
+            this.paintedStrokeTowers = [];
+            if (this.hoveredCell && !this.hoveredExistingTower) {
+              // Fires for invalid cells too, so main.ts plays error + reason toast (0 walls, blocks path)
               this.onPlaceTower?.(this.hoveredCell.x, this.hoveredCell.y);
+              if (this.lastHoverValid) {
+                this.lastPaintedCellKey = `${this.hoveredCell.x},${this.hoveredCell.y}`;
+                this.lastPaintedCell = { ...this.hoveredCell };
+                this.recordStrokeTower(this.hoveredCell.x, this.hoveredCell.y);
+              }
             }
             return;
           }
 
-          // Sweep-remove when pressing directly on an existing wall in SELL mode
-          if (this._activeTool === 'SELL' && this.hoveredExistingTower) {
+          // Sweep-remove when pressing on an existing wall (or Shift + Left-Drag across grass) in SELL mode
+          if (
+            this._activeTool === 'SELL' &&
+            (this.hoveredExistingTower || e.shiftKey)
+          ) {
             this.isSweepSelling = true;
+            this.lastPaintedCell = null;
             const t = this.hoveredExistingTower;
-            this.onSellTower?.(t.id, t.x, t.y);
+            if (t) {
+              this.onSellTower?.(t.id, t.x, t.y);
+              this.sweptTowerIds.add(t.id);
+            }
             return;
           }
         }
@@ -3017,8 +3573,8 @@ export class Arena3DRenderer {
             return;
           }
 
-          // Grabbed active ghost (<= 56px) -> smooth -54px Loupe Ghost Drag!
-          if (!this.isLoupeDragging && this.canGrabExistingGhost && totalDist > 7) {
+          // Grabbed active ghost (<= 32px) -> pure 1:1 Loupe Ghost Drag (zero forced lift / veer)
+          if (!this.isLoupeDragging && this.canGrabExistingGhost && totalDist > 6) {
             this.clearTouchHoldTimer();
             this.isLoupeDragging = true;
             this.touchGestureMoved = true;
@@ -3026,18 +3582,12 @@ export class Arena3DRenderer {
 
           if (this.isLoupeDragging) {
             if (this.canGrabExistingGhost) {
-              const ramp = Math.min(1, totalDist / 36);
-              const targetY = Math.min(this.loupeGrabInitOffset.y, -54);
-              this.loupeCurrentOffset.x =
-                this.loupeGrabInitOffset.x * (1 - ramp);
-              this.loupeCurrentOffset.y =
-                this.loupeGrabInitOffset.y +
-                (targetY - this.loupeGrabInitOffset.y) * ramp;
+              // aim = proj0 + (finger - finger0) == finger + (proj0 - finger0)
+              this.loupeCurrentOffset.x = this.loupeGrabInitOffset.x;
+              this.loupeCurrentOffset.y = this.loupeGrabInitOffset.y;
             } else {
-              const elapsedMs = performance.now() - this.loupeHoldStartMs;
-              const ramp = Math.min(1, elapsedMs / 110);
+              // Hold-lift is animated smoothly in renderFrame toward `loupeLiftTargetY`
               this.loupeCurrentOffset.x = 0;
-              this.loupeCurrentOffset.y = -54 * ramp;
             }
             this.updateLoupeDragAtScreen(tracked.x, tracked.y, false);
             return;
@@ -3061,15 +3611,21 @@ export class Arena3DRenderer {
       this.lastPointerScreen = { x: e.clientX, y: e.clientY };
       this.screenToNDC(e.clientX, e.clientY, this.mouseNDC);
 
+      // Hybrid touch -> mouse handoff: never leave a frozen touch ghost under a live mouse
+      if (
+        e.pointerType === 'mouse' &&
+        (this.pendingTouchCell || this.pendingTouchTowerId)
+      ) {
+        this.cancelTouchGhost();
+        this.onDesktopMouseActive?.();
+      }
+
       if (this.isMiddleOrAltDragging) {
+        // Middle-Drag & Alt + Left-Drag both orbit
         const dx = e.clientX - this.dragStart.x;
-        const dy = e.clientY - this.dragStart.y;
         this.dragStart = { x: e.clientX, y: e.clientY };
-        if (e.buttons === 4) {
-          this.camGoalAzimuth -= dx * 0.006;
-        } else {
-          this.panCameraByScreenDelta(dx, dy);
-        }
+        this.camGoalAzimuth -= dx * 0.006;
+        this.setCanvasCursor('grabbing');
         return;
       }
 
@@ -3086,33 +3642,22 @@ export class Arena3DRenderer {
           const dx = e.clientX - this.dragStart.x;
           const dy = e.clientY - this.dragStart.y;
           this.dragStart = { x: e.clientX, y: e.clientY };
-          if (e.shiftKey) {
-            this.camGoalAzimuth -= dx * 0.006;
-          } else {
-            this.panCameraByScreenDelta(dx, dy);
-          }
+          // Right-Drag is dedicated to smooth pan (no surprise Shift + Right-Drag orbit)
+          this.panCameraByScreenDelta(dx, dy);
+          this.setCanvasCursor('grabbing');
           return;
         }
       }
 
       if (this.isShiftPainting) {
         this.updateBuildHover();
-        if (this.hoveredCell && this.lastHoverValid) {
-          const key = `${this.hoveredCell.x},${this.hoveredCell.y}`;
-          if (key !== this.lastPaintedCellKey) {
-            this.lastPaintedCellKey = key;
-            this.onPlaceTower?.(this.hoveredCell.x, this.hoveredCell.y);
-          }
-        }
+        this.paintInterpolatedStroke();
         return;
       }
 
       if (this.isSweepSelling) {
         this.updateBuildHover();
-        if (this.hoveredExistingTower) {
-          const t = this.hoveredExistingTower;
-          this.onSellTower?.(t.id, t.x, t.y);
-        }
+        this.sweepSellInterpolated();
         return;
       }
 
@@ -3131,6 +3676,7 @@ export class Arena3DRenderer {
           const dy = e.clientY - this.dragStart.y;
           this.dragStart = { x: e.clientX, y: e.clientY };
           this.panCameraByScreenDelta(dx, dy);
+          this.setCanvasCursor('grabbing');
           return;
         }
       }
@@ -3138,6 +3684,7 @@ export class Arena3DRenderer {
       if (!this.pendingTouchCell && !this.pendingTouchTowerId) {
         this.updateBuildHover();
       }
+      this.refreshCanvasCursor(e.clientX, e.clientY);
     });
 
     // ------------------------------------------------------------------------
@@ -3179,6 +3726,8 @@ export class Arena3DRenderer {
           this.canGrabExistingGhost = false;
           this.touchGestureMoved = false;
           this.postPinchGuard = false;
+          this.lastTouchAimMs = performance.now();
+          this.cachedHoverPreview = null;
           this.applyTouchSelectionVisuals();
           return;
         }
@@ -3206,8 +3755,17 @@ export class Arena3DRenderer {
 
       // Desktop mouse up
       this.isMiddleOrAltDragging = false;
+      const wasShiftPainting = this.isShiftPainting;
+      const wasSweepSelling = this.isSweepSelling;
       this.isShiftPainting = false;
       this.isSweepSelling = false;
+      this.lastPaintedCell = null;
+      this.paintedStrokeTowers = [];
+      this.sweptTowerIds.clear();
+      if (wasShiftPainting || wasSweepSelling) {
+        this.cachedHoverPreview = null;
+        this.updateBuildHover(true);
+      }
 
       if (this.isRightMouseDown) {
         const wasCleanRightClick =
@@ -3285,14 +3843,17 @@ export class Arena3DRenderer {
             } else if (
               this._activeTool === 'BLOCK' &&
               this.hoveredCell &&
-              this.lastHoverValid &&
-              !this.hoveredExistingTower
+              !this.hoveredExistingTower &&
+              !this.lastHoverInspected
             ) {
+              // Fires for BOTH valid and invalid cells so main.ts plays error + reason toast
               this.onPlaceTower?.(this.hoveredCell.x, this.hoveredCell.y);
+              if (this.lastHoverValid) this.lastPaintedCell = null;
             }
           }
         }
       }
+      this.refreshCanvasCursor(e.clientX, e.clientY);
     };
 
     window.addEventListener('pointerup', handlePointerEnd);
@@ -3301,6 +3862,7 @@ export class Arena3DRenderer {
     dom.addEventListener('pointerleave', (e) => {
       if (e.pointerType === 'touch') return;
       this.mouseNDC.set(-99, -99);
+      this.setCanvasCursor('default');
       if (!this.pendingTouchCell && !this.pendingTouchTowerId) {
         this.hideDesktopHoverVisuals();
       }
@@ -3311,13 +3873,190 @@ export class Arena3DRenderer {
       (e) => {
         if (this._modalOpen) return;
         e.preventDefault();
-        this.camGoalRadius = this.clampCameraRadius(
-          this.camGoalRadius + e.deltaY * 0.028
-        );
+        // Normalize Firefox line/page deltaMode, then zoom toward the cursor's ground point
+        const pxDelta =
+          e.deltaMode === 1
+            ? e.deltaY * 36
+            : e.deltaMode === 2
+            ? e.deltaY * 360
+            : e.deltaY;
+        const clampedDelta = Math.max(-180, Math.min(180, pxDelta));
+        const oldR = this.camGoalRadius;
+        const newR = this.clampCameraRadius(oldR + clampedDelta * 0.03);
+        const ratio = newR / Math.max(1, oldR);
+        this.camGoalRadius = newR;
         this.updateZoomCoupledPolar();
+
+        this.lastPointerScreen = { x: e.clientX, y: e.clientY };
+        this.screenToNDC(e.clientX, e.clientY, this.mouseNDC);
+        if (ratio < 1 && this.mouseNDC.x > -9) {
+          this.camera.updateMatrixWorld();
+          this.raycaster.setFromCamera(this.mouseNDC, this.camera);
+          if (this.raycaster.ray.intersectPlane(this.groundPlane, this._tmpPinch)) {
+            this.camGoalTarget.x +=
+              (this._tmpPinch.x - this.camGoalTarget.x) * (1 - ratio);
+            this.camGoalTarget.z +=
+              (this._tmpPinch.z - this.camGoalTarget.z) * (1 - ratio);
+            this.clampCameraTarget();
+          }
+        }
+        if (!this.pendingTouchCell && !this.pendingTouchTowerId) {
+          this.updateBuildHover();
+        }
       },
       { passive: false }
     );
+  }
+
+  // ==========================================================================
+  // DESKTOP CURSOR, SHIFT-PAINT INTERPOLATION & SELL SWEEP
+  // ==========================================================================
+
+  private setCanvasCursor(cursor: string) {
+    if (cursor === this.currentCanvasCursor) return;
+    this.currentCanvasCursor = cursor;
+    this.renderer.domElement.style.cursor = cursor;
+  }
+
+  private refreshCanvasCursor(clientX: number, clientY: number) {
+    if (this._modalOpen) {
+      this.setCanvasCursor('default');
+      return;
+    }
+    if (
+      this.leftMousePanned ||
+      this.rightMousePanned ||
+      this.isMiddleOrAltDragging
+    ) {
+      this.setCanvasCursor('grabbing');
+      return;
+    }
+    if (this._activeTool === 'PAN') {
+      this.setCanvasCursor('grab');
+      return;
+    }
+    if (this.arenaOverviewMode) {
+      this.setCanvasCursor(
+        this.raycastAnyIsland(clientX, clientY) ? 'pointer' : 'default'
+      );
+      return;
+    }
+    if (this.hoveredExistingTower) {
+      this.setCanvasCursor('pointer');
+      return;
+    }
+    if (this.lastHoverInspected) {
+      this.setCanvasCursor('help');
+      return;
+    }
+    if (this.currentRoomState?.phase === 'BUILD' && this.hoveredCell) {
+      if (this._activeTool === 'SELL') {
+        this.setCanvasCursor('crosshair');
+      } else {
+        this.setCanvasCursor(this.lastHoverValid ? 'pointer' : 'not-allowed');
+      }
+      return;
+    }
+    this.setCanvasCursor('default');
+  }
+
+  private recordStrokeTower(x: number, y: number) {
+    this.paintedStrokeTowers.push({
+      id: `stroke_${this.paintedStrokeTowers.length}`,
+      type: 'BLOCK',
+      x,
+      y,
+      createdAt: Date.now(),
+    });
+  }
+
+  /**
+   * Axis-clean `Shift + Left-Drag` line paint: steps from `lastPaintedCell` toward the hovered
+   * cell in `2`-cell increments along the dominant axis so fast swipes leave zero gaps.
+   */
+  private paintInterpolatedStroke() {
+    if (!this.hoveredCell || !this.currentRoomState || !this.localPlayerId) return;
+    const localPlayer = this.currentRoomState.players.find(
+      (p) => p.id === this.localPlayerId
+    );
+    if (!localPlayer) return;
+    const round = this.currentRoomState.roundConfig;
+    const target = this.hoveredCell;
+
+    if (!this.lastPaintedCell) {
+      if (this.lastHoverValid && !this.hoveredExistingTower) {
+        this.onPlaceTower?.(target.x, target.y);
+        this.lastPaintedCell = { ...target };
+        this.lastPaintedCellKey = `${target.x},${target.y}`;
+        this.recordStrokeTower(target.x, target.y);
+      }
+      return;
+    }
+
+    let cx = this.lastPaintedCell.x;
+    let cy = this.lastPaintedCell.y;
+    let guard = 0;
+    while (guard++ < 24) {
+      const dx = target.x - cx;
+      const dy = target.y - cy;
+      if (Math.abs(dx) < 2 && Math.abs(dy) < 2) break;
+      if (Math.abs(dx) >= Math.abs(dy)) {
+        cx += Math.sign(dx) * 2;
+      } else {
+        cy += Math.sign(dy) * 2;
+      }
+      if (cx < 0 || cy < 0 || cx > round.gridWidth - 2 || cy > round.gridHeight - 2) {
+        break;
+      }
+      const goldLeft =
+        localPlayer.gold - this.paintedStrokeTowers.length * TOWER_SPECS.BLOCK.goldCost;
+      if (goldLeft < TOWER_SPECS.BLOCK.goldCost) break;
+      const towers = localPlayer.towers.concat(
+        this.paintedStrokeTowers.filter(
+          (st) => !localPlayer.towers.some((t) => t.x === st.x && t.y === st.y)
+        )
+      );
+      const val = validateTowerPlacement(round, towers, cx, cy);
+      if (val.valid) {
+        this.onPlaceTower?.(cx, cy);
+        this.recordStrokeTower(cx, cy);
+        this.lastBuildVector = {
+          dx: Math.sign(cx - this.lastPaintedCell.x),
+          dy: Math.sign(cy - this.lastPaintedCell.y),
+        };
+      }
+      this.lastPaintedCell = { x: cx, y: cy };
+      this.lastPaintedCellKey = `${cx},${cy}`;
+    }
+  }
+
+  /** Grass-tolerant `SELL` sweep: removes every wall crossed between pointer samples. */
+  private sweepSellInterpolated() {
+    if (!this.currentRoomState || !this.localPlayerId) return;
+    const localPlayer = this.currentRoomState.players.find(
+      (p) => p.id === this.localPlayerId
+    );
+    if (!localPlayer) return;
+    const sellOne = (t: PlacedTower) => {
+      if (this.sweptTowerIds.has(t.id)) return;
+      this.sweptTowerIds.add(t.id);
+      this.onSellTower?.(t.id, t.x, t.y);
+    };
+    if (this.hoveredExistingTower) sellOne(this.hoveredExistingTower);
+
+    const cell = this.hoveredCell;
+    if (!cell) return;
+    const prev = this.lastPaintedCell;
+    this.lastPaintedCell = { ...cell };
+    if (!prev) return;
+    const steps = Math.max(Math.abs(cell.x - prev.x), Math.abs(cell.y - prev.y));
+    for (let i = 1; i <= steps; i++) {
+      const sx = Math.round(prev.x + ((cell.x - prev.x) * i) / steps) + 1;
+      const sy = Math.round(prev.y + ((cell.y - prev.y) * i) / steps) + 1;
+      for (const t of localPlayer.towers) {
+        if (isCellIn2x2(sx, sy, t)) sellOne(t);
+      }
+    }
   }
 
   private clearTouchHoldTimer() {
@@ -3392,12 +4131,13 @@ export class Arena3DRenderer {
     const hit = this.intersectClampedBuildPlane(localIsland, round, 2.2);
     if (!hit) return;
 
+    // Raw unclamped hit + `searchSpanOverride: 0` -> 1×1 glide (zero 2.83m diagonal vaults)
     const smart = resolveSmart2x2Placement(
       round,
       localPlayer.towers,
-      hit.relX,
-      hit.relZ,
-      { mode: 'touch', availableGold: localPlayer.gold }
+      hit.rawRelX,
+      hit.rawRelZ,
+      { mode: 'touch', availableGold: localPlayer.gold, searchSpanOverride: 0 }
     );
 
     const cellChanged =
@@ -3407,9 +4147,11 @@ export class Arena3DRenderer {
 
     this.pendingTouchTowerId = null;
     this.pendingTouchCell = { x: smart.x, y: smart.y };
+    this.lastTouchAimMs = performance.now();
 
     if (cellChanged || forceEmit) {
       if (cellChanged) {
+        this.cachedHoverPreview = null;
         this.onTouchSnapChange?.({ x: smart.x, y: smart.y }, smart.valid);
       }
       this.applyTouchSelectionVisuals(false, smart.snapped);
@@ -3431,7 +4173,8 @@ export class Arena3DRenderer {
       !this.currentRoomState ||
       this.currentRoomState.phase !== 'BUILD' ||
       !this.localPlayerId ||
-      this.arenaOverviewMode
+      this.arenaOverviewMode ||
+      this._activeTool !== 'BLOCK' // SELL/PAN: nudges must never mutate into wall placement
     ) {
       return false;
     }
@@ -3442,34 +4185,76 @@ export class Arena3DRenderer {
 
     const round = this.currentRoomState.roundConfig;
     let baseCell = this.pendingTouchCell;
+    let stepMult = 1;
     if (!baseCell && this.pendingTouchTowerId) {
       const existing = localPlayer.towers.find(
         (t) => t.id === this.pendingTouchTowerId
       );
-      if (existing) baseCell = { x: existing.x, y: existing.y };
+      if (existing) {
+        baseCell = { x: existing.x, y: existing.y };
+        stepMult = 2; // step flush off the selected wall (never half-overlap it)
+      }
     }
     if (!baseCell) return false;
 
-    const nx = Math.max(0, Math.min(round.gridWidth - 2, baseCell.x + dx));
-    const ny = Math.max(0, Math.min(round.gridHeight - 2, baseCell.y + dy));
-    if (
-      this.pendingTouchCell &&
-      nx === this.pendingTouchCell.x &&
-      ny === this.pendingTouchCell.y
-    ) {
+    const nx = Math.max(0, Math.min(round.gridWidth - 2, baseCell.x + dx * stepMult));
+    const ny = Math.max(0, Math.min(round.gridHeight - 2, baseCell.y + dy * stepMult));
+    if (nx === baseCell.x && ny === baseCell.y) {
       return false;
     }
+    if (dx !== 0 || dy !== 0) {
+      this.lastBuildVector = { dx: Math.sign(dx), dy: Math.sign(dy) };
+    }
 
-    this.pendingTouchTowerId = null;
-    this.pendingTouchCell = { x: nx, y: ny };
+    // Nudging exactly onto an existing wall selects it for Remove (zero Z-fighting ghost)
+    const onWall = localPlayer.towers.find((t) => t.x === nx && t.y === ny);
+    this.cachedHoverPreview = null;
+    if (onWall) {
+      this.pendingTouchCell = null;
+      this.pendingTouchTowerId = onWall.id;
+    } else {
+      this.pendingTouchTowerId = null;
+      this.pendingTouchCell = { x: nx, y: ny };
+    }
+    this.lastTouchAimMs = performance.now();
     this.applyTouchSelectionVisuals(true, false);
+    this.softPanToPendingGhost();
 
     const valid = this.activeTouchHoverInfo?.valid ?? false;
     this.onTouchSnapChange?.({ x: nx, y: ny }, valid);
     return true;
   }
 
-  public confirmTouchGhost(): boolean {
+  /** Soft-pans `camGoalTarget` when a nudged ghost projects behind the HUD/tray aperture. */
+  private softPanToPendingGhost() {
+    if (!this.localPlayerId) return;
+    const island = this.islands.get(this.localPlayerId);
+    const localPlayer = this.currentRoomState?.players.find(
+      (p) => p.id === this.localPlayerId
+    );
+    if (!island || !localPlayer) return;
+    let cell = this.pendingTouchCell;
+    if (!cell && this.pendingTouchTowerId) {
+      const t = localPlayer.towers.find((tw) => tw.id === this.pendingTouchTowerId);
+      if (t) cell = { x: t.x, y: t.y };
+    }
+    if (!cell) return;
+    this._tmpWorld.set(island.offsetX + cell.x + 1, 0.3, island.offsetZ + cell.y + 1);
+    const proj = this.projectWorldToScreen(this._tmpWorld);
+    const topLimit = this.hudSafeTopPx + 24;
+    const botLimit = this.viewportH - this.hudSafeBottomLivePx - 24;
+    let dyPx = 0;
+    if (proj.y < topLimit) dyPx = topLimit - proj.y;
+    else if (proj.y > botLimit) dyPx = botLimit - proj.y;
+    let dxPx = 0;
+    if (proj.x < 24) dxPx = 24 - proj.x;
+    else if (proj.x > this.viewportW - 24) dxPx = this.viewportW - 24 - proj.x;
+    if (dxPx !== 0 || dyPx !== 0) {
+      this.panCameraByScreenDelta(dxPx, dyPx);
+    }
+  }
+
+  public confirmTouchGhost(options?: { chainAdvance?: boolean }): boolean {
     if (
       !this.currentRoomState ||
       this.currentRoomState.phase !== 'BUILD' ||
@@ -3495,20 +4280,49 @@ export class Arena3DRenderer {
       return false;
     }
 
-    if (this.pendingTouchCell) {
+    // SELL mode can NEVER place walls
+    if (this.pendingTouchCell && this._activeTool === 'BLOCK') {
       const { x, y } = this.pendingTouchCell;
-      const hasGold = localPlayer.gold >= TOWER_SPECS.BLOCK.goldCost;
-      const val = validateTowerPlacement(
-        this.currentRoomState.roundConfig,
-        localPlayer.towers,
-        x,
-        y
-      );
+      const round = this.currentRoomState.roundConfig;
+      const goldCost = TOWER_SPECS.BLOCK.goldCost;
+      const hasGold = localPlayer.gold >= goldCost;
+      const val = validateTowerPlacement(round, localPlayer.towers, x, y);
       if (!hasGold || !val.valid) {
         return false;
       }
+
+      // `+2` chain-advance along the last build/nudge vector (keeps tray open for fast switchbacks)
+      let nextCell: GridPoint | null = null;
+      if (options?.chainAdvance && localPlayer.gold - goldCost >= goldCost) {
+        const v = this.lastBuildVector;
+        const nx = x + v.dx * 2;
+        const ny = y + v.dy * 2;
+        if (
+          (v.dx !== 0 || v.dy !== 0) &&
+          nx >= 0 &&
+          ny >= 0 &&
+          nx <= round.gridWidth - 2 &&
+          ny <= round.gridHeight - 2
+        ) {
+          const hypothetical: PlacedTower[] = localPlayer.towers.concat([
+            { id: '__chain_tmp', type: 'BLOCK', x, y, createdAt: Date.now() },
+          ]);
+          if (validateTowerPlacement(round, hypothetical, nx, ny).valid) {
+            nextCell = { x: nx, y: ny };
+          }
+        }
+      }
+
       this.cancelTouchGhost();
       this.onPlaceTower?.(x, y);
+      if (nextCell) {
+        this.pendingTouchCell = nextCell;
+        this.pendingTouchTowerId = null;
+        this.lastTouchAimMs = performance.now();
+        this.cachedHoverPreview = null;
+        this.applyTouchSelectionVisuals(true, false);
+        this.softPanToPendingGhost();
+      }
       return true;
     }
 
@@ -3525,6 +4339,7 @@ export class Arena3DRenderer {
     this.hoveredCell = null;
     this.hoveredExistingTower = null;
     this.lastHoverValid = false;
+    this.lastHoverInspected = null;
     this.cachedHoverPreview = null;
 
     this.ghostGroup.visible = false;
@@ -3573,17 +4388,63 @@ export class Arena3DRenderer {
       return;
     }
 
+    if (!this.currentRoomState) {
+      this.cancelTouchGhost();
+      return;
+    }
+
+    this.lastPointerScreen = { x: clientX, y: clientY };
+    const ndc = new THREE.Vector2();
+    this.screenToNDC(clientX, clientY, ndc);
+    this.camera.updateMatrixWorld();
+    this.raycaster.setFromCamera(ndc, this.camera);
+
+    const focusPid = this.focusedPlayerId || this.localPlayerId;
+    const focusedIsland = focusPid ? this.islands.get(focusPid) : undefined;
+    const focusedPlayer = focusPid
+      ? this.currentRoomState.players.find((p) => p.id === focusPid)
+      : undefined;
+    const round = this.currentRoomState.roundConfig;
+
     const isSpectatingOther =
       this.focusedPlayerId !== null &&
       this.focusedPlayerId !== this.localPlayerId;
 
+    // Non-build phases (`RUN`, `ROUND_RESULTS`) or rival spectating -> touch tap-inspect!
     if (
-      !this.currentRoomState ||
       this.currentRoomState.phase !== 'BUILD' ||
       !this.localPlayerId ||
       isSpectatingOther
     ) {
       this.cancelTouchGhost();
+      if (focusedIsland && focusedPlayer) {
+        const hit = this.intersectClampedBuildPlane(focusedIsland, round, 1.8);
+        if (hit) {
+          const inspected = this.detectInspectedWorldFeature(
+            focusedIsland,
+            focusedPlayer,
+            round,
+            hit.rawRelX,
+            hit.rawRelZ
+          );
+          focusedIsland.spireRigs.forEach((sr, idx) => {
+            sr.targetHoverBoost =
+              inspected?.kind === 'SPIRE' && inspected.spireIndex === idx
+                ? 1.0
+                : 0.0;
+          });
+          if (inspected) {
+            this.onHoverStatusChange?.({
+              cell: null,
+              screenX: clientX,
+              screenY: clientY,
+              valid: false,
+              inspectedFeature: inspected,
+              isTouchInspect: true,
+            });
+          }
+        }
+      }
       return;
     }
 
@@ -3596,17 +4457,9 @@ export class Arena3DRenderer {
       return;
     }
 
-    this.lastPointerScreen = { x: clientX, y: clientY };
-    const ndc = new THREE.Vector2();
-    this.screenToNDC(clientX, clientY, ndc);
-    this.camera.updateMatrixWorld();
-    this.raycaster.setFromCamera(ndc, this.camera);
-
-    // 1. 3D Mesh-First Raycast against existing Stone Walls (zero cap parallax miss!)
+    // 1. Analytical 3D Box3 raycast against existing Stone Walls (zero cap parallax miss!)
     let existing = this.raycastExistingWallMesh(localIsland, localPlayer);
-
-    const round = this.currentRoomState.roundConfig;
-    const planeHit = this.intersectClampedBuildPlane(localIsland, round, 1.5);
+    const planeHit = this.intersectClampedBuildPlane(localIsland, round, 1.6);
 
     if (!existing && planeHit) {
       const cx = Math.floor(planeHit.relX);
@@ -3617,8 +4470,16 @@ export class Arena3DRenderer {
 
     if (this._activeTool === 'SELL') {
       if (existing) {
+        if (
+          this.pendingTouchTowerId === existing.id &&
+          performance.now() - this.lastTouchAimMs >= 180
+        ) {
+          this.confirmTouchGhost();
+          return;
+        }
         this.pendingTouchCell = null;
         this.pendingTouchTowerId = existing.id;
+        this.lastTouchAimMs = performance.now();
         this.applyTouchSelectionVisuals();
       } else {
         this.cancelTouchGhost();
@@ -3630,6 +4491,7 @@ export class Arena3DRenderer {
     if (existing) {
       this.pendingTouchCell = null;
       this.pendingTouchTowerId = existing.id;
+      this.lastTouchAimMs = performance.now();
       this.applyTouchSelectionVisuals();
       return;
     }
@@ -3639,22 +4501,105 @@ export class Arena3DRenderer {
       return;
     }
 
-    // Smart 2x2 Obstacle-Aware Flush Snap (eliminates 0.5m 'Occupied' dead-moat!)
+    // 2. Direct tap on Spire / Keep / Gate / Runner interior in BUILD -> open touch inspect card!
+    const inspected = this.detectInspectedWorldFeature(
+      localIsland,
+      localPlayer,
+      round,
+      planeHit.rawRelX,
+      planeHit.rawRelZ
+    );
+    if (inspected) {
+      // Allow flush-adjacent moat taps to build; only center taps (`<= 0.92m` from center) inspect
+      let isDirectCenterTap = true;
+      if (inspected.kind === 'SPIRE' || inspected.kind === 'KEEP') {
+        const dCenter = Math.hypot(
+          planeHit.rawRelX - (inspected.x + 1.0),
+          planeHit.rawRelZ - (inspected.y + 1.0)
+        );
+        isDirectCenterTap = dCenter <= 0.92;
+      }
+      if (isDirectCenterTap) {
+        this.cancelTouchGhost();
+        localIsland.spireRigs.forEach((sr, idx) => {
+          sr.targetHoverBoost =
+            inspected.kind === 'SPIRE' && inspected.spireIndex === idx
+              ? 1.0
+              : 0.0;
+        });
+        this.onHoverStatusChange?.({
+          cell: null,
+          screenX: clientX,
+          screenY: clientY,
+          valid: false,
+          inspectedFeature: inspected,
+          isTouchInspect: true,
+        });
+        return;
+      }
+    }
+
+    // 3. Re-tapping inside an already-active valid `2x2` ghost (`>= 180ms` after aim) confirms!
+    if (
+      this.pendingTouchCell &&
+      this.lastHoverValid &&
+      performance.now() - this.lastTouchAimMs >= 180
+    ) {
+      const gx = this.pendingTouchCell.x;
+      const gy = this.pendingTouchCell.y;
+      if (
+        planeHit.rawRelX >= gx - 0.15 &&
+        planeHit.rawRelX <= gx + 2.15 &&
+        planeHit.rawRelZ >= gy - 0.15 &&
+        planeHit.rawRelZ <= gy + 2.15
+      ) {
+        this.confirmTouchGhost();
+        return;
+      }
+    }
+
+    // 4. Smart 2x2 Obstacle-Aware Flush Snap (raw unclamped coords)
     const smart = resolveSmart2x2Placement(
       round,
       localPlayer.towers,
-      planeHit.relX,
-      planeHit.relZ,
+      planeHit.rawRelX,
+      planeHit.rawRelZ,
       { mode: 'touch', availableGold: localPlayer.gold }
     );
+
+    // Also confirm if smart-snap resolved back onto the same valid pendingTouchCell >= 180ms after aim
+    if (
+      this.pendingTouchCell &&
+      this.lastHoverValid &&
+      smart.valid &&
+      smart.x === this.pendingTouchCell.x &&
+      smart.y === this.pendingTouchCell.y &&
+      performance.now() - this.lastTouchAimMs >= 180
+    ) {
+      this.confirmTouchGhost();
+      return;
+    }
 
     const changed =
       !this.pendingTouchCell ||
       this.pendingTouchCell.x !== smart.x ||
       this.pendingTouchCell.y !== smart.y;
 
+    if (this.pendingTouchCell && changed) {
+      const dx = smart.x - this.pendingTouchCell.x;
+      const dy = smart.y - this.pendingTouchCell.y;
+      if (Math.abs(dx) + Math.abs(dy) <= 4 && (dx !== 0 || dy !== 0)) {
+        this.lastBuildVector = {
+          dx: Math.abs(dx) >= Math.abs(dy) ? Math.sign(dx) : 0,
+          dy: Math.abs(dy) > Math.abs(dx) ? Math.sign(dy) : 0,
+        };
+      }
+    }
+
+    this.cachedHoverPreview = null;
     this.pendingTouchTowerId = null;
     this.pendingTouchCell = { x: smart.x, y: smart.y };
+    this.lastTouchAimMs = performance.now();
     this.applyTouchSelectionVisuals(false, smart.snapped);
 
     if (changed) {
@@ -3686,7 +4631,7 @@ export class Arena3DRenderer {
       proj.x < 12 ||
       proj.x > this.viewportW - 12 ||
       proj.y < this.hudSafeTopPx + 8 ||
-      proj.y > this.viewportH - this.hudSafeBottomPx - 8
+      proj.y > this.viewportH - this.hudSafeBottomLivePx - 8
     );
   }
 
@@ -3719,7 +4664,13 @@ export class Arena3DRenderer {
         return;
       }
 
-      this.showRemoveBracketVisuals(localIsland, existing.x, existing.y);
+      this.cachedHoverPreview = null;
+      const removal = this.showRemoveBracketVisuals(
+        localIsland,
+        existing.x,
+        existing.y,
+        existing
+      );
 
       this.touchWorldAnchor.set(
         localIsland.offsetX + existing.x + 1.0,
@@ -3742,6 +4693,10 @@ export class Arena3DRenderer {
         valid: true,
         reason: 'Remove (+1)',
         existingTower: existing,
+        deltaTime: removal?.deltaTime,
+        deltaOvercharge: removal?.deltaOvercharge,
+        deltaKeeps: removal?.deltaKeeps,
+        previewTime: removal?.previewTime,
         isTouchPreview: true,
         isLoupeDragging: this.isLoupeDragging,
         isGestureMoving,
@@ -3816,7 +4771,31 @@ export class Arena3DRenderer {
       .map((s) => `${s.x},${s.y},${s.spireType || 'THUNDERCLAP'}`)
       .join(';');
     const oStr = round.obstacles.map((o) => `${o.x},${o.y}`).join(';');
-    return `${round.roundNumber}|${round.seed ?? 0}|${round.spawn.x},${round.spawn.y}|${round.exit.x},${round.exit.y}|${round.runnerType || 'SCOUT'}|${sStr}|${oStr}`;
+    const cpStr = (round.checkpoints || []).map((c) => `${c.x},${c.y}`).join(';');
+    const wgStr = round.waygate
+      ? `${round.waygate.entry.x},${round.waygate.entry.y}>${round.waygate.exit.x},${round.waygate.exit.y}`
+      : '';
+    return `${round.roundNumber}|${round.seed ?? 0}|${round.spawn.x},${round.spawn.y}|${round.exit.x},${round.exit.y}|${round.runnerType || 'SCOUT'}|${sStr}|${oStr}|cp:${cpStr}|wg:${wgStr}`;
+  }
+
+  /** Re-lays out island offsets when the Overview column count flips (portrait <-> landscape). */
+  private relayoutIslandOffsets() {
+    if (!this.currentRoomState) return;
+    const cols = this.getOverviewCols(
+      Math.max(1, this.currentRoomState.players.length)
+    );
+    if (cols !== this.lastOverviewCols) {
+      this.syncRoomState(this.currentRoomState, this.localPlayerId);
+    }
+  }
+
+  private updateIslandWorldBounds(island: IslandVisuals, round: RoundConfig) {
+    island.worldBounds.min.set(island.offsetX - 3, -2, island.offsetZ - 3);
+    island.worldBounds.max.set(
+      island.offsetX + round.gridWidth + 3,
+      4,
+      island.offsetZ + round.gridHeight + 3
+    );
   }
 
   public syncRoomState(state: RoomState, localPlayerId: string | null): void {
@@ -3835,28 +4814,38 @@ export class Arena3DRenderer {
       this.latestSimStates.clear();
     }
 
-    // Center sea around active multi-island grid
+    // Center sea around active multi-island grid (portrait = 2 cols × 3 rows)
     const count = Math.max(1, state.players.length);
-    const cols = Math.min(3, count);
-    const rows = Math.ceil(count / 3);
+    const cols = this.getOverviewCols(count);
+    const rows = Math.ceil(count / cols);
     const arenaCenterX =
       ((cols - 1) * ISLAND_SPACING_X + state.roundConfig.gridWidth) * 0.5;
     const arenaCenterZ =
       ((rows - 1) * ISLAND_SPACING_Z + state.roundConfig.gridHeight) * 0.5;
     this.seaMesh.position.set(arenaCenterX, SEA_LEVEL_Y, arenaCenterZ);
     this.voidSeaMat.uniforms.uArenaCenter.value.set(arenaCenterX, arenaCenterZ);
+    this.lastOverviewCols = cols;
 
     // Dispose & remove disconnected islands cleanly (zero VRAM leaks!)
     const activeIds = new Set(state.players.map((p) => p.id));
     for (const [pid, isl] of this.islands.entries()) {
       if (!activeIds.has(pid)) {
+        isl.root.traverse((o) => {
+          if ((o as THREE.InstancedMesh).isInstancedMesh) {
+            (o as THREE.InstancedMesh).dispose();
+          }
+        });
         this.disposeSubtree(isl.root);
+        isl.pathMat.dispose();
+        isl.conduitMat.dispose();
         this.scene.remove(isl.root);
         this.islands.delete(pid);
         this.islandBadges.get(pid)?.root.remove();
         this.islandBadges.delete(pid);
         this.runnerBadges.get(pid)?.root.remove();
         this.runnerBadges.delete(pid);
+        this.piercedHitRemaining.delete(pid);
+        this.lastBurstSpireType.delete(pid);
       }
     }
 
@@ -3890,8 +4879,8 @@ export class Arena3DRenderer {
     }
 
     state.players.forEach((player, index) => {
-      const col = index % 3;
-      const row = Math.floor(index / 3);
+      const col = index % cols;
+      const row = Math.floor(index / cols);
       const offsetX = col * ISLAND_SPACING_X;
       const offsetZ = row * ISLAND_SPACING_Z;
 
@@ -3912,12 +4901,17 @@ export class Arena3DRenderer {
         if (island.playerColor !== player.color) {
           island.playerColor = player.color;
           island.trimMesh.material = this.getPlayerTrimMaterial(player.color);
+          island.wallLayers.emblem.mesh.material = this.getPlayerMedallionMaterial(
+            player.color
+          );
+          island.wallLayers.emblem.mat = island.wallLayers.emblem.mesh.material;
         }
         if (layoutChanged) {
           this.rebuildIslandPadsAndObstacles(island, state.roundConfig);
           island.lastTowersSig = '__force__';
         }
       }
+      this.updateIslandWorldBounds(island, state.roundConfig);
 
       this.syncIslandTowersAndPath(
         island,
@@ -3930,12 +4924,21 @@ export class Arena3DRenderer {
 
     if (firstSync && localPlayerId) {
       this.focusOnPlayerIsland(localPlayerId, true);
+    } else if (layoutChanged && localPlayerId && !this.arenaOverviewMode) {
+      // New round: reframe cleanly instead of leaving players zoomed into last round's corner
+      this.buildInsetLocked = false;
+      const pid =
+        this.focusedPlayerId && this.islands.has(this.focusedPlayerId)
+          ? this.focusedPlayerId
+          : localPlayerId;
+      this.focusOnPlayerIsland(pid);
     } else if (
       prevPhase &&
       prevPhase !== state.phase &&
       !this.arenaOverviewMode
     ) {
-      // Gently adjust HUD aperture zBias when bottom build dock hides/shows on BUILD <-> RUN
+      this.buildInsetLocked = false;
+      // Gently adjust HUD aperture zBias (and radius when un-zoomed) on BUILD <-> RUN
       const pid = this.focusedPlayerId || this.localPlayerId;
       const isl = pid ? this.islands.get(pid) : undefined;
       if (isl) {
@@ -3948,8 +4951,18 @@ export class Arena3DRenderer {
         );
         if (distFromCenter < 5.0) {
           this.camGoalTarget.z = isl.offsetZ + gh * 0.5 + frame.zBias;
+          if (
+            this.lastFramedRadius > 0 &&
+            Math.abs(this.camGoalRadius - this.lastFramedRadius) < 1.5
+          ) {
+            this.camGoalRadius = this.clampCameraRadius(frame.radius);
+            this.lastFramedRadius = this.camGoalRadius;
+            this.updateZoomCoupledPolar();
+          }
         }
       }
+    } else if (this.arenaOverviewMode && layoutChanged) {
+      this.focusArenaOverview();
     }
 
     if (state.phase !== 'BUILD' || layoutChanged) {
@@ -4007,20 +5020,30 @@ export class Arena3DRenderer {
     const gw = round.gridWidth;
     const gh = round.gridHeight;
 
-    // 1. Submerged Coastal Reef Terrace & Lower Talus (`y = -1.58 .. -1.06`)
+    // 1. Submerged Coastal Reef Terrace (top `y = -1.46m` < sea level, so shoreline foam is 100% visible)
     const reefW = gw + 2.6;
     const reefD = gh + 2.6;
     const reefShelf = new THREE.Mesh(
-      new THREE.BoxGeometry(reefW, 0.52, reefD),
+      new THREE.BoxGeometry(reefW, 0.56, reefD),
       this.cliffTalusMat
     );
-    reefShelf.position.set(gw / 2, -1.32, gh / 2);
+    reefShelf.position.set(gw / 2, -1.74, gh / 2);
     reefShelf.receiveShadow = true;
     root.add(reefShelf);
 
     // Rounded Shoreline Foam + Shallow Coastal Turquoise Halo at sea level (`y = -1.39`)
     const bankW = gw + 1.64;
     const bankD = gh + 1.64;
+
+    // Lower Talus Footing: rises out of the sea exactly at the foam contact band (`bankW × bankD`)
+    const lowerTalus = new THREE.Mesh(
+      new THREE.BoxGeometry(bankW, 0.58, bankD),
+      this.cliffTalusMat
+    );
+    lowerTalus.position.set(gw / 2, -1.36, gh / 2);
+    lowerTalus.receiveShadow = true;
+    root.add(lowerTalus);
+
     const foamGeo = new THREE.PlaneGeometry(bankW + 4.8, bankD + 4.8);
     foamGeo.rotateX(-Math.PI / 2);
     const foamMat = createShorelineFoamShader(
@@ -4047,7 +5070,7 @@ export class Arena3DRenderer {
       this.cliffLimestoneMat
     );
     upperCliff.position.set(gw / 2, -0.51, gh / 2);
-    upperCliff.castShadow = true;
+    upperCliff.castShadow = false;
     upperCliff.receiveShadow = true;
     root.add(upperCliff);
 
@@ -4062,8 +5085,9 @@ export class Arena3DRenderer {
         this.sharedGeos.plateauCornerBastion,
         this.cliffLimestoneMat
       );
-      bastion.position.set(c.x, -0.68, c.z);
-      bastion.castShadow = true;
+      bastion.position.set(c.x, -0.76, c.z);
+      bastion.scale.y = 1.12; // footing reaches below sea level (no floating corners)
+      bastion.castShadow = false;
       bastion.receiveShadow = true;
       root.add(bastion);
     }
@@ -4120,11 +5144,11 @@ export class Arena3DRenderer {
     floorMesh.receiveShadow = true;
     root.add(floorMesh);
 
-    // Veiled Fog-of-War Mist Shroud for hidden rival islands
-    const fogVeilGeo = new THREE.PlaneGeometry(gw - 0.3, gh - 0.3);
+    // Feathered Fog-of-War Mist Shroud for hidden rival islands
+    const fogVeilGeo = new THREE.PlaneGeometry(gw + 0.6, gh + 0.6);
     fogVeilGeo.rotateX(-Math.PI / 2);
     const fogVeilMesh = new THREE.Mesh(fogVeilGeo, this.fogVeilMat);
-    fogVeilMesh.position.set(gw / 2, 0.24, gh / 2);
+    fogVeilMesh.position.set(gw / 2, 2.9, gh / 2);
     fogVeilMesh.renderOrder = 8;
     fogVeilMesh.visible = false;
     root.add(fogVeilMesh);
@@ -4170,6 +5194,44 @@ export class Arena3DRenderer {
 
     this.scene.add(root);
 
+    // Persistent per-island InstancedMesh layers (Stone Walls: 5 draw calls; masonry: 9 draw calls)
+    const mk = (
+      parent: THREE.Group,
+      geo: THREE.BufferGeometry,
+      mat: THREE.Material,
+      capacity: number,
+      cast: boolean,
+      receive: boolean,
+      renderOrder = 0,
+      useColor = false
+    ) => this.createInstLayer(parent, geo, mat, capacity, cast, receive, renderOrder, useColor);
+    const g = this.sharedGeos;
+    const wallLayers: WallInstLayers = {
+      ao: mk(towerGroup, g.aoQuad, this.aoDiscMat, 64, false, false, 2),
+      plinth: mk(towerGroup, g.pillarPlinth, this.plinthSandstoneMat, 64, true, true),
+      shaft: mk(towerGroup, g.pillarShaft, this.ivoryShaftMat, 64, true, true),
+      cap: mk(towerGroup, g.pillarCapMerlons, this.creamCapMat, 64, true, true),
+      emblem: mk(
+        towerGroup,
+        g.pillarEmblem,
+        this.getPlayerMedallionMaterial(player.color),
+        64,
+        false,
+        true
+      ),
+    };
+    const bridgeLayers: BridgeInstLayers = {
+      ao: mk(bridgeGroup, g.bridgeAoQuad, this.aoDiscMat, 96, false, false, 2),
+      wall: mk(bridgeGroup, g.bridgeWallUnit, this.instMasonryWallMat, 96, true, true, 0, true),
+      cap: mk(bridgeGroup, g.bridgeCapUnit, this.instMasonryCapMat, 96, false, true, 0, true),
+      keyBody: mk(bridgeGroup, g.keystoneBody, this.creamStoneTrimMat, 16, true, true),
+      keyCap: mk(bridgeGroup, g.keystoneCap, this.instMasonryCapMat, 16, false, true, 0, true),
+      bollardPost: mk(bridgeGroup, g.bollardPost, this.ivoryShaftMat, 32, true, true),
+      bollardCap: mk(bridgeGroup, g.bollardCap, this.instMasonryCapMat, 32, false, true, 0, true),
+      pierBody: mk(bridgeGroup, g.stepPierBody, this.instMasonryWallMat, 32, true, true, 0, true),
+      pierCap: mk(bridgeGroup, g.stepPierCap, this.instMasonryCapMat, 32, false, true, 0, true),
+    };
+
     const visuals: IslandVisuals = {
       playerId: player.id,
       playerColor: player.color,
@@ -4190,6 +5252,12 @@ export class Arena3DRenderer {
       bridgeEntries: [],
       clapMarkerGroup,
       towerMeshes: new Map(),
+      wallLayers,
+      wallOrder: [],
+      bridgeLayers,
+      bridgeRecs: [],
+      checkpointRigs: [],
+      worldBounds: new THREE.Box3(),
       spireRigs: [],
       ruinRigs: [],
       pathMesh: null,
@@ -4199,6 +5267,7 @@ export class Arena3DRenderer {
       lastSimStatus: '',
       lastSimTimeText: '',
     };
+    this.updateIslandWorldBounds(visuals, round);
 
     this.rebuildIslandPadsAndObstacles(visuals, round);
     this.createIslandDOMElements(player);
@@ -4214,13 +5283,42 @@ export class Arena3DRenderer {
    * - `JUGGERNAUT`: Gleaming Silver-Steel (`#cbd5e1`) pauldrons & greathelm + wide `0.56m` gilded Pavise + maul.
    * - `HERALD`: Viridian tunic + wide `0.68m` swept emerald V-wings that flare wide during Tailwind Haste!
    */
+  private readonly runnerPooledMats = new Map<string, THREE.Material>();
+
+  private getPooledRunnerStandardMat(
+    key: string,
+    params: THREE.MeshStandardMaterialParameters
+  ): THREE.MeshStandardMaterial {
+    let m = this.runnerPooledMats.get(key) as THREE.MeshStandardMaterial | undefined;
+    if (!m) {
+      m = new THREE.MeshStandardMaterial(params);
+      this.protectedMats.add(m);
+      this.runnerPooledMats.set(key, m);
+    }
+    return m;
+  }
+
+  private getPooledRunnerBasicMat(
+    key: string,
+    color: string
+  ): THREE.MeshBasicMaterial {
+    let m = this.runnerPooledMats.get(key) as THREE.MeshBasicMaterial | undefined;
+    if (!m) {
+      m = new THREE.MeshBasicMaterial({ color });
+      this.protectedMats.add(m);
+      this.runnerPooledMats.set(key, m);
+    }
+    return m;
+  }
+
   private buildArticulatedRunnerRig(
     playerColor: string,
     runnerType: RunnerArchetype = 'SCOUT'
   ): RunnerRig {
     const root = new THREE.Group();
     if (runnerType === 'JUGGERNAUT') {
-      root.scale.set(1.16, 1.12, 1.16);
+      // Compact `(1.10, 1.12, 1.10)` hull so lateral reach <= 0.53m in 1m lanes
+      root.scale.set(1.1, 1.12, 1.1);
     }
 
     const footShadow = new THREE.Mesh(this.sharedGeos.aoQuad, this.aoDiscMat);
@@ -4246,43 +5344,49 @@ export class Arena3DRenderer {
 
     const tunicColor =
       runnerType === 'OUTRIDER'
-        ? '#1d4ed8'
+        ? '#f1f5f9'
         : runnerType === 'JUGGERNAUT'
         ? '#475569'
         : runnerType === 'HERALD'
         ? '#0d9488'
-        : '#2563eb';
+        : '#0369a1';
 
-    const torsoMesh = new THREE.Mesh(
-      this.sharedGeos.runnerTorso,
-      new THREE.MeshStandardMaterial({
+    const torsoMat = this.getPooledRunnerStandardMat(
+      `torso:${runnerType}:${playerColor}`,
+      {
         color: tunicColor,
         emissive: playerColor,
-        emissiveIntensity: 0.12,
-        roughness: runnerType === 'JUGGERNAUT' ? 0.36 : 0.58,
+        emissiveIntensity: 0.14,
+        roughness: runnerType === 'JUGGERNAUT' ? 0.36 : 0.56,
         metalness: runnerType === 'JUGGERNAUT' ? 0.48 : 0.1,
-      })
+      }
     );
+    const torsoMesh = new THREE.Mesh(this.sharedGeos.runnerTorso, torsoMat);
     torsoMesh.position.y = 0.25;
     torsoMesh.castShadow = true;
     pelvis.add(torsoMesh);
 
-    // High-contrast bright collar so runners never disappear inside directional shadows
+    const heraldryMat = this.getPlayerMedallionMaterial(playerColor);
+
+    // High-contrast bright collar (or `playerColor` mantle on SCOUT/HERALD) so runners pop in shadow
     const collar = new THREE.Mesh(
       this.sharedGeos.runnerCollar,
       runnerType === 'JUGGERNAUT'
         ? this.runnerSteelBrightMat
+        : runnerType === 'SCOUT' || runnerType === 'HERALD'
+        ? heraldryMat
         : this.runnerCollarIvoryMat
     );
     collar.position.y = 0.54;
+    if (runnerType === 'SCOUT') collar.scale.set(1.22, 1.35, 1.22);
     pelvis.add(collar);
 
     let leftWing: THREE.Mesh | null = null;
     let rightWing: THREE.Mesh | null = null;
-    let pennantMesh: THREE.Mesh | null = null;
+    let pennantMesh: THREE.Object3D | null = null;
 
     if (runnerType === 'JUGGERNAUT') {
-      for (const side of [-0.34, 0.34]) {
+      for (const side of [-0.32, 0.32]) {
         const pauldron = new THREE.Mesh(
           this.sharedGeos.runnerPauldron,
           this.runnerSteelBrightMat
@@ -4292,7 +5396,7 @@ export class Arena3DRenderer {
         pelvis.add(pauldron);
       }
     } else if (runnerType === 'HERALD') {
-      const wingMat = new THREE.MeshStandardMaterial({
+      const wingMat = this.getPooledRunnerStandardMat('wing:HERALD', {
         color: '#6ee7b7',
         emissive: '#10b981',
         emissiveIntensity: 0.28,
@@ -4310,22 +5414,29 @@ export class Arena3DRenderer {
       rightWing.castShadow = true;
       pelvis.add(rightWing);
     } else if (runnerType === 'OUTRIDER') {
-      // Tall back-mounted fluttering gold cavalry pennant visible above walls!
+      // Pole-pivoted twin-vane `playerColor` V-pennant (`0.18m` top-down width even running N/S!)
       const pole = new THREE.Mesh(
         this.sharedGeos.runnerPennantPole,
         this.cypressTrunkMat
       );
       pole.position.set(-0.14, 0.68, -0.18);
-      pole.rotation.x = -0.12;
+      pole.rotation.x = -0.08;
       pelvis.add(pole);
 
-      pennantMesh = new THREE.Mesh(
-        this.sharedGeos.runnerPennantFlag,
-        this.runnerGoldAccentMat
-      );
-      pennantMesh.position.set(-0.14, 1.06, -0.4);
-      pennantMesh.castShadow = true;
-      pelvis.add(pennantMesh);
+      const pennantPivot = new THREE.Group();
+      pennantPivot.position.set(-0.14, 1.08, -0.22);
+      for (const splay of [-0.21, 0.21]) {
+        const vane = new THREE.Mesh(
+          this.sharedGeos.runnerPennantFlag,
+          heraldryMat
+        );
+        vane.position.set(Math.sin(splay) * 0.2, 0, -0.2);
+        vane.rotation.y = splay;
+        vane.castShadow = true;
+        pennantPivot.add(vane);
+      }
+      pelvis.add(pennantPivot);
+      pennantMesh = pennantPivot;
     }
 
     const headGroup = new THREE.Group();
@@ -4334,7 +5445,7 @@ export class Arena3DRenderer {
     const helmMat =
       runnerType === 'JUGGERNAUT'
         ? this.runnerSteelBrightMat
-        : new THREE.MeshStandardMaterial({
+        : this.getPooledRunnerStandardMat(`helm:${runnerType}`, {
             color:
               runnerType === 'OUTRIDER'
                 ? '#e2e8f0'
@@ -4384,7 +5495,7 @@ export class Arena3DRenderer {
         : '#38bdf8';
     const visor = new THREE.Mesh(
       this.sharedGeos.runnerVisor,
-      new THREE.MeshBasicMaterial({ color: visorColor })
+      this.getPooledRunnerBasicMat(`visor:${runnerType}`, visorColor)
     );
     visor.position.set(0, 0.01, 0.18);
     headGroup.add(visor);
@@ -4412,13 +5523,14 @@ export class Arena3DRenderer {
     let accentMesh: THREE.Mesh | null = null;
 
     if (runnerType === 'JUGGERNAUT') {
+      // Tucked `playerColor`-painted Pavise (`x = -0.04, z = 0.22, ry = -0.46`) -> lateral reach <= 0.53m
       const shieldGroup = new THREE.Group();
-      shieldGroup.position.set(-0.1, -0.1, 0.25);
-      shieldGroup.rotation.set(-0.24, -0.34, 0.08);
+      shieldGroup.position.set(-0.04, -0.1, 0.22);
+      shieldGroup.rotation.set(-0.24, -0.46, 0.08);
 
       const shieldPlate = new THREE.Mesh(
         this.sharedGeos.runnerShieldPlate,
-        this.runnerSteelDarkMat
+        heraldryMat
       );
       shieldPlate.castShadow = true;
       shieldGroup.add(shieldPlate);
@@ -4443,34 +5555,35 @@ export class Arena3DRenderer {
         this.sharedGeos.runnerWeaponShaft,
         this.cypressTrunkMat
       );
-      maceShaft.position.set(0.05, 0.04, 0.18);
-      maceShaft.rotation.x = 0.45;
+      maceShaft.position.set(0.05, 0.04, 0.16);
+      maceShaft.rotation.x = 0.42;
       rightArm.add(maceShaft);
 
       const maceHead = new THREE.Mesh(
         this.sharedGeos.runnerMaceHead,
         this.runnerSteelBrightMat
       );
-      maceHead.position.set(0.05, 0.42, 0.36);
+      maceHead.position.set(0.05, 0.4, 0.32);
       maceHead.castShadow = true;
       rightArm.add(maceHead);
     } else if (runnerType === 'OUTRIDER') {
-      // Compact 0.90m non-clipping cavalry spear
+      // Upright-pitched (`rx = 0.58`) `0.78m` cavalry spear -> forward tip reach <= 0.52m (zero wall clips!)
       const spearGroup = new THREE.Group();
-      spearGroup.position.set(0.05, -0.12, 0.18);
-      spearGroup.rotation.x = 1.05;
+      spearGroup.position.set(0.05, -0.08, 0.14);
+      spearGroup.rotation.x = 0.58;
 
       const spearShaft = new THREE.Mesh(
         this.sharedGeos.runnerWeaponShaft,
         this.cypressTrunkMat
       );
+      spearShaft.scale.y = 0.86;
       spearGroup.add(spearShaft);
 
       const spearTip = new THREE.Mesh(
         this.sharedGeos.runnerSpearTip,
         this.runnerSteelBrightMat
       );
-      spearTip.position.y = 0.54;
+      spearTip.position.y = 0.47;
       spearGroup.add(spearTip);
       rightArm.add(spearGroup);
     } else if (runnerType === 'HERALD') {
@@ -4486,7 +5599,7 @@ export class Arena3DRenderer {
 
       const galeGem = new THREE.Mesh(
         this.sharedGeos.runnerOrbGem,
-        new THREE.MeshBasicMaterial({ color: '#34d399' })
+        this.getPooledRunnerBasicMat('gem:HERALD', '#34d399')
       );
       galeGem.position.set(0, 0.54, 0);
       rodGroup.add(galeGem);
@@ -4505,7 +5618,7 @@ export class Arena3DRenderer {
 
       const lanternGlow = new THREE.Mesh(
         this.sharedGeos.runnerOrbGem,
-        new THREE.MeshBasicMaterial({ color: '#38bdf8' })
+        this.getPooledRunnerBasicMat('gem:SCOUT', '#38bdf8')
       );
       lanternGlow.position.set(0.04, 0.48, 0.1);
       staffGroup.add(lanternGlow);
@@ -4544,12 +5657,13 @@ export class Arena3DRenderer {
       statusRingMat,
       walkPhase: 0,
       currentYaw: 0,
+      heraldWingFlare: 0,
     };
   }
 
   /**
    * Rebuilds North Gatehouse, South Shrine, Flush North/South Coping Curbs,
-   * Open-Crown Elemental Spires, and Buttressed Crimson Keeps (disposing prior dynamic resources).
+   * Open-Crown Elemental Spires, Buttressed Crimson Keeps, and 3D Gilded Checkpoint Waystones.
    */
   private rebuildIslandPadsAndObstacles(
     island: IslandVisuals,
@@ -4559,6 +5673,7 @@ export class Arena3DRenderer {
     island.padGroup.clear();
     island.spireRigs = [];
     island.ruinRigs = [];
+    island.checkpointRigs = [];
 
     const gw = round.gridWidth;
     const gh = round.gridHeight;
@@ -4591,15 +5706,23 @@ export class Arena3DRenderer {
     addCurbSpan(0, exitCx - gateHalfGap, gh + curbThick * 0.5);
     addCurbSpan(exitCx + gateHalfGap, gw, gh + curbThick * 0.5);
 
-    // 2. Distinct North Gatehouse (`y = 0`, slate-blue steeped roof + south-pointing chevron apron)
+    // 2. North Gatehouse: Flush `0.018m` Apron strictly outside `[0..gh]` + Limestone Cliff Corbel!
     const spawnGate = new THREE.Group();
     spawnGate.position.set(spawnCx, 0, spawnBorderZ);
 
+    const northCorbel = new THREE.Mesh(
+      this.sharedGeos.gateCliffCorbel,
+      this.cliffLimestoneMat
+    );
+    northCorbel.position.set(0, -0.54, -0.88);
+    northCorbel.receiveShadow = true;
+    spawnGate.add(northCorbel);
+
     const northApron = new THREE.Mesh(
-      new THREE.BoxGeometry(2.8, 0.06, 1.5),
+      this.sharedGeos.gateApronFlush,
       this.plinthSandstoneMat
     );
-    northApron.position.set(0, 0.01, -0.45);
+    northApron.position.set(0, 0.004, -0.59); // top = 0.018m < path/conduit/chevron
     northApron.receiveShadow = true;
     spawnGate.add(northApron);
 
@@ -4630,19 +5753,27 @@ export class Arena3DRenderer {
       this.sharedGeos.gateChevron,
       this.spawnAzureMat
     );
-    chevron.position.set(0, 0.03, 0.28);
+    chevron.position.set(0, 0.032, 0.28);
     spawnGate.add(chevron);
     island.padGroup.add(spawnGate);
 
-    // 3. Distinct South Triumphal Shrine (`y = 26`, tall obsidian/ivory piers + sacred coral-gold braziers + goal seal)
+    // 3. South Triumphal Shrine: Flush `0.018m` Apron + Cliff Corbel + 100% Unburied `goalSeal`!
     const exitShrine = new THREE.Group();
     exitShrine.position.set(exitCx, 0, exitBorderZ);
 
+    const southCorbel = new THREE.Mesh(
+      this.sharedGeos.gateCliffCorbel,
+      this.cliffLimestoneMat
+    );
+    southCorbel.position.set(0, -0.54, 0.88);
+    southCorbel.receiveShadow = true;
+    exitShrine.add(southCorbel);
+
     const southApron = new THREE.Mesh(
-      new THREE.BoxGeometry(2.8, 0.06, 1.5),
+      this.sharedGeos.gateApronFlush,
       this.plinthSandstoneMat
     );
-    southApron.position.set(0, 0.01, 0.45);
+    southApron.position.set(0, 0.004, 0.59); // top = 0.018m, strictly outside playable row 25
     southApron.receiveShadow = true;
     exitShrine.add(southApron);
 
@@ -4677,9 +5808,84 @@ export class Arena3DRenderer {
       this.sharedGeos.goalSealRing,
       this.exitCoralMat
     );
-    goalSeal.position.set(0, 0.026, -0.32);
+    goalSeal.position.set(0, 0.028, -0.1);
     exitShrine.add(goalSeal);
     island.padGroup.add(exitShrine);
+
+    // 3B. Bespoke 3D Gilded Checkpoint Waystones (`round.checkpoints` — R3, R6, R8)
+    for (const cp of round.checkpoints || []) {
+      const cpGroup = new THREE.Group();
+      cpGroup.position.set(cp.x + 1.0, 0, cp.y + 1.0);
+
+      const mosaic = new THREE.Mesh(
+        this.sharedGeos.checkpointInnerMosaic,
+        this.checkpointMosaicMat
+      );
+      mosaic.position.y = 0.018;
+      mosaic.receiveShadow = true;
+      cpGroup.add(mosaic);
+
+      const runeRing = new THREE.Mesh(
+        this.sharedGeos.checkpointRuneRing,
+        this.checkpointRuneGoldMat
+      );
+      runeRing.position.y = 0.022;
+      runeRing.receiveShadow = true;
+      cpGroup.add(runeRing);
+
+      const chimes: THREE.Mesh[] = [];
+      for (const [kx, kz] of [
+        [-0.82, -0.82],
+        [0.82, 0.82],
+      ]) {
+        const pillar = new THREE.Mesh(
+          this.sharedGeos.checkpointPillar,
+          this.creamStoneTrimMat
+        );
+        pillar.position.set(kx, 0, kz);
+        pillar.castShadow = true;
+        cpGroup.add(pillar);
+
+        const chime = new THREE.Mesh(
+          this.sharedGeos.checkpointChime,
+          this.checkpointChimeDormantMat
+        );
+        chime.position.set(kx, 0, kz);
+        cpGroup.add(chime);
+        chimes.push(chime);
+      }
+
+      island.padGroup.add(cpGroup);
+      island.checkpointRigs.push({ group: cpGroup, chimes, lit: false });
+    }
+
+    // 3C. Optional Waygate Pair (`round.waygate`)
+    if (round.waygate) {
+      const pair: Array<{ pt: GridPoint; color: string }> = [
+        { pt: round.waygate.entry, color: '#a855f7' },
+        { pt: round.waygate.exit, color: '#38bdf8' },
+      ];
+      for (const wg of pair) {
+        const wgGroup = new THREE.Group();
+        wgGroup.position.set(wg.pt.x + 1.0, 0, wg.pt.y + 1.0);
+        const ring = new THREE.Mesh(
+          this.sharedGeos.checkpointRuneRing,
+          this.getPooledRunnerBasicMat(`wg:${wg.color}`, wg.color)
+        );
+        ring.position.y = 0.022;
+        wgGroup.add(ring);
+        for (const sx of [-0.84, 0.84]) {
+          const pylon = new THREE.Mesh(
+            this.sharedGeos.checkpointPillar,
+            this.spireSlatePedestalMat
+          );
+          pylon.position.set(sx, 0, 0);
+          pylon.castShadow = true;
+          wgGroup.add(pylon);
+        }
+        island.padGroup.add(wgGroup);
+      }
+    }
 
     // 4. Pre-Placed Freestanding Open-Crown Elemental Spires
     round.preplacedSpires.forEach((spirePt, idx) => {
@@ -4702,7 +5908,7 @@ export class Arena3DRenderer {
       island.ruinRigs.push(ruinRig);
     });
 
-    // 6. Rebuild Runner Rig cleanly (disposing previous non-shared runner materials)
+    // 6. Rebuild Runner Rig cleanly (pooled materials stay protected)
     this.disposeSubtree(island.runner.root);
     island.root.remove(island.runner.root);
     island.runner = this.buildArticulatedRunnerRig(
@@ -4715,10 +5921,10 @@ export class Arena3DRenderer {
 
   /**
    * Builds Freestanding Dark-Slate Open-Crown Elemental Spires (100% distinct from top-down!):
-   * - `THUNDERCLAP`: Bronze-slate obelisk + open 3-pronged brass fork & glowing amber prism.
-   * - `FROST_OBELISK`: 4-pointed pale-cyan glacier star around a central ice monolith.
-   * - `CHRONO_SPIRE`: Unroofed open crescent cradle + brass halo + unobstructed `r=0.34m` violet orb!
-   * - High-contrast dark-bezel gold `◆–◆◆◆` sigils + ground collar tier segments.
+   * - Hollow outer collar bezel (`spireCollarRim` Torus at `y = 1.13m`) — never floods Frost/Chrono with gold!
+   * - `120°` radial `◆–◆◆◆` sigils (`ang = 0, ±2π/3` — immune to South-wall occlusion!).
+   * - `CHRONO_SPIRE`: Widened `±0.58m` crescent horns + `r=0.41m` halo (`>= 9.8cm` air gap!).
+   * - `FROST_OBELISK`: Stationary glacier star on plinth + detached levitating upper Glacial Finial!
    */
   private buildArticulatedStormSpireRig(
     spireType: SpireType = 'THUNDERCLAP',
@@ -4731,7 +5937,7 @@ export class Arena3DRenderer {
     const spec = TOWER_SPECS[spireType];
 
     const ao = new THREE.Mesh(this.sharedGeos.aoQuad, this.aoDiscMat);
-    ao.scale.setScalar(1.1);
+    ao.scale.setScalar(0.98);
     ao.position.y = 0.015;
     ao.renderOrder = 2;
     group.add(ao);
@@ -4766,19 +5972,20 @@ export class Arena3DRenderer {
       this.sharedGeos.spireCollarRim,
       this.collarRimInactiveMat
     );
-    collarRimMesh.position.y = 1.16;
+    collarRimMesh.position.y = 1.13;
     group.add(collarRimMesh);
 
-    // 3 Bold Dark-Bezel Gold Diamond Sigils (`◆–◆◆◆`) + 3 Ground Collar Segments
+    // `120°` Radial `◆–◆◆◆` Sigils & Ground Arcs (`0, +2π/3, -2π/3`: South, NE, NW — never hidden by South walls!)
     const overchargePips: THREE.Mesh[] = [];
     const groundTierArcs: THREE.Mesh[] = [];
+    const radialAngles = [0, (Math.PI * 2) / 3, -(Math.PI * 2) / 3];
     for (let i = 0; i < 3; i++) {
-      const ang = (i - 1) * 0.62;
+      const ang = radialAngles[i];
       const pipHolder = new THREE.Group();
-      pipHolder.position.set(Math.sin(ang) * 0.84, 1.15, Math.cos(ang) * 0.84);
+      pipHolder.position.set(Math.sin(ang) * 0.84, 1.19, Math.cos(ang) * 0.84);
       pipHolder.rotation.order = 'YXZ';
       pipHolder.rotation.y = ang;
-      pipHolder.rotation.x = -0.74;
+      pipHolder.rotation.x = -0.78;
 
       const bezel = new THREE.Mesh(
         this.sharedGeos.spirePipBezel,
@@ -4802,6 +6009,7 @@ export class Arena3DRenderer {
       groundArc.position.y = 0.032;
       groundArc.rotation.y = ang;
       groundArc.renderOrder = 4;
+      groundArc.visible = false;
       group.add(groundArc);
       groundTierArcs.push(groundArc);
     }
@@ -4810,19 +6018,16 @@ export class Arena3DRenderer {
     let baseCoreY = 1.85;
 
     if (spireType === 'FROST_OBELISK') {
-      // 4-Pointed Cyan Glacier Star + Central Hexagonal Monolith
-      const frostGroup = new THREE.Group();
+      // Stationary 4-Pointed Cyan Glacier Star + Detached Levitating Upper Finial (`baseCoreY = 2.62m`)
+      const frostBase = new THREE.Group();
+      frostBase.position.y = 1.14;
       const shaft = new THREE.Mesh(
         this.sharedGeos.frostCentralShaft,
         this.frostMainMat
       );
       shaft.position.y = 0.64;
       shaft.castShadow = true;
-      frostGroup.add(shaft);
-
-      const tip = new THREE.Mesh(this.sharedGeos.frostTip, this.frostBladeMat);
-      tip.position.y = 1.46;
-      frostGroup.add(tip);
+      frostBase.add(shaft);
 
       for (let s = 0; s < 4; s++) {
         const ang = (s * Math.PI) / 2;
@@ -4834,22 +6039,25 @@ export class Arena3DRenderer {
         blade.rotation.y = ang;
         blade.rotation.x = 0.38;
         blade.castShadow = true;
-        frostGroup.add(blade);
+        frostBase.add(blade);
       }
+      group.add(frostBase);
 
-      baseCoreY = 1.14;
-      frostGroup.position.y = baseCoreY;
-      group.add(frostGroup);
-      upperCore = frostGroup;
+      const tip = new THREE.Mesh(this.sharedGeos.frostTip, this.frostBladeMat);
+      tip.castShadow = true;
+      baseCoreY = 2.62;
+      tip.position.y = baseCoreY;
+      group.add(tip);
+      upperCore = tip;
     } else if (spireType === 'CHRONO_SPIRE') {
-      // UNROOFED Open Crescent Astrolabe Cradle + Unobstructed Violet-Gold Orb (`r = 0.34m`)!
+      // Widened `±0.58m` Crescent Horns + `0.41m` Halo (`>= 9.8cm` air gap throughout vertical bob!)
       for (const sideX of [-1, 1]) {
         const horn = new THREE.Mesh(
           this.sharedGeos.chronoHorn,
           this.chronoHornMat
         );
-        horn.position.set(sideX * 0.46, 1.66, 0);
-        horn.rotation.z = -sideX * 0.24;
+        horn.position.set(sideX * 0.58, 1.66, 0);
+        horn.rotation.z = -sideX * 0.26;
         horn.castShadow = true;
         group.add(horn);
       }
@@ -4873,7 +6081,7 @@ export class Arena3DRenderer {
       group.add(coreGroup);
       upperCore = coreGroup;
     } else {
-      // THUNDERCLAP: Dark Bronze-Slate Obelisk + Open 3-Prong Brass Fork & Glowing Amber Prism
+      // THUNDERCLAP: Dark Bronze-Slate Obelisk + Shadow-Casting 3-Prong Brass Fork & Levitating Prism
       const body = new THREE.Mesh(
         this.sharedGeos.stormObeliskBody,
         this.stormBodyMat
@@ -4892,6 +6100,7 @@ export class Arena3DRenderer {
         prong.position.set(Math.sin(ang) * 0.36, 2.12, Math.cos(ang) * 0.36);
         prong.rotation.y = ang;
         prong.rotation.x = 0.26;
+        prong.castShadow = true;
         group.add(prong);
       }
 
@@ -5014,59 +6223,112 @@ export class Arena3DRenderer {
     return { group, keepIndex, lanternMesh, corniceMesh, gridX, gridY };
   }
 
-  /**
-   * Player Stone Wall (`BLOCK`):
-   * Chamfered Square Ivory Turret (`h = 1.38m`) + 4 Corner Merlons + True Player-Color Square Emblem!
-   */
-  private buildWall3DMesh(
-    towerId: string,
+  // ==========================================================================
+  // PER-ISLAND INSTANCED WALLS & ORTHOGONAL MASONRY (<180 DRAW CALLS IN 6-ISLAND OVERVIEW)
+  // ==========================================================================
+
+  private createInstLayer(
+    parent: THREE.Group,
+    geo: THREE.BufferGeometry,
+    mat: THREE.Material,
+    capacity: number,
+    castShadow: boolean,
+    receiveShadow: boolean,
+    renderOrder = 0,
+    useColor = false
+  ): InstLayer {
+    const mesh = new THREE.InstancedMesh(geo, mat, capacity);
+    mesh.count = 0;
+    mesh.frustumCulled = false; // Culled per-island via `island.worldBounds`
+    mesh.castShadow = castShadow;
+    mesh.receiveShadow = receiveShadow;
+    mesh.renderOrder = renderOrder;
+    if (useColor) mesh.setColorAt(0, this._colIvoryWall);
+    parent.add(mesh);
+    return {
+      mesh,
+      capacity,
+      geo,
+      mat,
+      castShadow,
+      receiveShadow,
+      renderOrder,
+      useColor,
+    };
+  }
+
+  private ensureInstCapacity(
+    parent: THREE.Group,
+    layer: InstLayer,
+    needed: number
+  ) {
+    if (needed <= layer.capacity) return;
+    const newCap = Math.max(needed + 16, layer.capacity * 2);
+    parent.remove(layer.mesh);
+    layer.mesh.dispose();
+    const mesh = new THREE.InstancedMesh(layer.geo, layer.mat, newCap);
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    mesh.castShadow = layer.castShadow;
+    mesh.receiveShadow = layer.receiveShadow;
+    mesh.renderOrder = layer.renderOrder;
+    if (layer.useColor) mesh.setColorAt(0, this._colIvoryWall);
+    parent.add(mesh);
+    layer.mesh = mesh;
+    layer.capacity = newCap;
+  }
+
+  private writeWallInstanceMatrices(
+    island: IslandVisuals,
+    idx: number,
     x: number,
     y: number,
-    playerColor = '#38bdf8',
-    bornTime = performance.now()
-  ): WallVisualEntry {
-    const group = new THREE.Group();
-    group.userData.towerId = towerId;
+    scaleY: number
+  ) {
+    // Clamp placement pop horizontal squash `scaleXZ <= 1.18` (zero neighbor clipping!)
+    const scaleXZ = scaleY === 1 ? 1 : Math.min(1.18, 1 / Math.sqrt(scaleY));
+    const cx = x + 1.0;
+    const cz = y + 1.0;
+    const d = this._dummyObj;
+    const wl = island.wallLayers;
 
-    const ao = new THREE.Mesh(this.sharedGeos.aoQuad, this.aoDiscMat);
-    ao.position.y = 0.015;
-    ao.renderOrder = 2;
-    group.add(ao);
+    d.rotation.set(0, 0, 0);
+    d.position.set(cx, 0.015, cz);
+    d.scale.set(0.9 * scaleXZ, 1, 0.9 * scaleXZ); // 1.87m AO quad (zero 2.08m overhang)
+    d.updateMatrix();
+    wl.ao.mesh.setMatrixAt(idx, d.matrix);
+    wl.ao.mesh.instanceMatrix.needsUpdate = true;
 
-    const plinth = new THREE.Mesh(
-      this.sharedGeos.pillarPlinth,
-      this.plinthSandstoneMat
-    );
-    plinth.position.y = 0.11;
-    plinth.castShadow = true;
-    plinth.receiveShadow = true;
-    group.add(plinth);
+    d.position.set(cx, 0.11 * scaleY, cz);
+    d.scale.set(scaleXZ, scaleY, scaleXZ);
+    d.updateMatrix();
+    wl.plinth.mesh.setMatrixAt(idx, d.matrix);
+    wl.plinth.mesh.instanceMatrix.needsUpdate = true;
 
-    const shaft = new THREE.Mesh(
-      this.sharedGeos.pillarShaft,
-      this.ivoryShaftMat
-    );
-    shaft.position.y = 0.7;
-    shaft.castShadow = true;
-    shaft.receiveShadow = true;
-    group.add(shaft);
+    d.position.set(cx, 0.7 * scaleY, cz);
+    d.updateMatrix();
+    wl.shaft.mesh.setMatrixAt(idx, d.matrix);
+    wl.shaft.mesh.instanceMatrix.needsUpdate = true;
 
-    const cap = new THREE.Mesh(
-      this.sharedGeos.pillarCapMerlons,
-      this.creamCapMat
-    );
-    cap.receiveShadow = true;
-    group.add(cap);
+    d.position.set(cx, 0, cz);
+    d.updateMatrix();
+    wl.cap.mesh.setMatrixAt(idx, d.matrix);
+    wl.cap.mesh.instanceMatrix.needsUpdate = true;
 
-    const emblem = new THREE.Mesh(
-      this.sharedGeos.pillarEmblem,
-      this.getPlayerMedallionMaterial(playerColor)
-    );
-    emblem.position.y = 1.34;
-    emblem.receiveShadow = true;
-    group.add(emblem);
+    d.position.set(cx, 1.34 * scaleY, cz);
+    d.updateMatrix();
+    wl.emblem.mesh.setMatrixAt(idx, d.matrix);
+    wl.emblem.mesh.instanceMatrix.needsUpdate = true;
+  }
 
-    return { group, born: bornTime, x, y };
+  private writeMasonryInstanceMatrix(rec: MasonryInstanceRec, scaleY: number) {
+    const d = this._dummyObj;
+    d.position.set(rec.px, rec.py * scaleY, rec.pz);
+    d.rotation.set(0, rec.rotY, 0);
+    d.scale.set(rec.sx, rec.sy * scaleY, rec.sz);
+    d.updateMatrix();
+    rec.layer.mesh.setMatrixAt(rec.idx, d.matrix);
+    rec.layer.mesh.instanceMatrix.needsUpdate = true;
   }
 
   // ==========================================================================
@@ -5095,7 +6357,7 @@ export class Arena3DRenderer {
     bridge.position.set(ax + dx * midT, 0, az + dz * midT);
     bridge.rotation.y = angle;
 
-    if (!isGhost) {
+    if (!isGhost && spanLen > 0.72) {
       const ao = new THREE.Mesh(this.sharedGeos.bridgeAoQuad, this.aoDiscMat);
       ao.scale.z = spanLen;
       ao.position.y = 0.014;
@@ -5119,33 +6381,6 @@ export class Arena3DRenderer {
     bridge.add(parapet);
 
     return bridge;
-  }
-
-  private createBridgeKeystoneCollar(
-    mx: number,
-    mz: number,
-    angle: number,
-    capMat: THREE.Material
-  ): THREE.Group {
-    const keystone = new THREE.Group();
-    keystone.position.set(mx, 0, mz);
-    keystone.rotation.y = angle;
-
-    const body = new THREE.Mesh(
-      this.sharedGeos.keystoneBody,
-      this.creamStoneTrimMat
-    );
-    body.position.y = 0.51;
-    body.castShadow = true;
-    body.receiveShadow = true;
-    keystone.add(body);
-
-    const cap = new THREE.Mesh(this.sharedGeos.keystoneCap, capMat);
-    cap.position.y = 1.06;
-    cap.receiveShadow = true;
-    keystone.add(cap);
-
-    return keystone;
   }
 
   /**
@@ -5197,9 +6432,10 @@ export class Arena3DRenderer {
     const dx = toCx - fromCx;
     const dz = toCz - fromCz;
     const fullDist = Math.hypot(dx, dz);
-    // Start at edge of Wall/Keep plinth (~0.74m) and end at edge of Spire plinth (~0.84m)
-    const startInset = Math.min(0.74, fullDist * 0.35);
-    const endInset = Math.min(0.84, fullDist * 0.38);
+    // Visible clasp on flush 2.0m touches (`spanLen >= 0.82m`, `y = 0.038`) so plinths never swallow 62% of the line
+    const isFlushTouch = fullDist <= 2.15;
+    const startInset = isFlushTouch ? 0.56 : Math.min(0.74, fullDist * 0.35);
+    const endInset = isFlushTouch ? 0.62 : Math.min(0.84, fullDist * 0.38);
     const spanLen = fullDist - startInset - endInset;
     if (spanLen <= 0.08) return null;
 
@@ -5208,12 +6444,12 @@ export class Arena3DRenderer {
     const mesh = new THREE.Mesh(this.sharedGeos.conduitQuad, mat);
     mesh.position.set(
       fromCx + ux * startInset,
-      0.024,
+      isFlushTouch ? 0.038 : 0.024,
       fromCz + uz * startInset
     );
     mesh.rotation.y = Math.atan2(dx, dz);
     mesh.scale.z = spanLen;
-    mesh.renderOrder = 3;
+    mesh.renderOrder = isFlushTouch ? 5 : 3;
     return mesh;
   }
 
@@ -5239,16 +6475,34 @@ export class Arena3DRenderer {
 
   private applyKeepLinkVisuals(
     island: IslandVisuals,
-    linkedIndices: Set<number>
+    linkedIndices: Set<number>,
+    poweredSpireCounts?: number[]
   ) {
     island.ruinRigs.forEach((ruin, idx) => {
       const isLinked = linkedIndices.has(idx);
-      ruin.lanternMesh.material = isLinked
-        ? this.keepBrazierLinkedMat
-        : this.keepBrazierDormantMat;
-      ruin.corniceMesh.material = isLinked
-        ? this.goldBridgeTrimMat
-        : this.creamStoneTrimMat;
+      const poweredCount = poweredSpireCounts ? poweredSpireCounts[idx] ?? 0 : isLinked ? 1 : 0;
+      if (!isLinked) {
+        // Dormant: low dark-ash embers
+        ruin.linkState = 0;
+        ruin.lanternMesh.material = this.keepBrazierDormantMat;
+        ruin.corniceMesh.material = this.creamStoneTrimMat;
+        ruin.lanternMesh.scale.set(0.52, 0.26, 0.52);
+        ruin.lanternMesh.position.y = 1.75;
+      } else if (poweredCount <= 0) {
+        // Wall-linked (`0` Spires reached in chain): warm amber rim
+        ruin.linkState = 1;
+        ruin.lanternMesh.material = this.keepBrazierAmberMat;
+        ruin.corniceMesh.material = this.keepAmberCorniceMat;
+        ruin.lanternMesh.scale.set(0.78, 0.68, 0.78);
+        ruin.lanternMesh.position.y = 1.82;
+      } else {
+        // ◆ Powering Spire (`>= 1` Spire reached): radiant `#fbbf24` gold brazier
+        ruin.linkState = 2;
+        ruin.lanternMesh.material = this.keepBrazierLinkedMat;
+        ruin.corniceMesh.material = this.goldBridgeTrimMat;
+        ruin.lanternMesh.scale.set(1, 1, 1);
+        ruin.lanternMesh.position.y = 1.88;
+      }
     });
   }
 
@@ -5261,6 +6515,9 @@ export class Arena3DRenderer {
       const effectiveRange = spireRig.baseRange + tier * 0.25;
       spireRig.aoeMesh.scale.set(effectiveRange, 1, effectiveRange);
       spireRig.aoeMat.uniforms.uOverchargeTier.value = tier;
+      if (spireRig.spireType === 'FROST_OBELISK') {
+        spireRig.aoeMat.uniforms.uInnerFillAlpha.value = 0.045 + tier * 0.015;
+      }
 
       spireRig.collarRimMesh.material =
         tier >= 1 ? this.collarRimGoldMat : this.collarRimInactiveMat;
@@ -5272,13 +6529,20 @@ export class Arena3DRenderer {
       });
 
       spireRig.groundTierArcs.forEach((arc, arcIdx) => {
-        arc.material =
-          arcIdx < tier ? this.groundArcGoldMat : this.groundArcInactiveMat;
+        const active = arcIdx < tier;
+        arc.visible = active;
+        arc.material = active ? this.groundArcGoldMat : this.groundArcInactiveMat;
       });
     });
   }
 
   private restoreIslandBaseSynergyVisuals(island: IslandVisuals) {
+    island.conduitGroup.visible =
+      !island.fogVeilMesh.visible &&
+      !(
+        island.playerId === this.localPlayerId &&
+        this.previewConduitGroup.children.length > 0
+      );
     if (
       island.playerId === this.localPlayerId &&
       this.cachedBaseEval &&
@@ -5292,7 +6556,8 @@ export class Arena3DRenderer {
       );
       this.applyKeepLinkVisuals(
         island,
-        this.cachedLocalCircuitry.linkedKeepIndices
+        this.cachedLocalCircuitry.linkedKeepIndices,
+        this.cachedLocalCircuitry.keepPoweredSpireCounts
       );
       this.applySpireOverchargeVisuals(
         island,
@@ -5345,8 +6610,8 @@ export class Arena3DRenderer {
     player: PlayerState,
     round: RoundConfig
   ) {
-    island.bridgeGroup.clear();
     island.bridgeEntries = [];
+    island.bridgeRecs = [];
     island.conduitGroup.clear();
 
     const now = performance.now();
@@ -5389,13 +6654,80 @@ export class Arena3DRenderer {
       })),
     ];
 
-    const addBridgeEntry = (grp: THREE.Group, born: number) => {
-      const ageSec = (now - born) / 1000;
-      if (ageSec >= 0 && ageSec < 0.26) {
-        grp.scale.set(1, evalToyBoxSpringScaleY(ageSec / 0.26), 1);
+    const bl = island.bridgeLayers;
+    let cAo = 0;
+    let cWall = 0;
+    let cCap = 0;
+    let cKeyBody = 0;
+    let cKeyCap = 0;
+    let cBollardPost = 0;
+    let cBollardCap = 0;
+    let cPierBody = 0;
+    let cPierCap = 0;
+
+    const pushInst = (
+      layer: InstLayer,
+      idx: number,
+      px: number,
+      py: number,
+      pz: number,
+      rotY: number,
+      sx: number,
+      sy: number,
+      sz: number,
+      born: number,
+      color?: THREE.Color
+    ) => {
+      this.ensureInstCapacity(island.bridgeGroup, layer, idx + 1);
+      if (color && layer.useColor) {
+        layer.mesh.setColorAt(idx, color);
       }
-      island.bridgeGroup.add(grp);
-      island.bridgeEntries.push({ group: grp, born });
+      const rec: MasonryInstanceRec = {
+        layer,
+        idx,
+        px,
+        py,
+        pz,
+        rotY,
+        sx,
+        sy,
+        sz,
+        born,
+      };
+      const ageSec = (now - born) / 1000;
+      const sY =
+        ageSec >= 0 && ageSec < 0.26 ? evalToyBoxSpringScaleY(ageSec / 0.26) : 1;
+      this.writeMasonryInstanceMatrix(rec, sY);
+      if (ageSec >= 0 && ageSec < 0.28) {
+        island.bridgeRecs.push(rec);
+      }
+    };
+
+    const emitSpan = (
+      ax: number,
+      az: number,
+      bx: number,
+      bz: number,
+      tStart: number,
+      tEnd: number,
+      wallCol: THREE.Color,
+      capCol: THREE.Color,
+      born: number,
+      withAo: boolean
+    ) => {
+      const dx = bx - ax;
+      const dz = bz - az;
+      const fullDist = Math.hypot(dx, dz);
+      const spanLen = Math.max(0.05, fullDist * (tEnd - tStart));
+      const midT = (tStart + tEnd) * 0.5;
+      const px = ax + dx * midT;
+      const pz = az + dz * midT;
+      const angle = Math.atan2(dx, dz);
+      if (withAo && spanLen > 0.72) {
+        pushInst(bl.ao, cAo++, px, 0.014, pz, angle, 1, 1, spanLen, born);
+      }
+      pushInst(bl.wall, cWall++, px, 0.49, pz, angle, 1, 1, spanLen, born, wallCol);
+      pushInst(bl.cap, cCap++, px, 1.05, pz, angle, 1, 1, spanLen, born, capCol);
     };
 
     const poweredSet = circuitry.poweredNodeKeys;
@@ -5421,89 +6753,132 @@ export class Arena3DRenderer {
           poweredSet !== undefined &&
           poweredSet.has(`${a.x},${a.y}`) &&
           poweredSet.has(`${b.x},${b.y}`);
+        const anyKeepLinked =
+          (a.keepIdx !== undefined &&
+            circuitry.linkedKeepIndices.has(a.keepIdx)) ||
+          (b.keepIdx !== undefined &&
+            circuitry.linkedKeepIndices.has(b.keepIdx));
+        const isGold =
+          a.kind === 'PLAYER' && b.kind === 'PLAYER' ? bothPowered : anyKeepLinked;
 
-        if (a.kind === 'PLAYER' && b.kind === 'PLAYER') {
-          const span = this.createBridgeSpanSegment(
-            a.cx,
-            a.cz,
-            b.cx,
-            b.cz,
-            0.0,
-            1.0,
-            this.bridgeWallMat,
-            bothPowered ? this.goldBridgeTrimMat : this.creamCapMat,
-            false
-          );
-          addBridgeEntry(span, pairBorn);
-        } else if (a.kind === 'RUIN' && b.kind === 'RUIN') {
-          const isLinked =
-            (a.keepIdx !== undefined &&
-              circuitry.linkedKeepIndices.has(a.keepIdx)) ||
-            (b.keepIdx !== undefined &&
-              circuitry.linkedKeepIndices.has(b.keepIdx));
-          const span = this.createBridgeSpanSegment(
-            a.cx,
-            a.cz,
-            b.cx,
-            b.cz,
-            0.0,
-            1.0,
-            this.crimsonKeepWallMat,
-            isLinked ? this.goldBridgeTrimMat : this.creamStoneTrimMat,
-            false
-          );
-          addBridgeEntry(span, pairBorn);
-        } else {
-          const pNode = a.kind === 'PLAYER' ? a : b;
-          const rNode = a.kind === 'RUIN' ? a : b;
-          const isLinked =
-            rNode.keepIdx !== undefined
-              ? circuitry.linkedKeepIndices.has(rNode.keepIdx)
-              : true;
-          const capMat = isLinked
-            ? this.goldBridgeTrimMat
-            : this.creamStoneTrimMat;
+        const isOrtho =
+          (Math.abs(dxGrid) === 2 && dzGrid === 0) ||
+          (dxGrid === 0 && Math.abs(dzGrid) === 2);
+        const isDiag = Math.abs(dxGrid) === 2 && Math.abs(dzGrid) === 2;
 
-          const pairGroup = new THREE.Group();
-          pairGroup.add(
-            this.createBridgeSpanSegment(
+        if (isOrtho) {
+          // Outer face-to-face span (`t ∈ [0.33, 0.67]` on 2.0m centers -> sockets cleanly into Keep spurs)
+          if (a.kind === 'PLAYER' && b.kind === 'PLAYER') {
+            emitSpan(
+              a.cx,
+              a.cz,
+              b.cx,
+              b.cz,
+              0.33,
+              0.67,
+              this._colIvoryWall,
+              isGold ? this._colGoldTrim : this._colCreamCap,
+              pairBorn,
+              false
+            );
+          } else if (a.kind === 'RUIN' && b.kind === 'RUIN') {
+            emitSpan(
+              a.cx,
+              a.cz,
+              b.cx,
+              b.cz,
+              0.33,
+              0.67,
+              this._colCrimsonWall,
+              isGold ? this._colGoldTrim : this._colCreamStone,
+              pairBorn,
+              false
+            );
+          } else {
+            const pNode = a.kind === 'PLAYER' ? a : b;
+            const rNode = a.kind === 'RUIN' ? a : b;
+            const capCol = isGold ? this._colGoldTrim : this._colCreamStone;
+            emitSpan(
               pNode.cx,
               pNode.cz,
               rNode.cx,
               rNode.cz,
-              0.0,
+              0.33,
               0.5,
-              this.bridgeWallMat,
-              capMat,
+              this._colIvoryWall,
+              capCol,
+              pairBorn,
               false
-            )
-          );
-          pairGroup.add(
-            this.createBridgeSpanSegment(
+            );
+            emitSpan(
               pNode.cx,
               pNode.cz,
               rNode.cx,
               rNode.cz,
               0.5,
-              1.0,
-              this.crimsonKeepWallMat,
-              capMat,
+              0.67,
+              this._colCrimsonWall,
+              capCol,
+              pairBorn,
               false
-            )
-          );
-          const angle = Math.atan2(rNode.cx - pNode.cx, rNode.cz - pNode.cz);
-          pairGroup.add(
-            this.createBridgeKeystoneCollar(
-              (pNode.cx + rNode.cx) * 0.5,
-              (pNode.cz + rNode.cz) * 0.5,
+            );
+            const mx = (pNode.cx + rNode.cx) * 0.5;
+            const mz = (pNode.cz + rNode.cz) * 0.5;
+            const angle = Math.atan2(rNode.cx - pNode.cx, rNode.cz - pNode.cz);
+            pushInst(bl.keyBody, cKeyBody++, mx, 0.51, mz, angle, 1, 1, 1, pairBorn);
+            pushInst(
+              bl.keyCap,
+              cKeyCap++,
+              mx,
+              1.06,
+              mz,
               angle,
-              capMat
-            )
-          );
-          addBridgeEntry(pairGroup, pairBorn);
+              1,
+              1,
+              1,
+              pairBorn,
+              capCol
+            );
+          }
+        } else if (isDiag) {
+          // `(±2, ±2)` Diagonal Touch: Compact Corner Bollard at the shared `(minX+2, minY+2)` vertex!
+          const vx = (a.cx + b.cx) * 0.5;
+          const vz = (a.cz + b.cz) * 0.5;
+          const capCol = isGold ? this._colGoldTrim : this._colCreamCap;
+          pushInst(bl.bollardPost, cBollardPost++, vx, 0, vz, 0, 1, 1, 1, pairBorn);
+          pushInst(bl.bollardCap, cBollardCap++, vx, 0, vz, 0, 1, 1, 1, pairBorn, capCol);
+        } else {
+          // `(±2, ±1)` / `(±1, ±2)` Half-Step Overlap: Axis-Aligned Step-Seam Pier on shared 1m edge!
+          const px = (a.cx + b.cx) * 0.5;
+          const pz = (a.cz + b.cz) * 0.5;
+          const rotY = Math.abs(dxGrid) === 2 ? 0 : Math.PI * 0.5;
+          const wallCol =
+            a.kind === 'RUIN' && b.kind === 'RUIN'
+              ? this._colCrimsonWall
+              : this._colIvoryWall;
+          const capCol = isGold ? this._colGoldTrim : this._colCreamCap;
+          pushInst(bl.pierBody, cPierBody++, px, 0, pz, rotY, 1, 1, 1, pairBorn, wallCol);
+          pushInst(bl.pierCap, cPierCap++, px, 0, pz, rotY, 1, 1, 1, pairBorn, capCol);
         }
       }
     }
+
+    const finalize = (layer: InstLayer, count: number) => {
+      layer.mesh.count = count;
+      if (count > 0) {
+        layer.mesh.instanceMatrix.needsUpdate = true;
+        if (layer.mesh.instanceColor) layer.mesh.instanceColor.needsUpdate = true;
+      }
+    };
+    finalize(bl.ao, cAo);
+    finalize(bl.wall, cWall);
+    finalize(bl.cap, cCap);
+    finalize(bl.keyBody, cKeyBody);
+    finalize(bl.keyCap, cKeyCap);
+    finalize(bl.bollardPost, cBollardPost);
+    finalize(bl.bollardCap, cBollardCap);
+    finalize(bl.pierBody, cPierBody);
+    finalize(bl.pierCap, cPierCap);
 
     // Render flush ground inlaid gold ley-line conduits (`dx^2 + dy^2 <= 13`) into Overcharged Spires!
     const links = this.computeFallbackConduitLinks(
@@ -5519,7 +6894,11 @@ export class Arena3DRenderer {
       island.conduitMat
     );
 
-    this.applyKeepLinkVisuals(island, circuitry.linkedKeepIndices);
+    this.applyKeepLinkVisuals(
+      island,
+      circuitry.linkedKeepIndices,
+      circuitry.keepPoweredSpireCounts
+    );
     this.applySpireOverchargeVisuals(island, circuitry.spireOverchargeTiers);
   }
 
@@ -5534,18 +6913,24 @@ export class Arena3DRenderer {
     skipPopAnim = false
   ) {
     const isFogged = Boolean(player.fogMasked);
+    const previewHidingBaseConduits =
+      player.id === this.localPlayerId &&
+      this.previewConduitGroup.children.length > 0;
     island.fogVeilMesh.visible = isFogged;
     island.towerGroup.visible = !isFogged;
     island.bridgeGroup.visible = !isFogged;
-    island.conduitGroup.visible = !isFogged;
+    island.conduitGroup.visible = !isFogged && !previewHidingBaseConduits;
 
     if (isFogged) {
       if (island.pathMesh) island.pathMesh.visible = false;
       island.clapMarkerGroup.clear();
+      // Clear any stale Keep brazier / Spire `◆` synergy residue under Fog of War!
+      this.applyKeepLinkVisuals(island, new Set(), []);
+      this.applySpireOverchargeVisuals(island, []);
       return;
     }
 
-    // 1. Reconcile optimistic `opt_*` meshes in-place when server assigns authoritative `twr_*` ID!
+    // 1. Reconcile optimistic `opt_*` entries in-place when server assigns authoritative `twr_*` ID!
     const incomingIds = new Set(player.towers.map((t) => t.id));
     const unmatchedIncoming = player.towers.filter(
       (t) => !island.towerMeshes.has(t.id)
@@ -5559,8 +6944,16 @@ export class Arena3DRenderer {
         if (matchIdx !== -1) {
           const matched = unmatchedIncoming.splice(matchIdx, 1)[0];
           island.towerMeshes.delete(tid);
-          entry.group.userData.towerId = matched.id;
           island.towerMeshes.set(matched.id, entry);
+          const ordIdx = island.wallOrder.indexOf(tid);
+          if (ordIdx !== -1) island.wallOrder[ordIdx] = matched.id;
+          // Rebind active mobile Remove selection across `opt_* -> twr_*` ack!
+          if (
+            player.id === this.localPlayerId &&
+            this.pendingTouchTowerId === tid
+          ) {
+            this.pendingTouchTowerId = matched.id;
+          }
         }
       }
     }
@@ -5575,10 +6968,12 @@ export class Arena3DRenderer {
     }
     island.lastTowersSig = coordSig;
 
-    // 2. Remove sold/cleared walls
+    // 2. Remove sold/cleared walls (cap batch dust bursts to <= 4 per sync so Clear/Sample stays 60fps)
+    let dustSpawned = 0;
     for (const [tid, entry] of Array.from(island.towerMeshes.entries())) {
       if (!incomingIds.has(tid)) {
-        if (!skipPopAnim && island.root.visible) {
+        if (!skipPopAnim && island.root.visible && dustSpawned < 4) {
+          dustSpawned++;
           this.spawnPlacementDustPuffs(
             island.offsetX + entry.x + 1.0,
             island.offsetZ + entry.y + 1.0,
@@ -5586,40 +6981,44 @@ export class Arena3DRenderer {
             5
           );
         }
-        island.towerGroup.remove(entry.group);
         island.towerMeshes.delete(tid);
       }
     }
 
-    // 3. Add newly built walls
+    // 3. Add newly built walls & write 5 per-island `InstancedMesh` matrices
     const now = performance.now();
     for (const tower of player.towers) {
       if (!island.towerMeshes.has(tower.id)) {
         const born = skipPopAnim ? now - 1000 : now;
-        const entry = this.buildWall3DMesh(
-          tower.id,
-          tower.x,
-          tower.y,
-          player.color,
-          born
-        );
-        entry.group.position.set(tower.x + 1.0, 0, tower.y + 1.0);
-        if (!skipPopAnim) {
-          const sY = 0.2;
-          const sXZ = 1 / Math.sqrt(sY);
-          entry.group.scale.set(sXZ, sY, sXZ);
-          if (island.root.visible) {
-            this.spawnPlacementDustPuffs(
-              island.offsetX + tower.x + 1.0,
-              island.offsetZ + tower.y + 1.0,
-              '#f5efe4',
-              5
-            );
-          }
+        island.towerMeshes.set(tower.id, { born, x: tower.x, y: tower.y });
+        if (!skipPopAnim && island.root.visible && dustSpawned < 4) {
+          dustSpawned++;
+          this.spawnPlacementDustPuffs(
+            island.offsetX + tower.x + 1.0,
+            island.offsetZ + tower.y + 1.0,
+            '#f5efe4',
+            5
+          );
         }
-        island.towerGroup.add(entry.group);
-        island.towerMeshes.set(tower.id, entry);
       }
+    }
+
+    const wallCount = player.towers.length;
+    for (const layer of Object.values(island.wallLayers) as InstLayer[]) {
+      this.ensureInstCapacity(island.towerGroup, layer, wallCount);
+      layer.mesh.count = wallCount;
+    }
+    island.wallOrder = [];
+    for (let idx = 0; idx < wallCount; idx++) {
+      const tower = player.towers[idx];
+      island.wallOrder.push(tower.id);
+      const entry = island.towerMeshes.get(tower.id)!;
+      const ageSec = (now - entry.born) / 1000;
+      const scaleY =
+        !skipPopAnim && ageSec >= 0 && ageSec < 0.26
+          ? evalToyBoxSpringScaleY(ageSec / 0.26)
+          : 1;
+      this.writeWallInstanceMatrices(island, idx, tower.x, tower.y, scaleY);
     }
 
     this.rebuildAllDirectionalConnections(island, player, round);
@@ -5728,18 +7127,28 @@ export class Arena3DRenderer {
   // RETICLE, REMOVE BRACKET, LIVE GHOST PREVIEW & WORLD FEATURE INSPECTION
   // ==========================================================================
 
-  private setGhostTint(valid: boolean) {
-    if (valid) {
-      this.ghostBodyMat.color.set('#86efac');
-      this.ghostBodyMat.emissive.set('#22c55e');
-      this.ghostCapMat.color.set('#dcfce7');
-      this.ghostCapMat.emissive.set('#4ade80');
-    } else {
-      this.ghostBodyMat.color.set('#fda4af');
-      this.ghostBodyMat.emissive.set('#fb7185');
-      this.ghostCapMat.color.set('#ffe4e6');
-      this.ghostCapMat.emissive.set('#f43f5e');
+  private setGhostTint(valid: boolean, joinsCircuit = false) {
+    const bodyMat =
+      valid && joinsCircuit ? this.ghostGoldBodyMat : this.ghostBodyMat;
+    const capMat =
+      valid && joinsCircuit ? this.ghostGoldCapMat : this.ghostCapMat;
+    if (!joinsCircuit || !valid) {
+      if (valid) {
+        this.ghostBodyMat.color.set('#86efac');
+        this.ghostBodyMat.emissive.set('#22c55e');
+        this.ghostCapMat.color.set('#dcfce7');
+        this.ghostCapMat.emissive.set('#4ade80');
+      } else {
+        this.ghostBodyMat.color.set('#fda4af');
+        this.ghostBodyMat.emissive.set('#fb7185');
+        this.ghostCapMat.color.set('#ffe4e6');
+        this.ghostCapMat.emissive.set('#f43f5e');
+      }
     }
+    const kids = this.ghostTurretGroup.children as THREE.Mesh[];
+    if (kids[0]) kids[0].material = bodyMat;
+    if (kids[1]) kids[1].material = bodyMat;
+    if (kids[2]) kids[2].material = capMat;
   }
 
   private computeBlockedSubCells(
@@ -5749,46 +7158,39 @@ export class Arena3DRenderer {
     placeY: number,
     out: THREE.Vector4
   ) {
-    const isSubBlocked = (cx: number, cy: number): number => {
-      if (cx < 0 || cy < 0 || cx >= round.gridWidth || cy >= round.gridHeight) {
-        return 1;
-      }
-      // Protected 2x1 gate mouths
-      if (
-        cy === 0 &&
-        round.spawn.y === 0 &&
-        cx >= round.spawn.x &&
-        cx <= round.spawn.x + 1
-      ) {
-        return 1;
-      }
-      if (
-        cy === round.gridHeight - 1 &&
-        round.exit.y >= round.gridHeight - 2 &&
-        cx >= round.exit.x &&
-        cx <= round.exit.x + 1
-      ) {
-        return 1;
-      }
-      if (round.obstacles.some((o) => isCellIn2x2(cx, cy, o))) return 1;
-      if (round.preplacedSpires.some((s) => isCellIn2x2(cx, cy, s))) return 1;
-      if (towers.some((t) => isCellIn2x2(cx, cy, t))) return 1;
-      return 0;
-    };
-
+    // Delegate to shared `isCellPlacementBlocked` (includes Keeps, Spires, Walls, Gates, Checkpoints & Waygates)
     out.set(
-      isSubBlocked(placeX, placeY),
-      isSubBlocked(placeX + 1, placeY),
-      isSubBlocked(placeX, placeY + 1),
-      isSubBlocked(placeX + 1, placeY + 1)
+      isCellPlacementBlocked(round, towers, placeX, placeY) ? 1 : 0,
+      isCellPlacementBlocked(round, towers, placeX + 1, placeY) ? 1 : 0,
+      isCellPlacementBlocked(round, towers, placeX, placeY + 1) ? 1 : 0,
+      isCellPlacementBlocked(round, towers, placeX + 1, placeY + 1) ? 1 : 0
     );
   }
+
+  private removePreviewCache: {
+    key: string;
+    deltaTime: number;
+    deltaOvercharge: number;
+    deltaKeeps: number;
+    previewTime: number;
+    afterCircuitry: CitadelCircuitryResult;
+    afterPath: PathResult;
+    afterClaps: GridPoint[];
+  } | null = null;
 
   private showRemoveBracketVisuals(
     localIsland: IslandVisuals,
     tx: number,
-    ty: number
-  ) {
+    ty: number,
+    existingTower?: PlacedTower
+  ): {
+    deltaTime: number;
+    deltaOvercharge: number;
+    deltaKeeps: number;
+    previewTime: number;
+  } | null {
+    // P0: Always invalidate `cachedHoverPreview` so returning to the prior build cell restores the ghost!
+    this.cachedHoverPreview = null;
     this.hidePreviewPathMesh();
     this.clearPreviewConduits();
     this.ghostConnGroup.clear();
@@ -5814,7 +7216,71 @@ export class Arena3DRenderer {
     for (const sr of localIsland.spireRigs) {
       sr.targetHoverBoost = 0;
     }
+
+    // WYSIWYG Removal Synergy-Loss & Run-Time Delta Preview (memoized per tower)
+    const state = this.currentRoomState;
+    const localPlayer = state?.players.find((p) => p.id === this.localPlayerId);
+    if (existingTower && state && localPlayer && this.cachedBaseEval) {
+      const rKey = `${this.lastLocalEvalSig}|rm:${existingTower.id}`;
+      let cached = this.removePreviewCache;
+      if (!cached || cached.key !== rKey) {
+        const round = state.roundConfig;
+        const remaining = localPlayer.towers.filter(
+          (t) => t.id !== existingTower.id
+        );
+        const afterPath = computeFullMazePath(round, remaining);
+        const afterEval = evaluateMazeRunTime(round, remaining, {
+          precomputedPath: afterPath,
+          collectClapLocations: true,
+        });
+        const afterCircuitry = computeCitadelCircuitry(round, remaining);
+        cached = {
+          key: rKey,
+          deltaTime: Number(
+            (
+              afterEval.finishTimeSeconds - this.cachedBaseEval.finishTimeSeconds
+            ).toFixed(1)
+          ),
+          deltaOvercharge:
+            afterEval.overchargedSpires - this.cachedBaseEval.overchargedSpires,
+          deltaKeeps: afterEval.linkedKeeps - this.cachedBaseEval.linkedKeeps,
+          previewTime: afterEval.finishTimeSeconds,
+          afterCircuitry,
+          afterPath,
+          afterClaps: afterEval.clapLocations,
+        };
+        this.removePreviewCache = cached;
+      }
+
+      const round = state.roundConfig;
+      localIsland.conduitGroup.visible = false;
+      this.populateSpireConduits(
+        this.previewConduitGroup,
+        cached.afterCircuitry.spireConduitLinks,
+        localIsland.offsetX,
+        localIsland.offsetZ,
+        this.previewConduitMat
+      );
+      this.applyKeepLinkVisuals(
+        localIsland,
+        cached.afterCircuitry.linkedKeepIndices,
+        cached.afterCircuitry.keepPoweredSpireCounts
+      );
+      this.applySpireOverchargeVisuals(
+        localIsland,
+        cached.afterCircuitry.spireOverchargeTiers
+      );
+      this.populateClapMarkers(localIsland, round, cached.afterClaps);
+      return {
+        deltaTime: cached.deltaTime,
+        deltaOvercharge: cached.deltaOvercharge,
+        deltaKeeps: cached.deltaKeeps,
+        previewTime: cached.previewTime,
+      };
+    }
+
     this.restoreIslandBaseSynergyVisuals(localIsland);
+    return null;
   }
 
   private hidePreviewPathMesh() {
@@ -5827,12 +7293,19 @@ export class Arena3DRenderer {
 
   private clearPreviewConduits() {
     this.previewConduitGroup.clear();
+    if (this.localPlayerId) {
+      const localIsland = this.islands.get(this.localPlayerId);
+      if (localIsland) {
+        localIsland.conduitGroup.visible = !localIsland.fogVeilMesh.visible;
+      }
+    }
   }
 
   private hideDesktopHoverVisuals() {
     this.hoveredCell = null;
     this.hoveredExistingTower = null;
     this.lastHoverValid = false;
+    this.lastHoverInspected = null;
     this.cachedHoverPreview = null;
     this.ghostGroup.visible = false;
     this.ghostTurretGroup.visible = true;
@@ -5866,7 +7339,13 @@ export class Arena3DRenderer {
     round: RoundConfig,
     placeX: number,
     placeY: number,
-    snapped = false
+    snapped = false,
+    precomputedValidation?: {
+      valid: boolean;
+      reason?: string;
+      reasonCode?: string;
+      pathResult?: PathResult;
+    }
   ): CachedHoverPreview {
     const cacheKey = `${this.lastLocalEvalSig}|${localPlayer.gold}|${placeX},${placeY}|${snapped ? 1 : 0}`;
     if (this.cachedHoverPreview && this.cachedHoverPreview.key === cacheKey) {
@@ -5874,30 +7353,28 @@ export class Arena3DRenderer {
     }
 
     const hasGold = localPlayer.gold >= TOWER_SPECS.BLOCK.goldCost;
-    const validation = validateTowerPlacement(
-      round,
-      localPlayer.towers,
-      placeX,
-      placeY
-    );
+    const validation =
+      precomputedValidation && precomputedValidation.reasonCode !== 'NO_PILLARS'
+        ? precomputedValidation
+        : validateTowerPlacement(round, localPlayer.towers, placeX, placeY);
 
     const isValid = hasGold && validation.valid;
     const reason = !hasGold ? 'No walls left' : validation.reason;
     const reasonCode = !hasGold ? 'NO_PILLARS' : validation.reasonCode;
 
     this.ghostGroup.visible = true;
-    this.ghostTurretGroup.visible = true;
+    // Hide the 1.38m ghost turret on invalid / post-budget (`NO_PILLARS`) cells so the reticle pad is unobstructed
+    this.ghostTurretGroup.visible = isValid;
     this.ghostGroup.scale.set(1, 1, 1);
     this.ghostGroup.position.set(
       localIsland.offsetX + placeX + 1.0,
       0,
       localIsland.offsetZ + placeY + 1.0
     );
-    this.setGhostTint(isValid);
 
     const blockedVec = this.reticlePadMat.uniforms.uBlockedCells
       .value as THREE.Vector4;
-    if (!isValid) {
+    if (!isValid && reasonCode !== 'NO_PILLARS') {
       this.computeBlockedSubCells(
         round,
         localPlayer.towers,
@@ -5958,7 +7435,7 @@ export class Arena3DRenderer {
           this.cachedBaseEval.overchargedSpires;
       }
 
-      // Pruned ghost bridges (tinted radiant Sun-Gold when joining a Crimson Keep circuit!)
+      // Orthogonal ghost bridges + `(±2,±1)` step-piers + `(±2,±2)` corner bollards!
       const previewMasonryNodes = [
         ...localPlayer.towers.map((t) => ({ x: t.x, y: t.y })),
         ...round.obstacles.map((o) => ({ x: o.x, y: o.y })),
@@ -5990,20 +7467,47 @@ export class Arena3DRenderer {
           continue;
         }
 
-        const fullDist = Math.hypot(dx, dz);
-        const insetT = Math.min(0.42, 0.72 / fullDist);
-        const previewBridge = this.createBridgeSpanSegment(
-          0,
-          0,
-          dx,
-          dz,
-          insetT,
-          1.0 - insetT,
-          ghostWallMat,
-          ghostTrimMat,
-          true
-        );
-        this.ghostConnGroup.add(previewBridge);
+        const isOrtho =
+          (Math.abs(dx) === 2 && dz === 0) || (dx === 0 && Math.abs(dz) === 2);
+        const isDiag = Math.abs(dx) === 2 && Math.abs(dz) === 2;
+
+        if (isOrtho) {
+          // Trim span to outer face-to-face (`t ∈ [0.35, 0.65]` on 2.0m centers)
+          const previewBridge = this.createBridgeSpanSegment(
+            0,
+            0,
+            dx,
+            dz,
+            0.35,
+            0.65,
+            ghostWallMat,
+            ghostTrimMat,
+            true
+          );
+          this.ghostConnGroup.add(previewBridge);
+        } else if (isDiag) {
+          // Shared `(±2, ±2)` vertex Corner Bollard (zero walkable-grass encroachment)
+          const bollard = new THREE.Group();
+          bollard.position.set(dx * 0.5, 0, dz * 0.5);
+          const post = new THREE.Mesh(this.sharedGeos.bollardPost, ghostWallMat);
+          post.renderOrder = 10;
+          const cap = new THREE.Mesh(this.sharedGeos.bollardCap, ghostTrimMat);
+          cap.renderOrder = 10;
+          bollard.add(post, cap);
+          this.ghostConnGroup.add(bollard);
+        } else {
+          // Half-step `(±2, ±1)` / `(±1, ±2)` orthogonal Step-Seam Pier at shared 1m edge midpoint
+          const pier = new THREE.Group();
+          const alongX = Math.abs(dx) === 2;
+          pier.position.set(dx * 0.5, 0, dz * 0.5);
+          pier.rotation.y = alongX ? 0 : Math.PI * 0.5;
+          const body = new THREE.Mesh(this.sharedGeos.stepPierBody, ghostWallMat);
+          body.renderOrder = 10;
+          const cap = new THREE.Mesh(this.sharedGeos.stepPierCap, ghostTrimMat);
+          cap.renderOrder = 10;
+          pier.add(body, cap);
+          this.ghostConnGroup.add(pier);
+        }
       }
 
       // Preview Flagstone Path Ribbon (`#fef08a` sunlit gold-cream)
@@ -6020,12 +7524,13 @@ export class Arena3DRenderer {
         this.scene.add(this.previewPathMesh);
       }
 
-      // Live Synergy Preview: light up newly linked Keep braziers, Spire Overcharge & gold ley-lines!
+      // Live WYSIWYG Conduits: hide base `conduitGroup` while `previewConduitGroup` is active (zero double-stack!)
       const previewLinks = this.computeFallbackConduitLinks(
         round,
         previewMasonryNodes,
         previewCircuitry
       );
+      localIsland.conduitGroup.visible = false;
       this.populateSpireConduits(
         this.previewConduitGroup,
         previewLinks,
@@ -6040,7 +7545,11 @@ export class Arena3DRenderer {
         previewEval.clapLocations,
         this.cachedBaseEval?.clapLocations
       );
-      this.applyKeepLinkVisuals(localIsland, previewCircuitry.linkedKeepIndices);
+      this.applyKeepLinkVisuals(
+        localIsland,
+        previewCircuitry.linkedKeepIndices,
+        previewCircuitry.keepPoweredSpireCounts
+      );
       this.applySpireOverchargeVisuals(
         localIsland,
         previewEval.spireOverchargeTiers
@@ -6050,19 +7559,25 @@ export class Arena3DRenderer {
         const dist = Math.hypot(sr.gridX - placeX, sr.gridY - placeY);
         const baseTier = this.cachedBaseEval?.spireOverchargeTiers[idx] || 0;
         const newTier = previewEval.spireOverchargeTiers[idx] || 0;
+        const effR = sr.baseRange + newTier * 0.25;
         sr.targetHoverBoost =
-          dist <= sr.baseRange + 2.8 || newTier > baseTier ? 1.0 : 0.0;
+          dist <= effR + 1.2 || newTier > baseTier ? 1.0 : 0.0;
       });
     } else {
       this.restoreIslandBaseSynergyVisuals(localIsland);
       localIsland.spireRigs.forEach((sr) => {
         const dist = Math.hypot(sr.gridX - placeX, sr.gridY - placeY);
-        sr.targetHoverBoost = dist <= sr.baseRange + 2.2 ? 1.0 : 0.0;
+        sr.targetHoverBoost =
+          reasonCode === 'NO_PILLARS' ? 0.0 : dist <= sr.baseRange + 1.2 ? 1.0 : 0.0;
       });
     }
 
+    this.setGhostTint(isValid, joinsCircuit);
+
     const modeVal = !isValid
-      ? 2.0
+      ? reasonCode === 'NO_PILLARS'
+        ? 5.0
+        : 2.0
       : joinsCircuit || deltaKeeps > 0 || deltaOvercharge > 0
       ? 4.0
       : 1.0;
@@ -6075,8 +7590,9 @@ export class Arena3DRenderer {
       placeX + 2.0,
       placeY + 2.0
     );
+    // Mode 5 (`NO_PILLARS`) = 0.0 rails (calm post-budget hover); Mode 3 = amber Remove; Mode 4 = sun-gold Circuit
     localIsland.floorUniforms.uReticleMode.value =
-      modeVal === 4.0 ? 3.0 : modeVal;
+      modeVal === 5.0 ? 0.0 : modeVal;
 
     const result: CachedHoverPreview = {
       key: cacheKey,
@@ -6117,7 +7633,10 @@ export class Arena3DRenderer {
       const currentSpeed = sim ? Number(sim.currentSpeed.toFixed(2)) : baseSpeed;
       let statusLabel: string | undefined;
       if (sim) {
+        const pierced = (this.piercedHitRemaining.get(player.id) ?? 0) > 0;
         if (sim.finished) statusLabel = 'Finished';
+        else if (pierced) statusLabel = 'Pierced ◆';
+        else if ((sim.armoredHitRemaining ?? 0) > 0) statusLabel = 'Armor Resist';
         else if (sim.clapSlowRemaining > 0 && sim.inPermafrostAura)
           statusLabel = 'Slow + Frost';
         else if (sim.clapSlowRemaining > 0) statusLabel = 'Slowed';
@@ -6162,14 +7681,8 @@ export class Arena3DRenderer {
         }
 
         const safeTier = Math.max(0, Math.min(3, tier));
-        const effectiveRange = Number((spec.range + safeTier * 0.25).toFixed(2));
-        const effectiveCooldown = Number(
-          (spec.cooldown * (1 - OVERCHARGE_CDR[safeTier])).toFixed(2)
-        );
-        const auraSlowPercent =
-          spec.auraSlowPercent !== undefined
-            ? Number((spec.auraSlowPercent + safeTier * 0.02).toFixed(2))
-            : undefined;
+        // Canonical shared Spire math (`+0.25s/tier` slow duration; exact tooltip-to-sim parity)
+        const eff = getEffectiveSpireStats(spireType, safeTier);
 
         return {
           kind: 'SPIRE',
@@ -6178,14 +7691,12 @@ export class Arena3DRenderer {
           x: s.x,
           y: s.y,
           overchargeTier: safeTier,
-          effectiveRange,
-          effectiveCooldown,
-          slowPercent: spec.slowPercent,
-          slowDuration: Number(
-            (spec.slowDuration + safeTier * 0.2).toFixed(2)
-          ),
-          auraSlowPercent,
-          cdrPulseSeconds: spec.cdrPulseSeconds,
+          effectiveRange: eff.effectiveRange,
+          effectiveCooldown: eff.effectiveCooldown,
+          slowPercent: eff.slowPercent,
+          slowDuration: eff.slowDuration,
+          auraSlowPercent: eff.auraSlowPercent > 0 ? eff.auraSlowPercent : undefined,
+          cdrPulseSeconds: eff.cdrPulseSeconds > 0 ? eff.cdrPulseSeconds : undefined,
           projectedOrLiveHits,
         };
       }
@@ -6205,6 +7716,7 @@ export class Arena3DRenderer {
           x: o.x,
           y: o.y,
           linked: circ.linkedKeepIndices.has(idx),
+          poweredSpireCount: circ.keepPoweredSpireCounts?.[idx] ?? 0,
         };
       }
     }
@@ -6285,6 +7797,7 @@ export class Arena3DRenderer {
 
     // Non-build phases (RUN, RESULTS) or Spectating or PAN mode -> Feature Inspection Only!
     if (!isBuildOnLocal) {
+      this.cachedHoverPreview = null;
       this.ghostGroup.visible = false;
       this.ghostConnGroup.clear();
       this.clearPreviewConduits();
@@ -6292,6 +7805,7 @@ export class Arena3DRenderer {
       this.hoveredCell = null;
       this.hoveredExistingTower = null;
       this.lastHoverValid = false;
+      this.lastHoverInspected = null;
       focusedIsland.floorUniforms.uReticleMode.value = 0;
 
       if (!planeHit) {
@@ -6312,6 +7826,7 @@ export class Arena3DRenderer {
         planeHit.rawRelX,
         planeHit.rawRelZ
       );
+      this.lastHoverInspected = inspected;
       focusedIsland.spireRigs.forEach((sr, idx) => {
         sr.targetHoverBoost =
           inspected?.kind === 'SPIRE' && inspected.spireIndex === idx
@@ -6331,19 +7846,29 @@ export class Arena3DRenderer {
 
     // Local Island in BUILD Phase:
     // 1. 3D Mesh-First Raycast for existing player Stone Walls (zero cap parallax miss!)
-    let existing = this.raycastExistingWallMesh(focusedIsland, focusedPlayer);
-    if (!existing && planeHit) {
-      const cx = Math.floor(planeHit.relX);
-      const cy = Math.floor(planeHit.relZ);
-      existing =
-        focusedPlayer.towers.find((t) => isCellIn2x2(cx, cy, t)) || null;
+    //    Suppressed during Shift-paint so the wall just placed never flashes amber `Remove (+1)`.
+    let existing: PlacedTower | null = null;
+    if (!this.isShiftPainting) {
+      existing = this.raycastExistingWallMesh(focusedIsland, focusedPlayer);
+      if (!existing && planeHit) {
+        const cx = Math.floor(planeHit.relX);
+        const cy = Math.floor(planeHit.relZ);
+        existing =
+          focusedPlayer.towers.find((t) => isCellIn2x2(cx, cy, t)) || null;
+      }
     }
     this.hoveredExistingTower = existing;
 
     if (existing) {
       this.hoveredCell = { x: existing.x, y: existing.y };
       this.lastHoverValid = false;
-      this.showRemoveBracketVisuals(focusedIsland, existing.x, existing.y);
+      this.lastHoverInspected = null;
+      const removal = this.showRemoveBracketVisuals(
+        focusedIsland,
+        existing.x,
+        existing.y,
+        existing
+      );
       this.onHoverStatusChange?.({
         cell: { x: existing.x, y: existing.y },
         screenX: this.lastPointerScreen.x,
@@ -6351,6 +7876,10 @@ export class Arena3DRenderer {
         valid: true,
         reason: 'Remove (+1)',
         existingTower: existing,
+        deltaTime: removal?.deltaTime,
+        deltaOvercharge: removal?.deltaOvercharge,
+        deltaKeeps: removal?.deltaKeeps,
+        previewTime: removal?.previewTime,
       });
       return;
     }
@@ -6361,14 +7890,18 @@ export class Arena3DRenderer {
     }
 
     // 2. Check if cursor is directly over a Spire, Keep, Gate, or Runner -> Inspect instead of flashing red 'Occupied'!
-    const inspected = this.detectInspectedWorldFeature(
-      focusedIsland,
-      focusedPlayer,
-      round,
-      planeHit.rawRelX,
-      planeHit.rawRelZ
-    );
+    const inspected = this.isShiftPainting
+      ? null
+      : this.detectInspectedWorldFeature(
+          focusedIsland,
+          focusedPlayer,
+          round,
+          planeHit.rawRelX,
+          planeHit.rawRelZ
+        );
+    this.lastHoverInspected = inspected;
     if (inspected) {
+      this.cachedHoverPreview = null;
       this.hoveredCell = null;
       this.lastHoverValid = false;
       this.ghostGroup.visible = false;
@@ -6397,16 +7930,23 @@ export class Arena3DRenderer {
     }
 
     if (this._activeTool === 'SELL') {
+      this.cachedHoverPreview = null;
       this.ghostGroup.visible = false;
       this.ghostConnGroup.clear();
       this.clearPreviewConduits();
       this.hidePreviewPathMesh();
+      this.restoreIslandBaseSynergyVisuals(focusedIsland);
       focusedIsland.floorUniforms.uCursorPos.value.set(
         planeHit.relX,
         planeHit.relZ
       );
       focusedIsland.floorUniforms.uReticleMode.value = 0;
       for (const sr of focusedIsland.spireRigs) sr.targetHoverBoost = 0;
+      // Track the raw cell so grass-tolerant SELL sweep can interpolate between samples
+      this.hoveredCell = {
+        x: Math.max(0, Math.min(round.gridWidth - 2, Math.round(planeHit.relX - 1))),
+        y: Math.max(0, Math.min(round.gridHeight - 2, Math.round(planeHit.relZ - 1))),
+      };
       this.onHoverStatusChange?.({
         cell: null,
         screenX: this.lastPointerScreen.x,
@@ -6427,12 +7967,15 @@ export class Arena3DRenderer {
       return;
     }
 
+    // Raw unclamped coords; Shift-paint disables snap (`searchSpanOverride: 0`) for axis-clean lines
     const smart = resolveSmart2x2Placement(
       round,
       focusedPlayer.towers,
-      planeHit.relX,
-      planeHit.relZ,
-      { mode: 'mouse', availableGold: focusedPlayer.gold }
+      planeHit.rawRelX,
+      planeHit.rawRelZ,
+      this.isShiftPainting
+        ? { mode: 'mouse', availableGold: focusedPlayer.gold, searchSpanOverride: 0 }
+        : { mode: 'mouse', availableGold: focusedPlayer.gold }
     );
 
     this.hoveredCell = { x: smart.x, y: smart.y };
@@ -6442,7 +7985,8 @@ export class Arena3DRenderer {
       round,
       smart.x,
       smart.y,
-      smart.snapped
+      smart.snapped,
+      smart
     );
     this.lastHoverValid = preview.valid;
 
@@ -6466,6 +8010,13 @@ export class Arena3DRenderer {
   // BESPOKE SPIRE COMBAT VFX, RUNNER KINEMATICS & ZERO-THRASH WORLD LABELS
   // ==========================================================================
 
+  // Reusable VFX pools (zero per-clap ShaderMaterial / Mesh BasicMaterial GC churn in 6-island 4× RUN!)
+  private readonly shockwavePool: THREE.Mesh[] = [];
+  private readonly frostNovaPool: THREE.Mesh[] = [];
+  private readonly chronoWavePool: THREE.Mesh[] = [];
+  private readonly arcMatPool: THREE.MeshBasicMaterial[] = [];
+  private readonly relayMatPool: THREE.MeshBasicMaterial[] = [];
+
   public updateRunners(
     states: Map<string, RunnerSimState>,
     events: SimEvent[]
@@ -6485,6 +8036,8 @@ export class Arena3DRenderer {
         const effectiveRange =
           simTower?.effectiveRange ??
           TOWER_SPECS[spireType].range + tier * 0.25;
+
+        this.lastBurstSpireType.set(ev.playerId, spireType);
 
         const worldSpireX = island.offsetX + ev.x;
         const worldSpireZ = island.offsetZ + ev.y;
@@ -6514,19 +8067,17 @@ export class Arena3DRenderer {
             );
           }
         } else if (spireType === 'CHRONO_SPIRE') {
-          // Violet Temporal Implosion-Expansion Wave + Golden-Violet CDR Relay to Sibling Spires!
-          this.spawnShockwaveEffect(
-            worldSpireX,
-            worldSpireZ,
-            effectiveRange,
-            '#c084fc'
-          );
+          // Temporal Implosion -> Outburst Wave + Honest CDR Relay ONLY to Spires in `ev.cdrTargetIds`!
+          this.spawnChronoWaveEffect(worldSpireX, worldSpireZ, effectiveRange);
+          const rechargedSet = new Set(ev.cdrTargetIds || []);
           for (const sibling of island.spireRigs) {
             const dist = Math.hypot(
               sibling.group.position.x - ev.x,
               sibling.group.position.z - ev.y
             );
-            if (dist > 0.6) {
+            if (dist <= 0.6) {
+              sibling.recoil = 1.0;
+            } else if (rechargedSet.has(`spire_${sibling.spireIndex}`)) {
               sibling.cdrFlash = 1.0;
               this.spawnChronoRelayArc(
                 worldSpireX,
@@ -6536,8 +8087,6 @@ export class Arena3DRenderer {
                 1.35,
                 island.offsetZ + sibling.group.position.z
               );
-            } else {
-              sibling.recoil = 1.0;
             }
           }
           if (isFocused) {
@@ -6582,24 +8131,49 @@ export class Arena3DRenderer {
           }
         }
 
-        // Iron Juggernaut Armor Deflect vs Overcharge Armor-Pierce Burst!
+        // Iron Juggernaut Armor Deflect (`0◆` steel ring at shield height `y = 0.76m`) vs Overcharge Pierce (`1◆+` gold)!
         if (ev.armoredResisted) {
           this.spawnShockwaveEffect(
             targetRunnerX,
             targetRunnerZ,
-            0.95,
-            '#94a3b8'
+            0.92,
+            '#94a3b8',
+            undefined,
+            undefined,
+            0.76
           );
+          if (isFocused) {
+            this.spawnParticleBurst(
+              targetRunnerX,
+              0.82,
+              targetRunnerZ,
+              '#cbd5e1',
+              5
+            );
+          }
         } else if (
           tier >= 1 &&
           island.runner.archetype === 'JUGGERNAUT'
         ) {
+          this.piercedHitRemaining.set(ev.playerId, 0.85);
           this.spawnShockwaveEffect(
             targetRunnerX,
             targetRunnerZ,
-            1.15,
-            '#fbbf24'
+            1.12,
+            '#fbbf24',
+            undefined,
+            undefined,
+            0.76
           );
+          if (isFocused) {
+            this.spawnParticleBurst(
+              targetRunnerX,
+              0.86,
+              targetRunnerZ,
+              '#fde047',
+              6
+            );
+          }
         }
       } else if (ev.type === 'CHECKPOINT') {
         this.spawnShockwaveEffect(
@@ -6608,6 +8182,18 @@ export class Arena3DRenderer {
           2.0,
           '#10b981'
         );
+        if (
+          !this.arenaOverviewMode &&
+          ev.playerId === (this.focusedPlayerId || this.localPlayerId)
+        ) {
+          this.spawnParticleBurst(
+            island.offsetX + ev.x,
+            0.9,
+            island.offsetZ + ev.y,
+            '#6ee7b7',
+            7
+          );
+        }
       } else if (ev.type === 'WAYGATE') {
         this.spawnShockwaveEffect(
           island.offsetX + ev.x,
@@ -6659,7 +8245,13 @@ export class Arena3DRenderer {
         let diff = targetYaw - r.currentYaw;
         while (diff > Math.PI) diff -= Math.PI * 2;
         while (diff < -Math.PI) diff += Math.PI * 2;
-        r.currentYaw += diff * 0.26;
+        // Displacement-aware yaw damping so `4×` speed corners never slide sideways
+        const yawAlpha =
+          1 -
+          Math.exp(
+            -18 * Math.max(0.016, distMoved / Math.max(1, sim.currentSpeed))
+          );
+        r.currentYaw += diff * yawAlpha;
         r.root.rotation.y = r.currentYaw;
 
         const bankAngle = Math.max(-0.3, Math.min(0.3, -diff * 1.5));
@@ -6678,42 +8270,86 @@ export class Arena3DRenderer {
           r.leftArm.rotation.x = -swing * 0.7;
           r.rightArm.rotation.x = swing * 0.14;
           if (r.pennantMesh) {
-            r.pennantMesh.rotation.y = Math.sin(r.walkPhase * 1.6) * 0.24;
+            r.pennantMesh.rotation.y = Math.sin(r.walkPhase * 1.6) * 0.22;
           }
         } else {
           r.leftArm.rotation.x = -swing * 0.7;
           r.rightArm.rotation.x = swing * 0.46;
         }
 
-        // Wind Herald dynamic wing flare during Tailwind Haste!
+        // Wind Herald smooth wing flare + subtle wing-beat during Tailwind Haste!
         if (r.leftWing && r.rightWing) {
-          const haste = sim.hasTailwindMomentum;
-          r.leftWing.rotation.y = haste ? -0.82 : -0.42;
-          r.rightWing.rotation.y = haste ? 0.82 : 0.42;
-          r.leftWing.scale.setScalar(haste ? 1.22 : 1.0);
-          r.rightWing.scale.setScalar(haste ? 1.22 : 1.0);
+          const targetFlare = sim.hasTailwindMomentum ? 1 : 0;
+          const prevFlare = r.heraldWingFlare ?? 0;
+          const flare = prevFlare + (targetFlare - prevFlare) * 0.22;
+          r.heraldWingFlare = flare;
+          const beat = flare * Math.sin(r.walkPhase * 2.2) * 0.08;
+          r.leftWing.rotation.y = -0.42 - flare * 0.4 - beat;
+          r.rightWing.rotation.y = 0.42 + flare * 0.4 + beat;
+          const wScale = 1.0 + flare * 0.22;
+          r.leftWing.scale.setScalar(wScale);
+          r.rightWing.scale.setScalar(wScale);
           const wMat = r.leftWing.material as THREE.MeshStandardMaterial;
-          wMat.emissiveIntensity = haste ? 0.75 : 0.28;
+          wMat.emissiveIntensity = 0.28 + flare * 0.47;
         }
 
         r.pelvis.position.y = 0.45 + Math.abs(Math.sin(r.walkPhase)) * 0.11;
         r.pelvis.rotation.x = sim.hasTailwindMomentum ? 0.22 : 0.12;
       } else {
-        // Calm victorious idle pose facing camera (zero dizzying endless spin!)
+        // Calm victorious idle pose facing camera; damp arms/pennant/wings cleanly back to neutral
         r.pelvis.position.y =
           0.54 + Math.sin(performance.now() * 0.005) * 0.05;
         r.pelvis.rotation.x = 0;
         r.pelvis.rotation.z = 0;
-        r.leftLeg.rotation.x = 0;
-        r.rightLeg.rotation.x = 0;
+        r.leftLeg.rotation.x *= 0.8;
+        r.rightLeg.rotation.x *= 0.8;
+        r.leftArm.rotation.x *= 0.82;
+        r.rightArm.rotation.x *= 0.82;
+        if (r.pennantMesh) r.pennantMesh.rotation.y *= 0.82;
+        if (r.leftWing && r.rightWing) {
+          r.heraldWingFlare = (r.heraldWingFlare ?? 0) * 0.82;
+          r.leftWing.rotation.y = -0.42 - r.heraldWingFlare * 0.4;
+          r.rightWing.rotation.y = 0.42 + r.heraldWingFlare * 0.4;
+          r.leftWing.scale.setScalar(1.0 + r.heraldWingFlare * 0.22);
+          r.rightWing.scale.setScalar(1.0 + r.heraldWingFlare * 0.22);
+        }
         r.currentYaw += (0 - r.currentYaw) * 0.15;
         r.root.rotation.y = r.currentYaw;
       }
 
-      // Dual-Status Segmented Ground Ring (shows stacked Slow + Frost simultaneously!)
+      // Ignite 3D Gilded Checkpoint Waystones as the runner crosses them (`sim.checkpointsReached > cpIdx`)
+      island.checkpointRigs.forEach((cpRig, cpIdx) => {
+        const shouldLight = sim.checkpointsReached > cpIdx;
+        if (cpRig.lit !== shouldLight) {
+          cpRig.lit = shouldLight;
+          const mat = shouldLight
+            ? this.checkpointChimeLitMat
+            : this.checkpointChimeDormantMat;
+          for (const ch of cpRig.chimes) ch.material = mat;
+        }
+      });
+
+      // Element-tinted Dual-Status Ground Ring (colors `clapSlowRemaining` by triggering Spire!)
       const activeColors: string[] = [];
-      if (sim.clapSlowRemaining > 0) activeColors.push('#f59e0b');
-      if (sim.inPermafrostAura || sim.inFrostMire) activeColors.push('#38bdf8');
+      const burstType = this.lastBurstSpireType.get(playerId) || 'THUNDERCLAP';
+      const burstHex =
+        burstType === 'FROST_OBELISK'
+          ? '#38bdf8'
+          : burstType === 'CHRONO_SPIRE'
+          ? '#c084fc'
+          : '#f59e0b';
+      if ((this.piercedHitRemaining.get(playerId) ?? 0) > 0) {
+        activeColors.push('#fbbf24');
+      } else if ((sim.armoredHitRemaining ?? 0) > 0) {
+        activeColors.push('#94a3b8');
+      }
+      if (sim.clapSlowRemaining > 0) activeColors.push(burstHex);
+      if (
+        (sim.inPermafrostAura || sim.inFrostMire) &&
+        !activeColors.includes('#38bdf8')
+      ) {
+        activeColors.push('#38bdf8');
+      }
       if (sim.hasTailwindMomentum) activeColors.push('#34d399');
       if (sim.inHasteRift) activeColors.push('#fb7185');
 
@@ -6851,19 +8487,28 @@ export class Arena3DRenderer {
     maxRadius: number,
     colorHex: string,
     arcTargetX?: number,
-    arcTargetZ?: number
+    arcTargetZ?: number,
+    worldY = 0.045
   ) {
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: colorHex,
-      transparent: true,
-      opacity: 0.8,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const mesh = new THREE.Mesh(this.sharedGeos.shockwaveRing, ringMat);
-    mesh.position.set(worldX, 0.045, worldZ);
-    mesh.renderOrder = 9;
-    this.scene.add(mesh);
+    let mesh = this.shockwavePool.pop();
+    if (!mesh) {
+      const ringMat = new THREE.MeshBasicMaterial({
+        color: colorHex,
+        transparent: true,
+        opacity: 0.8,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+      mesh = new THREE.Mesh(this.sharedGeos.shockwaveRing, ringMat);
+      mesh.renderOrder = 9;
+      this.scene.add(mesh);
+    } else {
+      const m = mesh.material as THREE.MeshBasicMaterial;
+      m.color.set(colorHex);
+      m.opacity = 0.8;
+      mesh.visible = true;
+    }
+    mesh.position.set(worldX, worldY, worldZ);
 
     let arcMesh: THREE.Mesh | undefined;
     if (arcTargetX !== undefined && arcTargetZ !== undefined) {
@@ -6878,13 +8523,16 @@ export class Arena3DRenderer {
         0.085,
         0.025
       );
-      const arcMat = new THREE.MeshBasicMaterial({
-        color: '#fef08a',
-        transparent: true,
-        opacity: 0.92,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      });
+      const arcMat =
+        this.arcMatPool.pop() ||
+        new THREE.MeshBasicMaterial({
+          color: '#fef08a',
+          transparent: true,
+          opacity: 0.92,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+      arcMat.opacity = 0.92;
       arcMesh = new THREE.Mesh(arcGeo, arcMat);
       arcMesh.renderOrder = 10;
       this.scene.add(arcMesh);
@@ -6897,7 +8545,7 @@ export class Arena3DRenderer {
       maxAge: 0.46,
       startRadius: 0.42,
       maxRadius,
-      isShaderMat: false,
+      poolKind: 'basic',
     });
   }
 
@@ -6906,11 +8554,17 @@ export class Arena3DRenderer {
     worldZ: number,
     maxRadius: number
   ) {
-    const novaMat = createFrostHexNovaShader();
-    const mesh = new THREE.Mesh(this.sharedGeos.unitCirclePlane, novaMat);
+    let mesh = this.frostNovaPool.pop();
+    if (!mesh) {
+      const novaMat = createFrostHexNovaShader();
+      mesh = new THREE.Mesh(this.sharedGeos.unitCirclePlane, novaMat);
+      mesh.renderOrder = 9;
+      this.scene.add(mesh);
+    } else {
+      (mesh.material as THREE.ShaderMaterial).uniforms.uOpacity.value = 0.85;
+      mesh.visible = true;
+    }
     mesh.position.set(worldX, 0.048, worldZ);
-    mesh.renderOrder = 9;
-    this.scene.add(mesh);
 
     this.shockwaves.push({
       mesh,
@@ -6918,7 +8572,37 @@ export class Arena3DRenderer {
       maxAge: 0.52,
       startRadius: 0.5,
       maxRadius,
-      isShaderMat: true,
+      poolKind: 'frost',
+    });
+  }
+
+  private spawnChronoWaveEffect(
+    worldX: number,
+    worldZ: number,
+    maxRadius: number
+  ) {
+    let mesh = this.chronoWavePool.pop();
+    if (!mesh) {
+      const waveMat = createChronoTemporalWaveShader();
+      mesh = new THREE.Mesh(this.sharedGeos.unitCirclePlane, waveMat);
+      mesh.renderOrder = 9;
+      this.scene.add(mesh);
+    } else {
+      const m = mesh.material as THREE.ShaderMaterial;
+      m.uniforms.uProgress.value = 0.0;
+      m.uniforms.uOpacity.value = 0.88;
+      mesh.visible = true;
+    }
+    mesh.position.set(worldX, 0.048, worldZ);
+    mesh.scale.set(maxRadius, 1, maxRadius);
+
+    this.shockwaves.push({
+      mesh,
+      age: 0,
+      maxAge: 0.54,
+      startRadius: maxRadius,
+      maxRadius,
+      poolKind: 'chrono',
     });
   }
 
@@ -6941,13 +8625,16 @@ export class Arena3DRenderer {
       0.07,
       0.035
     );
-    const mat = new THREE.MeshBasicMaterial({
-      color: '#e9d5ff',
-      transparent: true,
-      opacity: 0.88,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
+    const mat =
+      this.relayMatPool.pop() ||
+      new THREE.MeshBasicMaterial({
+        color: '#e9d5ff',
+        transparent: true,
+        opacity: 0.88,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      });
+    mat.opacity = 0.88;
     const mesh = new THREE.Mesh(geo, mat);
     mesh.renderOrder = 10;
     this.scene.add(mesh);
@@ -6961,6 +8648,7 @@ export class Arena3DRenderer {
   private createIslandDOMElements(player: PlayerState) {
     const header = document.createElement('div');
     header.className = 'island-3d-badge';
+    header.dataset.playerId = player.id;
     header.style.setProperty('--player-color', player.color);
     header.style.pointerEvents = 'auto';
     header.style.cursor = 'pointer';
@@ -7038,7 +8726,9 @@ export class Arena3DRenderer {
       refs.dot.style.background = player.color;
     }
 
-    const displayName = player.isBot ? `${player.name} · BOT` : player.name;
+    const compactMobile = this.viewportW <= 768;
+    const displayName =
+      player.isBot && !compactMobile ? `${player.name} · BOT` : player.name;
     if (refs.lastName !== displayName) {
       refs.lastName = displayName;
       refs.name.textContent = displayName;
@@ -7046,16 +8736,25 @@ export class Arena3DRenderer {
 
     let metaText: string;
     if (this.currentRoomState?.phase === 'RUN' && island.lastSimTimeText) {
-      metaText = island.lastSimStatus
-        ? `${island.lastSimTimeText} · ${island.lastSimStatus}`
-        : island.lastSimTimeText;
+      metaText =
+        !compactMobile && island.lastSimStatus
+          ? `${island.lastSimTimeText} · ${island.lastSimStatus}`
+          : island.lastSimTimeText;
     } else if (player.fogMasked) {
-      metaText = player.ready ? 'Hidden · Ready' : 'Hidden';
+      metaText = compactMobile
+        ? player.ready
+          ? 'Fog ✓'
+          : 'Fog'
+        : player.ready
+        ? 'Hidden · Ready'
+        : 'Hidden';
     } else {
       const distStr = `${player.pathDistance.toFixed(0)}m`;
       metaText =
         this.currentRoomState?.phase === 'BUILD' && player.ready
-          ? `${distStr} · Ready`
+          ? compactMobile
+            ? `${distStr} ✓`
+            : `${distStr} · Ready`
           : distStr;
     }
 
@@ -7066,7 +8765,7 @@ export class Arena3DRenderer {
   }
 
   /**
-   * Dirty-checked Runner status tag (`0` innerHTML wipes, `0` floating `x4` confusion!).
+   * Dirty-checked Runner status tag (`0` innerHTML wipes; status-only while running, time shown only on `Done`).
    * In `arenaOverviewMode`, folds live runner status into `.island-3d-badge` so 12 pills never collide!
    */
   private syncRunnerAndOverviewBadges(
@@ -7076,15 +8775,30 @@ export class Arena3DRenderer {
   ) {
     let statusText = '';
     let dotColor = '';
+    const pierced = (this.piercedHitRemaining.get(playerId) ?? 0) > 0;
+    const burstType = this.lastBurstSpireType.get(playerId) || 'THUNDERCLAP';
+    const burstColor =
+      burstType === 'FROST_OBELISK'
+        ? '#38bdf8'
+        : burstType === 'CHRONO_SPIRE'
+        ? '#c084fc'
+        : '#f59e0b';
+
     if (sim.finished) {
       statusText = 'Done';
       dotColor = '#34d399';
+    } else if (pierced) {
+      statusText = 'Pierced ◆';
+      dotColor = '#fbbf24';
+    } else if ((sim.armoredHitRemaining ?? 0) > 0) {
+      statusText = 'Armor -20%';
+      dotColor = '#94a3b8';
     } else if (sim.clapSlowRemaining > 0 && sim.inPermafrostAura) {
       statusText = 'Slow + Frost';
       dotColor = '#38bdf8';
     } else if (sim.clapSlowRemaining > 0) {
       statusText = 'Slow';
-      dotColor = '#f59e0b';
+      dotColor = burstColor;
     } else if (sim.inPermafrostAura || sim.inFrostMire) {
       statusText = 'Frost';
       dotColor = '#38bdf8';
@@ -7121,9 +8835,13 @@ export class Arena3DRenderer {
       refs.lastDotColor = dotColor;
       refs.dot.style.background = dotColor;
     }
-    if (refs.lastTime !== timeVal) {
-      refs.lastTime = timeVal;
-      refs.time.textContent = timeVal;
+    // Show time ONLY when `sim.finished === true` (pre-finish `.runner-3d-badge` is status-only!)
+    const showTime = sim.finished;
+    const timeDisplayVal = showTime ? timeVal : '';
+    if (refs.lastTime !== timeDisplayVal) {
+      refs.lastTime = timeDisplayVal;
+      refs.time.textContent = timeDisplayVal;
+      refs.time.style.display = showTime ? 'inline' : 'none';
     }
   }
 
@@ -7147,7 +8865,7 @@ export class Arena3DRenderer {
   }
 
   // ==========================================================================
-  // 60FPS RENDER LOOP (ISLAND CULLING, ROLLING DPR GOVERNOR & EDGE AUTO-PAN)
+  // 60FPS RENDER LOOP (FRUSTUM CULLING, BIDIRECTIONAL DPR & SMOOTH EDGE AUTO-PAN)
   // ==========================================================================
 
   public renderFrame(dt: number): void {
@@ -7157,25 +8875,42 @@ export class Arena3DRenderer {
     const isBuildPhase = this.currentRoomState?.phase === 'BUILD';
     const isRunPhase = this.currentRoomState?.phase === 'RUN';
 
-    // Rolling 90-frame FPS governor: step DPR down gracefully if sustained frame > 21ms
+    // Bidirectional 90-frame DPR governor: step down on >21.5ms; recover to 1.0 after 2 fast (<11.5ms) windows
     this.fpsAccumDt += safeDt;
     this.fpsFrameCount++;
     if (this.fpsFrameCount >= 90) {
       const avgMs = (this.fpsAccumDt / this.fpsFrameCount) * 1000;
       if (avgMs > 21.5 && this.dprScaleCap > 0.72) {
+        this.dprFastWindows = 0;
         this.dprScaleCap = Math.max(0.7, this.dprScaleCap - 0.15);
         this.renderer.setPixelRatio(this.computeAdaptivePixelRatio());
+      } else if (avgMs < 11.5 && this.dprScaleCap < 0.999) {
+        this.dprFastWindows++;
+        if (this.dprFastWindows >= 2) {
+          this.dprFastWindows = 0;
+          this.dprScaleCap = Math.min(1.0, this.dprScaleCap + 0.1);
+          this.renderer.setPixelRatio(this.computeAdaptivePixelRatio());
+        }
+      } else {
+        this.dprFastWindows = 0;
       }
       this.fpsAccumDt = 0;
       this.fpsFrameCount = 0;
     }
 
+    for (const [pid, rem] of this.piercedHitRemaining.entries()) {
+      if (rem <= safeDt) this.piercedHitRemaining.delete(pid);
+      else this.piercedHitRemaining.set(pid, rem - safeDt);
+    }
+
     this.voidSeaMat.uniforms.uTime.value = uTimeVal;
+    this.fogVeilMat.uniforms.uTime.value = uTimeVal;
     this.reticlePadMat.uniforms.uTime.value = uTimeVal;
     this.previewPathMat.uniforms.uTime.value = uTimeVal;
     this.previewConduitMat.uniforms.uTime.value = uTimeVal;
 
     // Keyboard camera panning (disabled cleanly when `modalOpen === true`)
+    let keyboardMovedCam = false;
     if (!this._modalOpen && this.keysDown.size > 0) {
       const moveForward =
         (this.keysDown.has('arrowup') || this.keysDown.has('w') ? 1 : 0) -
@@ -7192,29 +8927,74 @@ export class Arena3DRenderer {
         this.camGoalTarget.z +=
           (-cosAz * moveForward - sinAz * moveRight) * panSpeed;
         this.clampCameraTarget();
+        keyboardMovedCam = true;
       }
     }
 
-    // Viewport-Edge Auto-Pan during Mobile Loupe Ghost Drag!
+    // Smooth hold-lift + Azimuth-aware ramped Edge Auto-Pan during Mobile Loupe Ghost Drag!
+    let loupeNeedsReproject = false;
+    let loupeFingerX = 0;
+    let loupeFingerY = 0;
     if (this.isLoupeDragging && this.activeTouches.size === 1) {
       const touch = Array.from(this.activeTouches.values())[0];
+      loupeFingerX = touch.x;
+      loupeFingerY = touch.y;
+
+      // Animate hold-lift smoothly inside renderFrame (never step-jumps on delayed first move!)
+      if (!this.canGrabExistingGhost) {
+        const diffLift = this.loupeLiftTargetY - this.loupeCurrentOffset.y;
+        if (Math.abs(diffLift) > 0.35) {
+          this.loupeCurrentOffset.y += diffLift * Math.min(1, safeDt * 18);
+          loupeNeedsReproject = true;
+        } else {
+          this.loupeCurrentOffset.y = this.loupeLiftTargetY;
+        }
+      }
+
+      const relX = touch.x - this.viewportLeft;
+      const relY = touch.y - this.viewportTop;
+      const aimRelY = relY + this.loupeCurrentOffset.y;
       const edgeZone = 44;
-      let edgeVx = 0;
-      let edgeVz = 0;
-      if (touch.x < edgeZone) edgeVx = -1;
-      else if (touch.x > this.viewportW - edgeZone) edgeVx = 1;
+      const topEdge = this.hudSafeTopPx + 32;
+      const botEdge = this.viewportH - this.hudSafeBottomLivePx - 32;
 
-      const topEdge = this.hudSafeTopPx + 36;
-      const botEdge = this.viewportH - this.hudSafeBottomPx - 42;
-      if (touch.y < topEdge) edgeVz = -1;
-      else if (touch.y > botEdge) edgeVz = 1;
+      let rx = 0;
+      let rz = 0;
+      if (relX < edgeZone) {
+        const p = Math.min(1, (edgeZone - relX) / edgeZone);
+        rx = -(p * p);
+      } else if (relX > this.viewportW - edgeZone) {
+        const p = Math.min(1, (relX - (this.viewportW - edgeZone)) / edgeZone);
+        rx = p * p;
+      }
+      if (aimRelY < topEdge) {
+        const p = Math.min(1, (topEdge - aimRelY) / edgeZone);
+        rz = -(p * p);
+      } else if (relY > botEdge) {
+        const p = Math.min(1, (relY - botEdge) / edgeZone);
+        rz = p * p;
+      }
 
-      if ((edgeVx !== 0 || edgeVz !== 0) && this.camRadius < 74) {
-        const speed = 10.5 * safeDt;
-        this.camGoalTarget.x += edgeVx * speed;
-        this.camGoalTarget.z += edgeVz * speed;
+      if (rx !== 0 || rz !== 0) {
+        const mag = Math.hypot(rx, rz);
+        if (mag > 1) {
+          rx /= mag;
+          rz /= mag;
+        }
+        const prevGoalX = this.camGoalTarget.x;
+        const prevGoalZ = this.camGoalTarget.z;
+        const speed = Math.max(5.5, this.camRadius * 0.22) * safeDt;
+        const cosA = Math.cos(this.camAzimuth);
+        const sinA = Math.sin(this.camAzimuth);
+        this.camGoalTarget.x += (rx * cosA + rz * sinA) * speed;
+        this.camGoalTarget.z += (-rx * sinA + rz * cosA) * speed;
         this.clampCameraTarget();
-        this.updateLoupeDragAtScreen(touch.x, touch.y, false);
+        if (
+          Math.abs(this.camGoalTarget.x - prevGoalX) > 0.0005 ||
+          Math.abs(this.camGoalTarget.z - prevGoalZ) > 0.0005
+        ) {
+          loupeNeedsReproject = true;
+        }
       }
     }
 
@@ -7244,6 +9024,18 @@ export class Arena3DRenderer {
     this.camera.position.set(camX, camY, camZ);
     this.camera.lookAt(this.camTarget);
     this.camera.updateMatrixWorld();
+
+    // Post-matrix raycast refresh for Loupe lift/edge-pan and WASD panning
+    if (loupeNeedsReproject && this.isLoupeDragging) {
+      this.updateLoupeDragAtScreen(loupeFingerX, loupeFingerY, false);
+    } else if (
+      keyboardMovedCam &&
+      this.mouseNDC.x > -9 &&
+      !this.pendingTouchCell &&
+      !this.pendingTouchTowerId
+    ) {
+      this.updateBuildHover();
+    }
 
     this.updateSunShadowFrustum();
 
@@ -7280,21 +9072,21 @@ export class Arena3DRenderer {
     }
 
     const gw = this.currentRoomState?.roundConfig.gridWidth || 20;
-    const gh = this.currentRoomState?.roundConfig.gridHeight || 26;
     const focusedPid = this.focusedPlayerId || this.localPlayerId;
 
+    // Exact camera frustum culling (replaces coarse `distToCamTarget < 34`)
+    this._projScreenMatrix.multiplyMatrices(
+      this.camera.projectionMatrix,
+      this.camera.matrixWorldInverse
+    );
+    this._frustum.setFromProjectionMatrix(this._projScreenMatrix);
+
     for (const island of this.islands.values()) {
-      // Off-screen rival island culling when focused (`!arenaOverviewMode`): cuts traversal & draw calls by ~80%!
       const islCenterX = island.offsetX + gw * 0.5;
-      const islCenterZ = island.offsetZ + gh * 0.5;
-      const distToCamTarget = Math.hypot(
-        islCenterX - this.camTarget.x,
-        islCenterZ - this.camTarget.z
-      );
       const shouldBeVisible =
         this.arenaOverviewMode ||
         island.playerId === focusedPid ||
-        distToCamTarget < 34;
+        this._frustum.intersectsBox(island.worldBounds);
 
       island.root.visible = shouldBeVisible;
 
@@ -7339,30 +9131,53 @@ export class Arena3DRenderer {
 
       island.clapMarkerGroup.visible = Boolean(isBuildPhase && !isFogged);
 
-      for (const entry of island.towerMeshes.values()) {
-        const ageSec = (now - entry.born) / 1000;
-        if (ageSec < 0.26) {
-          const scaleY = evalToyBoxSpringScaleY(ageSec / 0.26);
-          const scaleXZ = 1 / Math.sqrt(scaleY);
-          entry.group.scale.set(scaleXZ, scaleY, scaleXZ);
-        } else if (entry.group.scale.y !== 1) {
-          entry.group.scale.set(1, 1, 1);
+      // Instanced Stone Wall spring pop (`0` matrix writes/frame when steady!)
+      for (let wIdx = 0; wIdx < island.wallOrder.length; wIdx++) {
+        const entry = island.towerMeshes.get(island.wallOrder[wIdx]);
+        if (!entry) continue;
+        const ageMs = now - entry.born;
+        if (ageMs >= 0 && ageMs < 280) {
+          const scaleY =
+            ageMs < 260 ? evalToyBoxSpringScaleY(ageMs / 260) : 1.0;
+          this.writeWallInstanceMatrices(
+            island,
+            wIdx,
+            entry.x,
+            entry.y,
+            scaleY
+          );
+          if (ageMs >= 260) entry.born = now - 1000;
         }
       }
 
-      for (const bEntry of island.bridgeEntries) {
-        const ageSec = (now - bEntry.born) / 1000;
-        if (ageSec < 0.26) {
-          bEntry.group.scale.y = evalToyBoxSpringScaleY(ageSec / 0.26);
-        } else if (bEntry.group.scale.y !== 1) {
-          bEntry.group.scale.y = 1;
+      // Instanced masonry spring pop (`bridgeRecs` pruned once settled -> `0` steady work!)
+      for (let bIdx = island.bridgeRecs.length - 1; bIdx >= 0; bIdx--) {
+        const rec = island.bridgeRecs[bIdx];
+        const ageMs = now - rec.born;
+        if (ageMs < 260) {
+          this.writeMasonryInstanceMatrix(
+            rec,
+            evalToyBoxSpringScaleY(Math.max(0, ageMs) / 260)
+          );
+        } else {
+          this.writeMasonryInstanceMatrix(rec, 1.0);
+          island.bridgeRecs.splice(bIdx, 1);
+        }
+      }
+
+      // Living Keep crown braziers (`linkState >= 1`)
+      for (const ruin of island.ruinRigs) {
+        if ((ruin.linkState ?? 0) >= 1) {
+          const baseS = ruin.linkState === 2 ? 1.0 : 0.68;
+          ruin.lanternMesh.scale.y =
+            baseS * (1.0 + Math.sin(uTimeVal * 5.0 + ruin.keepIndex * 1.7) * 0.08);
         }
       }
 
       for (const spireRig of island.spireRigs) {
         const targetRingAlpha = isBuildPhase
-          ? 0.28 + spireRig.targetHoverBoost * 0.36
-          : 0.16;
+          ? 0.16 + spireRig.targetHoverBoost * 0.44
+          : 0.14;
         const currRingAlpha = spireRig.aoeMat.uniforms.uRingAlpha.value;
         spireRig.aoeMat.uniforms.uRingAlpha.value =
           currRingAlpha +
@@ -7381,12 +9196,20 @@ export class Arena3DRenderer {
         if (spireRig.spireType === 'CHRONO_SPIRE') {
           spireRig.upperCore.position.y =
             spireRig.baseCoreY +
-            Math.sin(uTimeVal * 2.3) * 0.05 -
-            spireRig.recoil * 0.16;
+            Math.sin(uTimeVal * 2.3 + spireRig.spireIndex) * 0.045 -
+            spireRig.recoil * 0.15;
           spireRig.upperCore.rotation.y = uTimeVal * 0.45;
+        } else if (spireRig.spireType === 'THUNDERCLAP') {
+          spireRig.upperCore.position.y =
+            spireRig.baseCoreY +
+            Math.sin(uTimeVal * 2.5 + spireRig.spireIndex) * 0.045 -
+            spireRig.recoil * 0.14;
+          spireRig.upperCore.rotation.y = uTimeVal * 0.65;
         } else {
           spireRig.upperCore.position.y =
-            spireRig.baseCoreY - spireRig.recoil * 0.12;
+            spireRig.baseCoreY +
+            Math.sin(uTimeVal * 2.1 + spireRig.spireIndex) * 0.035 -
+            spireRig.recoil * 0.12;
         }
       }
 
@@ -7416,15 +9239,12 @@ export class Arena3DRenderer {
         }
       }
 
-      // Runner Badge: shown ONLY on the focused island during RUN (Overview folds status into `.island-3d-badge`!)
+      // Runner Badge: shown ONLY on focused island during RUN when runner has an active modifier or finished!
       if (rBadge) {
-        const showRunnerBadge =
+        const shouldShowCompact =
           Boolean(isRunPhase) &&
           !this.arenaOverviewMode &&
           island.playerId === focusedPid &&
-          Boolean(island.lastSimStatus || island.runner.statusRing.visible === false);
-        const shouldShowCompact =
-          showRunnerBadge &&
           (island.lastSimStatus !== '' ||
             this.latestSimStates.get(island.playerId)?.finished === true);
 
@@ -7445,30 +9265,42 @@ export class Arena3DRenderer {
       }
     }
 
-    // Update Ground Shockwaves, Frost Hex-Novas & Electric Arc Ribbons
+    // Update Ground Shockwaves, Frost Hex-Novas, Chrono Waves & Electric Arc Ribbons (pooled!)
     for (let i = this.shockwaves.length - 1; i >= 0; i--) {
       const sw = this.shockwaves[i];
       sw.age += safeDt;
       if (sw.age >= sw.maxAge) {
-        this.scene.remove(sw.mesh);
-        (sw.mesh.material as THREE.Material).dispose();
+        sw.mesh.visible = false;
+        if (sw.poolKind === 'frost') {
+          this.frostNovaPool.push(sw.mesh);
+        } else if (sw.poolKind === 'chrono') {
+          this.chronoWavePool.push(sw.mesh);
+        } else {
+          this.shockwavePool.push(sw.mesh);
+        }
         if (sw.arcMesh) {
           this.scene.remove(sw.arcMesh);
           sw.arcMesh.geometry.dispose();
-          (sw.arcMesh.material as THREE.Material).dispose();
+          this.arcMatPool.push(sw.arcMesh.material as THREE.MeshBasicMaterial);
         }
         this.shockwaves.splice(i, 1);
       } else {
         const t = sw.age / sw.maxAge;
-        const ease = 1 - Math.pow(1 - t, 3);
-        const rad = sw.startRadius + ease * (sw.maxRadius - sw.startRadius);
-        sw.mesh.scale.set(rad, 1, rad);
-        if (sw.isShaderMat) {
-          (sw.mesh.material as THREE.ShaderMaterial).uniforms.uOpacity.value =
-            (1 - t) * 0.86;
+        if (sw.poolKind === 'chrono') {
+          const mat = sw.mesh.material as THREE.ShaderMaterial;
+          mat.uniforms.uProgress.value = t;
+          mat.uniforms.uOpacity.value = (1 - t * 0.72) * 0.88;
         } else {
-          (sw.mesh.material as THREE.MeshBasicMaterial).opacity =
-            (1 - t) * 0.78;
+          const ease = 1 - Math.pow(1 - t, 3);
+          const rad = sw.startRadius + ease * (sw.maxRadius - sw.startRadius);
+          sw.mesh.scale.set(rad, 1, rad);
+          if (sw.poolKind === 'frost') {
+            (sw.mesh.material as THREE.ShaderMaterial).uniforms.uOpacity.value =
+              (1 - t) * 0.86;
+          } else {
+            (sw.mesh.material as THREE.MeshBasicMaterial).opacity =
+              (1 - t) * 0.78;
+          }
         }
         if (sw.arcMesh) {
           (sw.arcMesh.material as THREE.MeshBasicMaterial).opacity = Math.max(
@@ -7479,14 +9311,14 @@ export class Arena3DRenderer {
       }
     }
 
-    // Update Chrono Spire Sibling CDR Relay Arcs
+    // Update Chrono Spire Sibling CDR Relay Arcs (pooled material!)
     for (let i = this.relayArcs.length - 1; i >= 0; i--) {
       const ra = this.relayArcs[i];
       ra.age += safeDt;
       if (ra.age >= ra.maxAge) {
         this.scene.remove(ra.mesh);
         ra.mesh.geometry.dispose();
-        (ra.mesh.material as THREE.Material).dispose();
+        this.relayMatPool.push(ra.mesh.material as THREE.MeshBasicMaterial);
         this.relayArcs.splice(i, 1);
       } else {
         const t = ra.age / ra.maxAge;

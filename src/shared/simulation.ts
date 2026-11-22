@@ -4,8 +4,11 @@ import {
   computeSingleSegmentPath,
 } from './pathfinding.js';
 import {
+  EffectiveSpireStats,
+  getEffectiveSpireStats,
   GridPoint,
   MazeEvalResult,
+  OVERCHARGE_CDR,
   PathResult,
   PlacedTower,
   RoundConfig,
@@ -18,13 +21,15 @@ import {
   TowerSimState,
 } from './types.js';
 
+export { getEffectiveSpireStats, OVERCHARGE_CDR };
+export type { EffectiveSpireStats };
+
 export const SIM_TICK_RATE = 60;
 export const SIM_DT = 1 / SIM_TICK_RATE;
 export const MAX_SIM_SECONDS = 300;
-export const BASE_RUNNER_SPEED = 3.5;
-export const OVERCHARGE_CDR = [0, 0.12, 0.22, 0.3] as const;
 
 const TIME_EPS = 1e-7;
+const HOLD_GATE_THRESHOLD_SEC = 0.45;
 const FROST_MIRE_SLOW = 0.25;
 const HASTE_RIFT_MULT = 1.3;
 const TAILWIND_DELAY_SEC = 3.2;
@@ -40,9 +45,16 @@ interface InternalSpire {
   effectiveRangeSq: number;
   exitRimSq: number;
   slowPercent: number;
-  slowDuration: number;
+  baseSlowDuration: number;
+  auraSlowPercent: number;
   cdrPulseSeconds: number;
   isFrost: boolean;
+}
+
+interface SlowSkylineEntry {
+  pct: number;
+  rem: number;
+  sourceId: string;
 }
 
 function decayTimer(value: number, dt: number): number {
@@ -55,13 +67,14 @@ function isInside2x2Pad(x: number, y: number, pad: GridPoint): boolean {
   return x >= pad.x && x <= pad.x + 2.0 && y >= pad.y && y <= pad.y + 2.0;
 }
 
-function isPathResult(
-  val: PathResult | EvalMazeOptions
-): val is PathResult {
+function isPathResult(val: PathResult | EvalMazeOptions): val is PathResult {
   return 'valid' in val && Array.isArray((val as PathResult).segments);
 }
 
 export class MazeRunnerSimulator {
+  public playerId: string;
+  public round: RoundConfig;
+  public towers: PlacedTower[];
   public state: RunnerSimState;
   public pathResult: PathResult;
   public circuitry: ReturnType<typeof computeCitadelCircuitry>;
@@ -70,13 +83,18 @@ export class MazeRunnerSimulator {
   private tickCount = 0;
   private readonly runnerSpec: RunnerArchetypeSpec;
   private readonly spires: InternalSpire[];
+  private readonly slowSkyline: SlowSkylineEntry[] = [];
 
   constructor(
-    public playerId: string,
-    public round: RoundConfig,
-    public towers: PlacedTower[],
+    playerId: string,
+    round: RoundConfig,
+    towers: PlacedTower[],
     precomputedPath?: PathResult
   ) {
+    this.playerId = playerId;
+    this.round = round;
+    this.towers = towers;
+
     const rawPath = precomputedPath ?? computeFullMazePath(round, towers);
 
     // Only clone segment arrays when a Waygate can dynamically rewrite a segment mid-run
@@ -109,10 +127,9 @@ export class MazeRunnerSimulator {
         0,
         Math.min(3, this.circuitry.spireOverchargeTiers[idx] || 0)
       );
-      const effectiveRange = Number((spec.range + tier * 0.25).toFixed(2));
-      const effectiveCooldown = Number(
-        (spec.cooldown * (1 - OVERCHARGE_CDR[tier])).toFixed(2)
-      );
+      const effectiveStats = getEffectiveSpireStats(spireType, tier);
+      const effectiveRange = effectiveStats.effectiveRange;
+      const effectiveCooldown = effectiveStats.effectiveCooldown;
       const exitRim = Math.max(0, effectiveRange - 0.55);
 
       const simTower: TowerSimState = {
@@ -132,9 +149,10 @@ export class MazeRunnerSimulator {
         state: simTower,
         effectiveRangeSq: effectiveRange * effectiveRange,
         exitRimSq: exitRim * exitRim,
-        slowPercent: spec.slowPercent,
-        slowDuration: spec.slowDuration,
-        cdrPulseSeconds: spec.cdrPulseSeconds || 0,
+        slowPercent: effectiveStats.slowPercent,
+        baseSlowDuration: spec.slowDuration + tier * 0.25,
+        auraSlowPercent: effectiveStats.auraSlowPercent,
+        cdrPulseSeconds: effectiveStats.cdrPulseSeconds,
         isFrost: spireType === 'FROST_OBELISK',
       });
     }
@@ -144,17 +162,27 @@ export class MazeRunnerSimulator {
     const startX = round.spawn.x + 1.0;
     const startY = round.spawn.y === 0 ? 0.0 : round.spawn.y + 1.0;
 
+    let initialFacing = Math.PI / 2;
+    const firstSeg = this.pathResult.segments[0];
+    if (firstSeg && firstSeg.points.length > 1) {
+      const fdx = firstSeg.points[1].x - startX;
+      const fdy = firstSeg.points[1].y - startY;
+      if (fdx * fdx + fdy * fdy > 1e-8) {
+        initialFacing = Math.atan2(fdy, fdx);
+      }
+    }
+
     this.state = {
       playerId,
       x: startX,
       y: startY,
-      facingAngle: Math.PI / 2,
+      facingAngle: initialFacing,
       currentSegmentIndex: 0,
       currentWaypointIndex: 0,
       baseSpeed: this.runnerSpec.baseSpeed,
       currentSpeed: this.runnerSpec.baseSpeed,
       clapSlowRemaining: 0,
-      activeSlowPercent: 0.5,
+      activeSlowPercent: 0,
       strongSlowRemaining: 0,
       strongSlowPercent: 0,
       armoredHitRemaining: 0,
@@ -233,26 +261,29 @@ export class MazeRunnerSimulator {
       }
     }
 
-    // 2. Decay dual-slot Spire burst slows & armor-resist visual flag
-    if (this.state.clapSlowRemaining > 0) {
-      this.state.clapSlowRemaining = decayTimer(
-        this.state.clapSlowRemaining,
-        dt
-      );
-    }
-    if (
-      this.state.strongSlowRemaining &&
-      this.state.strongSlowRemaining > 0
+    // 2. Decay exact monotonic upper-envelope slow skyline & armor-resist indicator
+    if (this.slowSkyline.length > 0) {
+      let writeIdx = 0;
+      for (let i = 0; i < this.slowSkyline.length; i++) {
+        const entry = this.slowSkyline[i];
+        const nextRem = decayTimer(entry.rem, dt);
+        if (nextRem > 0) {
+          entry.rem = nextRem;
+          this.slowSkyline[writeIdx++] = entry;
+        }
+      }
+      this.slowSkyline.length = writeIdx;
+      this.syncSlowStateFromSkyline();
+    } else if (
+      this.state.clapSlowRemaining !== 0 ||
+      this.state.activeSlowPercent !== 0
     ) {
-      this.state.strongSlowRemaining = decayTimer(
-        this.state.strongSlowRemaining,
-        dt
-      );
-    }
-    if (this.state.clapSlowRemaining <= 0) {
+      this.state.clapSlowRemaining = 0;
+      this.state.activeSlowPercent = 0;
       this.state.strongSlowRemaining = 0;
       this.state.strongSlowPercent = 0;
     }
+
     if (
       this.state.armoredHitRemaining &&
       this.state.armoredHitRemaining > 0
@@ -266,14 +297,13 @@ export class MazeRunnerSimulator {
     let rx = this.state.x;
     let ry = this.state.y;
 
-    // 3. Optional Waygate Portal trigger
+    // 3. Optional Waygate Portal trigger (only consumes waygateUsed if reroute succeeds)
     if (this.round.waygate && !this.state.waygateUsed) {
       const entryX = this.round.waygate.entry.x + 1.0;
       const entryY = this.round.waygate.entry.y + 1.0;
       const wDx = rx - entryX;
       const wDy = ry - entryY;
       if (wDx * wDx + wDy * wDy <= 0.9025) {
-        this.state.waygateUsed = true;
         const exitPad = this.round.waygate.exit;
         const exitX = exitPad.x + 1.0;
         const exitY = exitPad.y + 1.0;
@@ -292,17 +322,29 @@ export class MazeRunnerSimulator {
           targetPad
         );
 
-        if (
-          rerouted &&
-          this.pathResult.segments[this.state.currentSegmentIndex]
-        ) {
-          this.pathResult.segments[this.state.currentSegmentIndex].points =
-            rerouted.points;
+        const seg = this.pathResult.segments[this.state.currentSegmentIndex];
+        if (rerouted && seg) {
+          this.state.waygateUsed = true;
+          const prevSegDist = seg.distance;
+          seg.points = rerouted.points;
+          seg.distance = rerouted.distance;
+          this.pathResult.totalDistance = Math.max(
+            0,
+            this.pathResult.totalDistance - prevSegDist + rerouted.distance
+          );
           this.state.currentWaypointIndex = 0;
           this.state.x = exitX;
           this.state.y = exitY;
           rx = exitX;
           ry = exitY;
+
+          if (rerouted.points.length > 1) {
+            const ndx = rerouted.points[1].x - exitX;
+            const ndy = rerouted.points[1].y - exitY;
+            if (ndx * ndx + ndy * ndy > 1e-8) {
+              this.state.facingAngle = Math.atan2(ndy, ndx);
+            }
+          }
 
           if (eventsOut) {
             eventsOut.push({
@@ -319,9 +361,9 @@ export class MazeRunnerSimulator {
       }
     }
 
-    // Compute instantaneous heading vector so outer-rim Spire override fires only when exiting
-    let headingX = Math.cos(this.state.facingAngle);
-    let headingY = Math.sin(this.state.facingAngle);
+    // Compute unit instantaneous heading vector for outer-rim & next-tick exit checks
+    let ux = Math.cos(this.state.facingAngle);
+    let uy = Math.sin(this.state.facingAngle);
     const activeSeg =
       this.pathResult.segments[this.state.currentSegmentIndex];
     if (activeSeg) {
@@ -332,40 +374,69 @@ export class MazeRunnerSimulator {
       ) {
         const hx = activeSeg.points[wi].x - rx;
         const hy = activeSeg.points[wi].y - ry;
-        if (hx * hx + hy * hy > 1e-8) {
-          headingX = hx;
-          headingY = hy;
+        const hLenSq = hx * hx + hy * hy;
+        if (hLenSq > 1e-8) {
+          const invLen = 1 / Math.sqrt(hLenSq);
+          ux = hx * invLen;
+          uy = hy * invLen;
           break;
         }
       }
     }
+    const estStep = this.state.baseSpeed * dt;
 
-    // 4. Check Spire Perimeters, Frost Obelisk Permafrost Aura, and Burst Triggers
+    // 4. Check Spire Perimeters, Permafrost Aura, and Burst Triggers (with 2nd micro-pass if Chrono recharges i < j)
     let insideAnySpireRing = false;
     let maxPermafrostTier = -1;
+    let maxPermafrostAura = 0;
 
     for (let i = 0; i < spireCount; i++) {
       const sp = spires[i];
-      const ts = sp.state;
-      const dx = rx - ts.centerX;
-      const dy = ry - ts.centerY;
-      const distSq = dx * dx + dy * dy;
-
-      if (distSq > sp.effectiveRangeSq) continue;
-
-      insideAnySpireRing = true;
-      if (sp.isFrost && ts.overchargeTier > maxPermafrostTier) {
-        maxPermafrostTier = ts.overchargeTier;
+      const dx = rx - sp.state.centerX;
+      const dy = ry - sp.state.centerY;
+      if (dx * dx + dy * dy <= sp.effectiveRangeSq) {
+        insideAnySpireRing = true;
+        if (sp.isFrost && sp.state.overchargeTier > maxPermafrostTier) {
+          maxPermafrostTier = sp.state.overchargeTier;
+          maxPermafrostAura = sp.auraSlowPercent;
+        }
       }
+    }
 
-      if (ts.cooldownRemaining > 0) continue;
+    for (let pass = 0; pass < 2; pass++) {
+      let rechargedEarlierSpire = false;
 
-      const slowNearlyExpired =
-        this.state.clapSlowRemaining <= 0.45 + TIME_EPS;
-      const exitingOuterRim =
-        distSq >= sp.exitRimSq && dx * headingX + dy * headingY > 0;
+      for (let i = 0; i < spireCount; i++) {
+        const sp = spires[i];
+        const ts = sp.state;
+        if (ts.cooldownRemaining > 0) continue;
 
-      if (slowNearlyExpired || exitingOuterRim) {
+        const dx = rx - ts.centerX;
+        const dy = ry - ts.centerY;
+        const distSq = dx * dx + dy * dy;
+        if (distSq > sp.effectiveRangeSq) continue;
+
+        // Ready Spires NEVER self-hold on their own prior slow; they hold only if a DIFFERENT Spire's
+        // slow still has > 0.45s left, UNLESS Chrono can recharge an active sibling OR runner is exiting!
+        const heldBySiblingSlow = this.isBlockedByOtherSpireSlow(ts.id);
+        let shouldFire = !heldBySiblingSlow;
+
+        if (!shouldFire) {
+          if (sp.cdrPulseSeconds > 0 && this.hasRechargingSibling(i)) {
+            shouldFire = true;
+          } else {
+            const nx = dx + ux * estStep;
+            const ny = dy + uy * estStep;
+            const willExitNextTick = nx * nx + ny * ny > sp.effectiveRangeSq;
+            const exitingOuterRim =
+              willExitNextTick ||
+              (distSq >= sp.exitRimSq && dx * ux + dy * uy >= -1e-6);
+            shouldFire = exitingOuterRim;
+          }
+        }
+
+        if (!shouldFire) continue;
+
         const hadActiveSlow = this.state.clapSlowRemaining > 0;
         ts.cooldownRemaining = ts.effectiveCooldown;
         ts.triggeredCount++;
@@ -382,29 +453,39 @@ export class MazeRunnerSimulator {
 
         const effectiveResist =
           ts.overchargeTier > 0 ? 0.0 : runnerSpec.slowResist;
-        const exposureBonus = this.state.exposureStacks * 0.03;
+        // Exposure starts on Hit #2 (+0% on Hit #1 so printed 50%/45%/55% match exactly)
+        const exposureBonus = (this.state.exposureStacks - 1) * 0.03;
         const rawSlow = Math.min(
           0.75,
           (sp.slowPercent + exposureBonus) * (1.0 - effectiveResist)
         );
         const chainComboBonus = hadActiveSlow ? 0.3 : 0.0;
         const duration =
-          (sp.slowDuration + ts.overchargeTier * 0.25 + chainComboBonus) *
-          runnerSpec.slowDurationMult;
+          (sp.baseSlowDuration + chainComboBonus) * runnerSpec.slowDurationMult;
 
-        this.applyBurstSlowEnvelope(rawSlow, duration);
+        this.insertBurstSlow(rawSlow, duration, ts.id);
 
-        // Chrono Spire pulse: shave cooldown off all other Spires on the island
+        // Chrono Spire pulse: shave cooldown ONLY off sibling Spires actually recharging (cooldownRemaining > 0)
         let cdrApplied: number | undefined;
+        let cdrTargetIds: string[] | undefined;
         if (sp.cdrPulseSeconds > 0) {
-          cdrApplied = sp.cdrPulseSeconds;
           for (let j = 0; j < spireCount; j++) {
-            if (j !== i) {
-              const other = spires[j].state;
-              other.cooldownRemaining = decayTimer(
+            if (j === i) continue;
+            const other = spires[j].state;
+            if (other.cooldownRemaining > TIME_EPS) {
+              const nextCd = decayTimer(
                 other.cooldownRemaining,
                 sp.cdrPulseSeconds
               );
+              other.cooldownRemaining = nextCd;
+              cdrApplied = sp.cdrPulseSeconds;
+              if (eventsOut) {
+                if (!cdrTargetIds) cdrTargetIds = [];
+                cdrTargetIds.push(other.id);
+              }
+              if (nextCd === 0 && j < i) {
+                rechargedEarlierSpire = true;
+              }
             }
           }
         }
@@ -425,11 +506,14 @@ export class MazeRunnerSimulator {
             spireType: ts.type,
             overchargeTier: ts.overchargeTier,
             cdrAppliedSeconds: cdrApplied,
+            cdrTargetIds,
             armoredResisted: armoredResisted ? true : undefined,
             timeSeconds: this.elapsedSeconds,
           });
         }
       }
+
+      if (!rechargedEarlierSpire) break;
     }
 
     // Optional terrain modifiers (zero cost when round arrays are empty)
@@ -463,7 +547,7 @@ export class MazeRunnerSimulator {
       this.state.timeSinceLastSpireSec += dt;
     }
 
-    // Wind Herald Momentum: +28% speed after 3.2s un-slowed outside Spire rings
+    // Wind Herald Tailwind: +28% speed after 3.2s unslowed outside Spire rings
     this.state.hasTailwindMomentum =
       runnerSpec.hasMomentum &&
       this.state.timeSinceLastSpireSec >= TAILWIND_DELAY_SEC - TIME_EPS;
@@ -471,22 +555,12 @@ export class MazeRunnerSimulator {
     // 5. Calculate effective speed
     let speedMultiplier = 1.0;
     if (this.state.clapSlowRemaining > 0) {
-      const burstSlow =
-        (this.state.strongSlowRemaining || 0) > 0
-          ? Math.max(
-              this.state.activeSlowPercent,
-              this.state.strongSlowPercent || 0
-            )
-          : this.state.activeSlowPercent;
-      speedMultiplier *= 1.0 - burstSlow;
+      speedMultiplier *= 1.0 - this.state.activeSlowPercent;
     }
 
     if (maxPermafrostTier >= 0) {
-      const baseAura =
-        (TOWER_SPECS.FROST_OBELISK.auraSlowPercent || 0.22) +
-        maxPermafrostTier * 0.02;
       const auraResist = maxPermafrostTier > 0 ? 0.0 : runnerSpec.slowResist;
-      speedMultiplier *= 1.0 - baseAura * (1.0 - auraResist);
+      speedMultiplier *= 1.0 - maxPermafrostAura * (1.0 - auraResist);
     }
 
     if (inMire) {
@@ -503,7 +577,7 @@ export class MazeRunnerSimulator {
 
     this.state.currentSpeed = this.state.baseSpeed * speedMultiplier;
 
-    // 6. Move along current segment waypoints with sub-tick finish interpolation
+    // 6. Move along current segment waypoints with IEEE-754 sqrt & sub-tick finish interpolation
     let moveRemaining = this.state.currentSpeed * dt;
 
     while (moveRemaining > 0 && !this.state.finished) {
@@ -559,7 +633,7 @@ export class MazeRunnerSimulator {
       const target = seg.points[nextWpIndex];
       const dx = target.x - this.state.x;
       const dy = target.y - this.state.y;
-      const distToWp = Math.hypot(dx, dy);
+      const distToWp = Math.sqrt(dx * dx + dy * dy);
 
       if (distToWp > 0.0001) {
         this.state.facingAngle = Math.atan2(dy, dx);
@@ -603,46 +677,111 @@ export class MazeRunnerSimulator {
     }
   }
 
+  private hasRechargingSibling(selfIdx: number): boolean {
+    for (let j = 0; j < this.spires.length; j++) {
+      if (j !== selfIdx && this.spires[j].state.cooldownRemaining > TIME_EPS) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private isBlockedByOtherSpireSlow(spireId: string): boolean {
+    for (let k = 0; k < this.slowSkyline.length; k++) {
+      const entry = this.slowSkyline[k];
+      if (
+        entry.sourceId !== spireId &&
+        entry.rem > HOLD_GATE_THRESHOLD_SEC + TIME_EPS
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /**
-   * Exact O(1) upper-envelope composition of overlapping Spire slows so a weaker slow
-   * never artificially extends a stronger slow's remaining duration.
+   * Maintains the exact monotonic upper-envelope skyline `S(tau) = max_k { pct_k | tau < rem_k }`:
+   * strictly decreasing `pct` with strictly increasing `rem` (bounded to <= 4 entries).
    */
-  private applyBurstSlowEnvelope(rawSlow: number, duration: number): void {
-    const prevRem = this.state.clapSlowRemaining;
-    if (prevRem <= 0) {
-      this.state.activeSlowPercent = rawSlow;
-      this.state.clapSlowRemaining = duration;
+  private insertBurstSlow(
+    rawSlow: number,
+    duration: number,
+    sourceId: string
+  ): void {
+    if (rawSlow <= 0 || duration <= TIME_EPS) return;
+
+    const skyline = this.slowSkyline;
+
+    // If an existing entry already dominates (rawSlow, duration), update sourceId only on exact tie
+    for (let i = 0; i < skyline.length; i++) {
+      const e = skyline[i];
+      if (e.pct >= rawSlow - 1e-9 && e.rem >= duration - TIME_EPS) {
+        if (
+          Math.abs(e.pct - rawSlow) <= 1e-9 &&
+          Math.abs(e.rem - duration) <= TIME_EPS
+        ) {
+          e.sourceId = sourceId;
+        }
+        return;
+      }
+    }
+
+    // Step 1: Prune entries dominated by (rawSlow, duration) in-place (writeIdx <= i)
+    let writeIdx = 0;
+    const origLen = skyline.length;
+    for (let i = 0; i < origLen; i++) {
+      const e = skyline[i];
+      if (e.pct <= rawSlow + 1e-9 && e.rem <= duration + TIME_EPS) {
+        continue;
+      }
+      skyline[writeIdx++] = e;
+    }
+    skyline.length = writeIdx;
+
+    // Step 2: Insert new entry in descending pct order via backward shift
+    const newEntry: SlowSkylineEntry = { pct: rawSlow, rem: duration, sourceId };
+    let insPos = writeIdx;
+    while (insPos > 0 && rawSlow > skyline[insPos - 1].pct) {
+      insPos--;
+    }
+    skyline.push(newEntry);
+    for (let j = skyline.length - 1; j > insPos; j--) {
+      skyline[j] = skyline[j - 1];
+    }
+    skyline[insPos] = newEntry;
+
+    // Step 3: Enforce strictly increasing remaining duration along the descending-pct skyline
+    const afterInsLen = skyline.length;
+    if (afterInsLen > 1) {
+      let cleanIdx = 1;
+      for (let i = 1; i < afterInsLen; i++) {
+        if (skyline[i].rem > skyline[cleanIdx - 1].rem + TIME_EPS) {
+          skyline[cleanIdx++] = skyline[i];
+        }
+      }
+      skyline.length = cleanIdx;
+    }
+
+    this.syncSlowStateFromSkyline();
+  }
+
+  private syncSlowStateFromSkyline(): void {
+    const len = this.slowSkyline.length;
+    if (len === 0) {
+      this.state.activeSlowPercent = 0;
+      this.state.clapSlowRemaining = 0;
       this.state.strongSlowPercent = 0;
       this.state.strongSlowRemaining = 0;
       return;
     }
-
-    const prevBasePct = this.state.activeSlowPercent;
-    const prevStrongRem = this.state.strongSlowRemaining || 0;
-    const prevStrongPct =
-      prevStrongRem > 0 ? this.state.strongSlowPercent || 0 : prevBasePct;
-    const currentPeakPct = Math.max(prevBasePct, prevStrongPct);
-    const currentPeakRem =
-      prevStrongPct > prevBasePct && prevStrongRem > 0
-        ? prevStrongRem
-        : prevRem;
-
-    if (rawSlow >= currentPeakPct) {
-      if (duration >= prevRem) {
-        this.state.activeSlowPercent = rawSlow;
-        this.state.clapSlowRemaining = duration;
-        this.state.strongSlowPercent = 0;
-        this.state.strongSlowRemaining = 0;
-      } else {
-        this.state.strongSlowPercent = rawSlow;
-        this.state.strongSlowRemaining = duration;
-      }
-    } else if (duration > currentPeakRem) {
-      this.state.strongSlowPercent = currentPeakPct;
-      this.state.strongSlowRemaining = currentPeakRem;
-      this.state.activeSlowPercent =
-        prevRem > duration ? Math.max(prevBasePct, rawSlow) : rawSlow;
-      this.state.clapSlowRemaining = Math.max(prevRem, duration);
+    this.state.activeSlowPercent = this.slowSkyline[0].pct;
+    this.state.clapSlowRemaining = this.slowSkyline[len - 1].rem;
+    if (len > 1) {
+      this.state.strongSlowPercent = this.slowSkyline[0].pct;
+      this.state.strongSlowRemaining = this.slowSkyline[0].rem;
+    } else {
+      this.state.strongSlowPercent = 0;
+      this.state.strongSlowRemaining = 0;
     }
   }
 }

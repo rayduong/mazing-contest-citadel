@@ -27,6 +27,7 @@ export interface PlacementValidationResult {
 export interface SmartPlacementOptions {
   mode: 'mouse' | 'touch';
   availableGold?: number;
+  searchSpanOverride?: 0 | 1 | 2;
 }
 
 export interface SmartPlacementResult {
@@ -53,13 +54,16 @@ export interface CitadelCircuitryResult {
   overchargedSpires: number;
   spireOverchargeTiers: number[];
   linkedKeepIndices: Set<number>;
+  keepPoweredSpireCounts: number[];
   poweredNodeKeys: Set<string>;
   spireConduitLinks: SpireConduitLink[];
 }
 
 const MOUSE_SNAP_MAX_DIST = 1.42;
-const TOUCH_SNAP_MAX_DIST = 1.75;
-const HEURISTIC_TIE_SCALE = 0.9995;
+const TOUCH_MOAT_SNAP_MAX_DIST = 1.75;
+const TOUCH_OBSTACLE_CORE_SNAP_MAX_DIST = 2.15;
+const FLUSH_ALIGNMENT_DIST_SQ_BIAS = 0.06;
+const HEURISTIC_TIE_SCALE = 0.999;
 
 const ASTAR_DIRS: ReadonlyArray<{ dx: number; dy: number; cost: number }> = [
   { dx: 0, dy: -1, cost: 1.0 },
@@ -72,7 +76,7 @@ const ASTAR_DIRS: ReadonlyArray<{ dx: number; dy: number; cost: number }> = [
   { dx: -1, dy: -1, cost: Math.SQRT2 },
 ];
 
-// Reusable single-threaded A* TypedArray scratch buffers (zero per-call heap churn)
+// Reusable single-threaded A* TypedArray scratch buffers (+1 slot for virtual terminal sink node)
 let scratchCapacity = 0;
 let scratchGScore = new Float64Array(0);
 let scratchFScore = new Float64Array(0);
@@ -81,9 +85,9 @@ let scratchClosed = new Uint8Array(0);
 let scratchHeapNodes = new Int32Array(0);
 let scratchHeapPos = new Int32Array(0);
 
-function ensureAStarScratch(totalCells: number): void {
-  if (scratchCapacity >= totalCells) return;
-  scratchCapacity = Math.max(totalCells, 1024);
+function ensureAStarScratch(requiredSlots: number): void {
+  if (scratchCapacity >= requiredSlots) return;
+  scratchCapacity = Math.max(requiredSlots, 1024);
   scratchGScore = new Float64Array(scratchCapacity);
   scratchFScore = new Float64Array(scratchCapacity);
   scratchCameFrom = new Int32Array(scratchCapacity);
@@ -218,6 +222,51 @@ function mark2x2Cells(
 }
 
 /**
+ * Single source of truth for 1x1 sub-cell reticle collision masks (Keeps, Spires,
+ * Player Walls, 2x1 Gate mouths, Checkpoints, and Waygate pads).
+ */
+export function isCellPlacementBlocked(
+  round: RoundConfig,
+  existingTowers: PlacedTower[],
+  cx: number,
+  cy: number
+): boolean {
+  if (
+    !Number.isInteger(cx) ||
+    !Number.isInteger(cy) ||
+    cx < 0 ||
+    cy < 0 ||
+    cx >= round.gridWidth ||
+    cy >= round.gridHeight
+  ) {
+    return true;
+  }
+  if (isCellInGateThreshold(round, cx, cy)) return true;
+
+  for (let i = 0; i < round.obstacles.length; i++) {
+    if (isCellIn2x2(cx, cy, round.obstacles[i])) return true;
+  }
+  for (let i = 0; i < round.preplacedSpires.length; i++) {
+    if (isCellIn2x2(cx, cy, round.preplacedSpires[i])) return true;
+  }
+  for (let i = 0; i < existingTowers.length; i++) {
+    if (isCellIn2x2(cx, cy, existingTowers[i])) return true;
+  }
+  for (let i = 0; i < round.checkpoints.length; i++) {
+    if (isCellIn2x2(cx, cy, round.checkpoints[i])) return true;
+  }
+  if (round.waygate) {
+    if (
+      isCellIn2x2(cx, cy, round.waygate.entry) ||
+      isCellIn2x2(cx, cy, round.waygate.exit)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Builds a 2D boolean grid of walkable cells (true = walkable, false = blocked).
  * Pre-placed Crimson Keeps (`obstacles`), Elemental Spires (`preplacedSpires`),
  * and player-placed Stone Walls (`towers`) block movement on their 2x2 footprint.
@@ -274,7 +323,7 @@ export function overlapsPreplacedStructure(
 
 /**
  * Admissible & consistent clamped Euclidean distance from cell (nx, ny) to the rectangular goal cell set
- * `[gx0, gx1] x [gy0, gy1]`. Never overestimates multi-cell 2x1 / 2x2 targets.
+ * `[gx0, gx1] x [gy0, gy1]`, with a tiny strictly-admissible lateral hint toward `hintX`.
  */
 function goalBoxHeuristic(
   nx: number,
@@ -282,24 +331,135 @@ function goalBoxHeuristic(
   gx0: number,
   gx1: number,
   gy0: number,
-  gy1: number
+  gy1: number,
+  hintX: number
 ): number {
   const dx = nx < gx0 ? gx0 - nx : nx > gx1 ? nx - gx1 : 0;
   const dy = ny < gy0 ? gy0 - ny : ny > gy1 ? ny - gy1 : 0;
-  return Math.hypot(dx, dy) * HEURISTIC_TIE_SCALE;
+  if (dx === 0 && dy === 0) return 0;
+  const lateralTie = Math.min(0.0004, Math.abs(nx + 0.5 - hintX) * 1e-5);
+  return Math.hypot(dx, dy) * HEURISTIC_TIE_SCALE + lateralTie;
+}
+
+interface SegmentQueryOptions {
+  startIsTopGate?: boolean;
+  goalIsBottomGate?: boolean;
+  exactStartCell?: GridPoint;
+  appendTerminalPoint?: boolean;
+  nextWaypointHintX?: number;
+}
+
+interface SegmentPathInternal {
+  points: GridPoint[];
+  distance: number;
+  reachedCell: GridPoint;
 }
 
 /**
- * A* pathfinding between two 2x2 pads on the walkable grid using an inline binary min-heap,
- * admissible clamped goal-box heuristic, and strict 8-directional no-corner-cutting rule.
+ * Smooths vertical gate-boulevard prefixes/suffixes onto the exact `x = gateX + 1.0` centerline
+ * whenever both gate columns (`gateX` and `gateX + 1`) are open, eliminating the `0.5m` gate-mouth veer.
+ */
+function alignGateSeamCenterline(
+  rawCells: GridPoint[],
+  walkable: boolean[][],
+  height: number,
+  startX: number,
+  goalX: number,
+  applyNorthGate: boolean,
+  applySouthGate: boolean
+): void {
+  const len = rawCells.length;
+  if (len === 0) return;
+
+  if (
+    applyNorthGate &&
+    applySouthGate &&
+    startX === goalX &&
+    len === height
+  ) {
+    let allStraightDualOpen = true;
+    for (let k = 0; k < len; k++) {
+      const cy = Math.floor(rawCells[k].y);
+      const cx = Math.floor(rawCells[k].x);
+      if (
+        cy !== k ||
+        (cx !== startX && cx !== startX + 1) ||
+        !walkable[k][startX] ||
+        !walkable[k][startX + 1]
+      ) {
+        allStraightDualOpen = false;
+        break;
+      }
+    }
+    if (allStraightDualOpen) {
+      const seamX = startX + 1.0;
+      for (let k = 0; k < len; k++) {
+        rawCells[k].x = seamX;
+      }
+      return;
+    }
+  }
+
+  let northRunEnd = -1;
+  if (applyNorthGate) {
+    for (let k = 0; k < len; k++) {
+      const cy = Math.floor(rawCells[k].y);
+      const cx = Math.floor(rawCells[k].x);
+      if (
+        cy === k &&
+        (cx === startX || cx === startX + 1) &&
+        walkable[k][startX] &&
+        walkable[k][startX + 1]
+      ) {
+        northRunEnd = k;
+      } else {
+        break;
+      }
+    }
+    // Keep `northRunEnd` at its inner cell center (`startX+0.5` or `startX+1.5`) to pivot cleanly into the turn
+    const startSeamX = startX + 1.0;
+    for (let k = 0; k < northRunEnd; k++) {
+      rawCells[k].x = startSeamX;
+    }
+  }
+
+  if (applySouthGate) {
+    let southRunStart = len;
+    for (let k = len - 1; k >= 0; k--) {
+      const expectedY = height - 1 - (len - 1 - k);
+      const cy = Math.floor(rawCells[k].y);
+      const cx = Math.floor(rawCells[k].x);
+      if (
+        cy === expectedY &&
+        (cx === goalX || cx === goalX + 1) &&
+        walkable[cy][goalX] &&
+        walkable[cy][goalX + 1]
+      ) {
+        southRunStart = k;
+      } else {
+        break;
+      }
+    }
+    const minSouthIdx = Math.max(southRunStart + 1, northRunEnd + 1);
+    const goalSeamX = goalX + 1.0;
+    for (let k = minSouthIdx; k < len; k++) {
+      rawCells[k].x = goalSeamX;
+    }
+  }
+}
+
+/**
+ * A* pathfinding between pads on the walkable grid using an inline binary min-heap,
+ * exact entry/exit terminal hop distances, explicit gate flags, and strict 8-dir no-corner-cutting.
  */
 function findSegmentPath(
   walkable: boolean[][],
   width: number,
   height: number,
   startPad: GridPoint,
-  goalPad: GridPoint
-): { points: GridPoint[]; distance: number } | null {
+  goalPad: GridPoint,
+  options?: SegmentQueryOptions
+): SegmentPathInternal | null {
   if (width <= 0 || height <= 0) return null;
 
   const startX = startPad.x;
@@ -307,16 +467,33 @@ function findSegmentPath(
   const goalX = goalPad.x;
   const goalY = goalPad.y;
 
-  const isTopBorderStart = startY === 0;
-  const isBottomBorderGoal = goalY >= height - 2;
+  const startIsTopGate = Boolean(options?.startIsTopGate);
+  const goalIsBottomGate = Boolean(options?.goalIsBottomGate);
+  const exactStartCell = options?.exactStartCell;
+  const appendTerminalPoint = options?.appendTerminalPoint ?? true;
+  const hintX = options?.nextWaypointHintX ?? goalX + 1.0;
 
   const gx0 = goalX;
   const gx1 = goalX + 1;
-  const gy0 = isBottomBorderGoal ? height - 1 : goalY;
-  const gy1 = isBottomBorderGoal ? height - 1 : goalY + 1;
+  const gy0 = goalIsBottomGate ? height - 1 : goalY;
+  const gy1 = goalIsBottomGate ? height - 1 : goalY + 1;
+
+  const startPoint: GridPoint = exactStartCell
+    ? { x: exactStartCell.x + 0.5, y: exactStartCell.y + 0.5 }
+    : {
+        x: startX + 1.0,
+        y: startIsTopGate ? 0.0 : startY + 1.0,
+      };
+
+  const endPoint: GridPoint = {
+    x: goalX + 1.0,
+    y: goalIsBottomGate ? height : goalY + 1.0,
+  };
 
   const totalCells = width * height;
-  ensureAStarScratch(totalCells);
+  const goalSinkIdx = totalCells;
+  const slotCount = totalCells + 1;
+  ensureAStarScratch(slotCount);
 
   const gScore = scratchGScore;
   const fScore = scratchFScore;
@@ -325,11 +502,11 @@ function findSegmentPath(
   const heapNodes = scratchHeapNodes;
   const heapPos = scratchHeapPos;
 
-  gScore.fill(Infinity, 0, totalCells);
-  fScore.fill(Infinity, 0, totalCells);
-  cameFrom.fill(-1, 0, totalCells);
-  closed.fill(0, 0, totalCells);
-  heapPos.fill(-1, 0, totalCells);
+  gScore.fill(Infinity, 0, slotCount);
+  fScore.fill(Infinity, 0, slotCount);
+  cameFrom.fill(-1, 0, slotCount);
+  closed.fill(0, 0, slotCount);
+  heapPos.fill(-1, 0, slotCount);
 
   let heapSize = 0;
 
@@ -400,18 +577,34 @@ function findSegmentPath(
     return topIdx;
   };
 
-  const startDyMax = isTopBorderStart ? 0 : 1;
-  for (let dy = 0; dy <= startDyMax; dy++) {
-    const sy = startY + dy;
-    if (sy < 0 || sy >= height) continue;
-    const row = walkable[sy];
-    for (let dx = 0; dx <= 1; dx++) {
-      const sx = startX + dx;
-      if (sx >= 0 && sx < width && row[sx]) {
-        const idx = sy * width + sx;
-        gScore[idx] = 0;
-        fScore[idx] = goalBoxHeuristic(sx, sy, gx0, gx1, gy0, gy1);
-        heapPushOrUpdate(idx);
+  if (exactStartCell) {
+    const sx = exactStartCell.x;
+    const sy = exactStartCell.y;
+    if (sx >= 0 && sx < width && sy >= 0 && sy < height && walkable[sy][sx]) {
+      const idx = sy * width + sx;
+      gScore[idx] = 0;
+      fScore[idx] = goalBoxHeuristic(sx, sy, gx0, gx1, gy0, gy1, hintX);
+      heapPushOrUpdate(idx);
+    }
+  } else {
+    const startDyMax = startIsTopGate ? 0 : 1;
+    for (let dy = 0; dy <= startDyMax; dy++) {
+      const sy = startY + dy;
+      if (sy < 0 || sy >= height) continue;
+      const row = walkable[sy];
+      for (let dx = 0; dx <= 1; dx++) {
+        const sx = startX + dx;
+        if (sx >= 0 && sx < width && row[sx]) {
+          const idx = sy * width + sx;
+          const entryHop = Math.hypot(
+            sx + 0.5 - startPoint.x,
+            sy + 0.5 - startPoint.y
+          );
+          gScore[idx] = entryHop;
+          fScore[idx] =
+            entryHop + goalBoxHeuristic(sx, sy, gx0, gx1, gy0, gy1, hintX);
+          heapPushOrUpdate(idx);
+        }
       }
     }
   }
@@ -423,15 +616,32 @@ function findSegmentPath(
     if (closed[bestIdx]) continue;
     closed[bestIdx] = 1;
 
-    const cx = bestIdx % width;
-    const cy = (bestIdx - cx) / width;
-
-    if (cx >= gx0 && cx <= gx1 && cy >= gy0 && cy <= gy1) {
-      reachedGoalIdx = bestIdx;
+    if (bestIdx === goalSinkIdx) {
+      reachedGoalIdx = cameFrom[goalSinkIdx];
       break;
     }
 
+    const cx = bestIdx % width;
+    const cy = (bestIdx - cx) / width;
     const currentG = gScore[bestIdx];
+
+    if (cx >= gx0 && cx <= gx1 && cy >= gy0 && cy <= gy1) {
+      if (!appendTerminalPoint) {
+        reachedGoalIdx = bestIdx;
+        break;
+      }
+      const exitHop = Math.hypot(
+        endPoint.x - (cx + 0.5),
+        endPoint.y - (cy + 0.5)
+      );
+      const totalGoalCost = currentG + exitHop;
+      if (totalGoalCost < gScore[goalSinkIdx]) {
+        cameFrom[goalSinkIdx] = bestIdx;
+        gScore[goalSinkIdx] = totalGoalCost;
+        fScore[goalSinkIdx] = totalGoalCost;
+        heapPushOrUpdate(goalSinkIdx);
+      }
+    }
 
     for (let dirIdx = 0; dirIdx < ASTAR_DIRS.length; dirIdx++) {
       const d = ASTAR_DIRS[dirIdx];
@@ -454,7 +664,7 @@ function findSegmentPath(
         cameFrom[nIdx] = bestIdx;
         gScore[nIdx] = tentativeG;
         fScore[nIdx] =
-          tentativeG + goalBoxHeuristic(nx, ny, gx0, gx1, gy0, gy1);
+          tentativeG + goalBoxHeuristic(nx, ny, gx0, gx1, gy0, gy1, hintX);
         heapPushOrUpdate(nIdx);
       }
     }
@@ -463,6 +673,10 @@ function findSegmentPath(
   if (reachedGoalIdx === -1) {
     return null;
   }
+
+  const reachedCx = reachedGoalIdx % width;
+  const reachedCy = (reachedGoalIdx - reachedCx) / width;
+  const reachedCell: GridPoint = { x: reachedCx, y: reachedCy };
 
   const rawCells: GridPoint[] = [];
   let curr = reachedGoalIdx;
@@ -474,16 +688,28 @@ function findSegmentPath(
   }
   rawCells.reverse();
 
-  const startPoint: GridPoint = {
-    x: startPad.x + 1.0,
-    y: isTopBorderStart ? 0.0 : startPad.y + 1.0,
-  };
-  const endPoint: GridPoint = {
-    x: goalPad.x + 1.0,
-    y: isBottomBorderGoal ? height : goalPad.y + 1.0,
-  };
+  if (
+    (startIsTopGate && !exactStartCell) ||
+    (goalIsBottomGate && appendTerminalPoint)
+  ) {
+    alignGateSeamCenterline(
+      rawCells,
+      walkable,
+      height,
+      startX,
+      goalX,
+      startIsTopGate && !exactStartCell,
+      goalIsBottomGate && appendTerminalPoint
+    );
+  }
 
-  const points: GridPoint[] = [startPoint, ...rawCells, endPoint];
+  const points: GridPoint[] = exactStartCell
+    ? [...rawCells]
+    : [startPoint, ...rawCells];
+
+  if (appendTerminalPoint) {
+    points.push(endPoint);
+  }
 
   let distance = 0;
   for (let i = 1; i < points.length; i++) {
@@ -493,7 +719,7 @@ function findSegmentPath(
     );
   }
 
-  return { points, distance };
+  return { points, distance, reachedCell };
 }
 
 function computeMazePathOnWalkable(
@@ -505,19 +731,33 @@ function computeMazePathOnWalkable(
     ...round.checkpoints,
     round.exit,
   ];
+  const lastSegIdx = waypoints.length - 2;
 
   const segments: PathSegment[] = [];
   const allPoints: GridPoint[] = [];
   let totalDistance = 0;
+  let prevReachedCell: GridPoint | undefined;
 
-  for (let i = 0; i < waypoints.length - 1; i++) {
+  for (let i = 0; i <= lastSegIdx; i++) {
+    const isFirstSeg = i === 0;
+    const isFinalSeg = i === lastSegIdx;
+    const nextHintPad = !isFinalSeg ? waypoints[i + 2] : waypoints[i + 1];
+
     const seg = findSegmentPath(
       walkable,
       round.gridWidth,
       round.gridHeight,
       waypoints[i],
-      waypoints[i + 1]
+      waypoints[i + 1],
+      {
+        startIsTopGate: isFirstSeg && round.spawn.y === 0,
+        goalIsBottomGate: isFinalSeg && round.exit.y >= round.gridHeight - 2,
+        exactStartCell: isFirstSeg ? undefined : prevReachedCell,
+        appendTerminalPoint: isFinalSeg,
+        nextWaypointHintX: nextHintPad.x + 1.0,
+      }
     );
+
     if (!seg) {
       return {
         valid: false,
@@ -527,6 +767,8 @@ function computeMazePathOnWalkable(
       };
     }
 
+    prevReachedCell = seg.reachedCell;
+
     segments.push({
       fromIndex: i,
       toIndex: i + 1,
@@ -534,7 +776,7 @@ function computeMazePathOnWalkable(
       distance: seg.distance,
     });
 
-    if (i === 0) {
+    if (isFirstSeg) {
       allPoints.push(...seg.points);
     } else {
       allPoints.push(...seg.points.slice(1));
@@ -551,7 +793,8 @@ function computeMazePathOnWalkable(
 }
 
 /**
- * Computes the complete path from the North Gate entrance to the South Shrine exit.
+ * Computes the complete path from the North Gate entrance (through any Checkpoint Waystones)
+ * to the South Shrine exit.
  */
 export function computeFullMazePath(
   round: RoundConfig,
@@ -562,7 +805,8 @@ export function computeFullMazePath(
 }
 
 /**
- * Helper to find a dynamic path from any 2x2 pad to a target pad.
+ * Helper to find a dynamic path from any 2x2 pad to a target pad (e.g. Waygate exit rerouting).
+ * Uses explicit gate identity checks so interior/border non-gate pads never project off-cliff.
  */
 export function computeSingleSegmentPath(
   round: RoundConfig,
@@ -571,13 +815,33 @@ export function computeSingleSegmentPath(
   toPad: GridPoint
 ): { points: GridPoint[]; distance: number } | null {
   const walkable = buildWalkableGrid(round, towers);
-  return findSegmentPath(
+  const startIsSpawnGate =
+    fromPad.x === round.spawn.x &&
+    fromPad.y === round.spawn.y &&
+    round.spawn.y === 0;
+  const goalIsExitGate =
+    toPad.x === round.exit.x &&
+    toPad.y === round.exit.y &&
+    round.exit.y >= round.gridHeight - 2;
+  const isCheckpointGoal =
+    !goalIsExitGate &&
+    round.checkpoints.some((cp) => cp.x === toPad.x && cp.y === toPad.y);
+
+  const seg = findSegmentPath(
     walkable,
     round.gridWidth,
     round.gridHeight,
     fromPad,
-    toPad
+    toPad,
+    {
+      startIsTopGate: startIsSpawnGate,
+      goalIsBottomGate: goalIsExitGate,
+      appendTerminalPoint: !isCheckpointGoal,
+      nextWaypointHintX: round.exit.x + 1.0,
+    }
   );
+  if (!seg) return null;
+  return { points: seg.points, distance: seg.distance };
 }
 
 /**
@@ -666,36 +930,46 @@ function validatePathWithCandidateOnWalkable(
   y: number
 ): PlacementValidationResult {
   const { gridWidth, gridHeight } = round;
-  mark2x2Cells(walkable, gridWidth, gridHeight, x, y, false);
 
-  const pathResult = computeMazePathOnWalkable(round, walkable);
+  // Snapshot exact prior 2x2 walkability state before temporary block
+  const prev00 = walkable[y][x];
+  const prev10 = walkable[y][x + 1];
+  const prev01 = walkable[y + 1][x];
+  const prev11 = walkable[y + 1][x + 1];
+
+  walkable[y][x] = false;
+  walkable[y][x + 1] = false;
+  walkable[y + 1][x] = false;
+  walkable[y + 1][x + 1] = false;
+
+  let pathResult: PathResult;
   let waygateReachable = true;
-  if (pathResult.valid && round.waygate) {
-    const waygateTarget =
-      round.checkpoints.length > 0 ? round.checkpoints[0] : round.exit;
-    const wgSeg = findSegmentPath(
-      walkable,
-      gridWidth,
-      gridHeight,
-      round.waygate.exit,
-      waygateTarget
-    );
-    const wgToExit =
-      waygateTarget === round.exit
-        ? wgSeg
-        : findSegmentPath(
-            walkable,
-            gridWidth,
-            gridHeight,
-            round.waygate.exit,
-            round.exit
-          );
-    if (!wgSeg || !wgToExit) {
-      waygateReachable = false;
-    }
-  }
 
-  mark2x2Cells(walkable, gridWidth, gridHeight, x, y, true);
+  try {
+    pathResult = computeMazePathOnWalkable(round, walkable);
+    if (pathResult.valid && round.waygate) {
+      const wgToExit = findSegmentPath(
+        walkable,
+        gridWidth,
+        gridHeight,
+        round.waygate.exit,
+        round.exit,
+        {
+          startIsTopGate: false,
+          goalIsBottomGate: round.exit.y >= gridHeight - 2,
+          appendTerminalPoint: true,
+        }
+      );
+      if (!wgToExit) {
+        waygateReachable = false;
+      }
+    }
+  } finally {
+    walkable[y][x] = prev00;
+    walkable[y][x + 1] = prev10;
+    walkable[y + 1][x] = prev01;
+    walkable[y + 1][x + 1] = prev11;
+  }
 
   if (!pathResult.valid || !waygateReachable) {
     return {
@@ -726,46 +1000,34 @@ export function validateTowerPlacement(
   return validatePathWithCandidateOnWalkable(round, walkable, x, y);
 }
 
-function isSingleCellOpenGrass(
+function isFlushAlignedWithMasonry(
   round: RoundConfig,
   existingTowers: PlacedTower[],
-  cx: number,
-  cy: number
+  nx: number,
+  ny: number
 ): boolean {
-  if (cx < 0 || cy < 0 || cx >= round.gridWidth || cy >= round.gridHeight) {
-    return false;
-  }
-  if (isCellInGateThreshold(round, cx, cy)) return false;
-
-  for (let i = 0; i < round.obstacles.length; i++) {
-    if (isCellIn2x2(cx, cy, round.obstacles[i])) return false;
-  }
-  for (let i = 0; i < round.preplacedSpires.length; i++) {
-    if (isCellIn2x2(cx, cy, round.preplacedSpires[i])) return false;
-  }
   for (let i = 0; i < existingTowers.length; i++) {
-    if (isCellIn2x2(cx, cy, existingTowers[i])) return false;
+    const t = existingTowers[i];
+    const dx = Math.abs(nx - t.x);
+    const dy = Math.abs(ny - t.y);
+    if ((dx === 2 && dy === 0) || (dx === 0 && dy === 2)) return true;
   }
-  for (let i = 0; i < round.checkpoints.length; i++) {
-    if (isCellIn2x2(cx, cy, round.checkpoints[i])) return false;
+  for (let i = 0; i < round.obstacles.length; i++) {
+    const o = round.obstacles[i];
+    const dx = Math.abs(nx - o.x);
+    const dy = Math.abs(ny - o.y);
+    if ((dx === 2 && dy === 0) || (dx === 0 && dy === 2)) return true;
   }
-  if (round.waygate) {
-    if (
-      isCellIn2x2(cx, cy, round.waygate.entry) ||
-      isCellIn2x2(cx, cy, round.waygate.exit)
-    ) {
-      return false;
-    }
-  }
-  return true;
+  return false;
 }
 
 /**
  * Resolves continuous island-space coordinates `(wx, wy)` to an accurate `2x2` top-left cell `(x, y)`
- * with flush-snap assist around Keeps, Spires, Walls, and Gates:
- * - Eliminates the `0.5m` `'Occupied'` dead-moat (`r <= 1.42m` in `'mouse'` mode when cursor cell is open grass;
- *   `r <= 1.75m` in `'touch'` mode).
- * - Never jumps across walls when `(rawX, rawY)` is open grass that fails `'BLOCKS_PATH'`.
+ * with flush-snap assist around Keeps, Spires, Walls, Pads, and Gates:
+ * - Respects `options.searchSpanOverride` (`0` disables snap during continuous Loupe drag & Shift+Drag).
+ * - Eliminates both the `0.5m` open-grass moat (`r <= 1.42m` mouse / `1.75m` touch) and the `2x2` Keep/Spire
+ *   interior bullseye dead-zone on touch (`r <= 2.15m` when tapping inside an obstacle/pad).
+ * - Prefers orthogonal flush masonry alignment (`-0.06` `distSq` tie-break) and never vaults across `'BLOCKS_PATH'` chokes.
  */
 export function resolveSmart2x2Placement(
   round: RoundConfig,
@@ -854,12 +1116,16 @@ export function resolveSmart2x2Placement(
     };
   };
 
-  // 1. Exact raw 2x2 slot is already valid (or genuinely blocks an open corridor) -> never snap away!
-  if (rawValidation.valid || rawValidation.reasonCode === 'BLOCKS_PATH') {
+  // 1. Exact raw 2x2 slot is valid, blocks an open corridor, or snap is explicitly disabled (Loupe / Shift+Drag)
+  if (
+    rawValidation.valid ||
+    rawValidation.reasonCode === 'BLOCKS_PATH' ||
+    options?.searchSpanOverride === 0
+  ) {
     return finalizeResult(rawX, rawY, false, rawValidation);
   }
 
-  // 2. Raw 2x2 slot overlapped a Keep, Spire, Wall, Gate, or Pad -> check flush-snap eligibility
+  // 2. Raw 2x2 slot overlapped a Keep, Spire, Wall, Gate, or Pad -> determine snap eligibility & span
   const clampedCellX = Math.max(
     0,
     Math.min(round.gridWidth - 1, Math.floor(wx))
@@ -869,19 +1135,40 @@ export function resolveSmart2x2Placement(
     Math.min(round.gridHeight - 1, Math.floor(wy))
   );
 
-  const canAssistSnap =
-    mode === 'touch' ||
-    isSingleCellOpenGrass(round, existingTowers, clampedCellX, clampedCellY);
+  const cursorCellOpenGrass = !isCellPlacementBlocked(
+    round,
+    existingTowers,
+    clampedCellX,
+    clampedCellY
+  );
 
-  if (!canAssistSnap) {
+  if (mode === 'mouse' && !cursorCellOpenGrass) {
     return finalizeResult(rawX, rawY, false, rawValidation);
   }
 
-  const maxDist = mode === 'touch' ? TOUCH_SNAP_MAX_DIST : MOUSE_SNAP_MAX_DIST;
-  const maxDistSq = maxDist * maxDist;
-  const searchSpan = mode === 'touch' ? 2 : 1;
+  const defaultSpan: 1 | 2 =
+    mode === 'touch' && !cursorCellOpenGrass ? 2 : 1;
+  const searchSpan = options?.searchSpanOverride ?? defaultSpan;
 
-  const candidates: Array<{ x: number; y: number; distSq: number }> = [];
+  const maxDist =
+    mode === 'mouse'
+      ? MOUSE_SNAP_MAX_DIST
+      : cursorCellOpenGrass
+      ? TOUCH_MOAT_SNAP_MAX_DIST
+      : TOUCH_OBSTACLE_CORE_SNAP_MAX_DIST;
+  const maxDistSq = maxDist * maxDist;
+
+  interface SnapCandidate {
+    x: number;
+    y: number;
+    dx: number;
+    dy: number;
+    distSq: number;
+    sortScore: number;
+    coversCursorCell: boolean;
+  }
+
+  const candidates: SnapCandidate[] = [];
   for (let dy = -searchSpan; dy <= searchSpan; dy++) {
     const ny = rawY + dy;
     if (ny < 0 || ny > maxY) continue;
@@ -898,26 +1185,74 @@ export function resolveSmart2x2Placement(
       if (checkStaticFootprint(round, existingTowers, nx, ny) !== null) {
         continue;
       }
-      candidates.push({ x: nx, y: ny, distSq });
+
+      const aligned = isFlushAlignedWithMasonry(round, existingTowers, nx, ny);
+      const sortScore =
+        distSq - (aligned ? FLUSH_ALIGNMENT_DIST_SQ_BIAS : 0);
+      const coversCursorCell =
+        cursorCellOpenGrass &&
+        clampedCellX >= nx &&
+        clampedCellX <= nx + 1 &&
+        clampedCellY >= ny &&
+        clampedCellY <= ny + 1;
+
+      candidates.push({
+        x: nx,
+        y: ny,
+        dx,
+        dy,
+        distSq,
+        sortScore,
+        coversCursorCell,
+      });
     }
   }
 
-  candidates.sort((a, b) => a.distSq - b.distSq || a.y - b.y || a.x - b.x);
+  candidates.sort(
+    (a, b) => a.sortScore - b.sortScore || a.y - b.y || a.x - b.x
+  );
+
+  // Track 1-step directions that are static-free but fail BLOCKS_PATH so 2-step search never vaults over a choke
+  const sealedStep1Dirs = new Set<string>();
 
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
+
+    if (Math.abs(cand.dx) === 2 || Math.abs(cand.dy) === 2) {
+      const sx = Math.sign(cand.dx);
+      const sy = Math.sign(cand.dy);
+      if (
+        sealedStep1Dirs.has(`${sx},${sy}`) ||
+        (sx !== 0 && sealedStep1Dirs.has(`${sx},0`)) ||
+        (sy !== 0 && sealedStep1Dirs.has(`0,${sy}`))
+      ) {
+        continue;
+      }
+    }
+
     const candVal = validatePathWithCandidateOnWalkable(
       round,
       walkable,
       cand.x,
       cand.y
     );
+
     if (candVal.valid) {
       return finalizeResult(cand.x, cand.y, true, candVal);
     }
+
+    if (candVal.reasonCode === 'BLOCKS_PATH') {
+      // When cursor is on open grass inside a 1-tile choke corridor next to an obstacle,
+      // stop monotonically on the closest covering choke cell instead of jumping sideways!
+      if (cand.coversCursorCell && i === 0) {
+        return finalizeResult(cand.x, cand.y, true, candVal);
+      }
+      if (Math.abs(cand.dx) <= 1 && Math.abs(cand.dy) <= 1) {
+        sealedStep1Dirs.add(`${cand.dx},${cand.dy}`);
+      }
+    }
   }
 
-  // If no valid slot exists nearby, surface 'No walls left' in touch mode if out of budget, else raw overlap error
   if (noPillarsLeft && mode === 'touch') {
     return {
       x: rawX,
@@ -933,45 +1268,47 @@ export function resolveSmart2x2Placement(
 }
 
 /**
- * Computes the Citadel Circuitry network:
- * - Player Stone Walls, Crimson Keeps (`obstacles`), and touching Elemental Spires (`|dx|<=2 && |dy|<=2`)
- *   form conductive masonry components when at least one Player Stone Wall and one Crimson Keep are linked.
- * - Any Elemental Spire within `|dx|<=3 && |dy|<=3 && dx^2 + dy^2 <= 13` (touching or wrapped by a 1-tile corridor,
- *   excluding far `(±3, ±3)` corners outside Spire AoE) of a powered Wall/Keep chain gains +1 Overcharge Tier
- *   per distinct Crimson Keep in that chain (capped at Tier 3 ◆◆◆).
- * - Emits `poweredNodeKeys` and deduplicated `spireConduitLinks` for inlaid gold ground ley-line rendering.
+ * Computes the Citadel Circuitry network with strict masonry-only (`PLAYER + KEEP`) `<= 2` conductivity:
+ * - Only Player Stone Walls and Crimson Keeps (`obstacles`) connect via `|dx|<=2 && |dy|<=2` masonry chains
+ *   (Spires never short-circuit Keep-less walls across their plinths, and dual-Keep chains on opposite Spire faces
+ *   each emit their own inlaid gold ley-line conduit).
+ * - Any Elemental Spire within `|dx|<=3 && |dy|<=3 && dx^2 + dy^2 <= 13` of a powered `PLAYER + KEEP` component
+ *   gains +1 Overcharge Tier per distinct Crimson Keep in that component (capped at Tier 3 ◆◆◆).
+ * - Populates `keepPoweredSpireCounts` (`0` = Wall-linked only, `>= 1` = ◆ Powering Spire(s)), `poweredNodeKeys`,
+ *   and deduplicated `spireConduitLinks`.
  */
 export function computeCitadelCircuitry(
   round: RoundConfig,
   towers: PlacedTower[]
 ): CitadelCircuitryResult {
-  interface CircuitNode {
+  interface MasonryNode {
     x: number;
     y: number;
-    kind: 'PLAYER' | 'KEEP' | 'SPIRE';
+    isPlayer: boolean;
     keepIdx: number;
-    spireIdx: number;
   }
 
-  const nodes: CircuitNode[] = [];
+  const nodes: MasonryNode[] = [];
   for (let i = 0; i < towers.length; i++) {
     const t = towers[i];
-    nodes.push({ x: t.x, y: t.y, kind: 'PLAYER', keepIdx: -1, spireIdx: -1 });
+    nodes.push({ x: t.x, y: t.y, isPlayer: true, keepIdx: -1 });
   }
   for (let i = 0; i < round.obstacles.length; i++) {
     const o = round.obstacles[i];
-    nodes.push({ x: o.x, y: o.y, kind: 'KEEP', keepIdx: i, spireIdx: -1 });
-  }
-  for (let i = 0; i < round.preplacedSpires.length; i++) {
-    const s = round.preplacedSpires[i];
-    nodes.push({ x: s.x, y: s.y, kind: 'SPIRE', keepIdx: -1, spireIdx: i });
+    nodes.push({ x: o.x, y: o.y, isPlayer: false, keepIdx: i });
   }
 
   const nodeCount = nodes.length;
   const visited = new Uint8Array(nodeCount);
   const linkedKeepIndices = new Set<number>();
   const poweredNodeKeys = new Set<string>();
+  const keepCount = round.obstacles.length;
   const spireCount = round.preplacedSpires.length;
+
+  const keepSpireSets: Array<Set<number>> = Array.from(
+    { length: keepCount },
+    () => new Set<number>()
+  );
   const spireKeepSets: Array<Set<number>> = Array.from(
     { length: spireCount },
     () => new Set<number>()
@@ -1009,9 +1346,9 @@ export function computeCitadelCircuitry(
     const compKeeps: number[] = [];
     for (let c = 0; c < comp.length; c++) {
       const n = nodes[comp[c]];
-      if (n.kind === 'PLAYER') {
+      if (n.isPlayer) {
         hasPlayerWall = true;
-      } else if (n.kind === 'KEEP' && n.keepIdx >= 0) {
+      } else if (n.keepIdx >= 0) {
         compKeeps.push(n.keepIdx);
       }
     }
@@ -1022,14 +1359,9 @@ export function computeCitadelCircuitry(
       linkedKeepIndices.add(compKeeps[k]);
     }
 
-    const compWallAndKeepIndices: number[] = [];
     for (let c = 0; c < comp.length; c++) {
-      const idx = comp[c];
-      const n = nodes[idx];
-      if (n.kind === 'PLAYER' || n.kind === 'KEEP') {
-        poweredNodeKeys.add(`${n.x},${n.y}`);
-        compWallAndKeepIndices.push(idx);
-      }
+      const n = nodes[comp[c]];
+      poweredNodeKeys.add(`${n.x},${n.y}`);
     }
 
     for (let sIdx = 0; sIdx < spireCount; sIdx++) {
@@ -1038,9 +1370,8 @@ export function computeCitadelCircuitry(
       let bestDistSq = Infinity;
       let bestIsPlayer = false;
 
-      // Primary check: closest powered Wall/Keep in this component within |dx|<=3, |dy|<=3, dx^2+dy^2<=13
-      for (let w = 0; w < compWallAndKeepIndices.length; w++) {
-        const candIdx = compWallAndKeepIndices[w];
+      for (let c = 0; c < comp.length; c++) {
+        const candIdx = comp[c];
         const wn = nodes[candIdx];
         const dx = wn.x - spire.x;
         const dy = wn.y - spire.y;
@@ -1048,44 +1379,21 @@ export function computeCitadelCircuitry(
         const distSq = dx * dx + dy * dy;
         if (distSq > 13) continue;
 
-        const isPlayer = wn.kind === 'PLAYER';
         if (
           distSq < bestDistSq ||
-          (distSq === bestDistSq && isPlayer && !bestIsPlayer)
+          (distSq === bestDistSq && wn.isPlayer && !bestIsPlayer)
         ) {
           bestDistSq = distSq;
           bestSourceIdx = candIdx;
-          bestIsPlayer = isPlayer;
-        }
-      }
-
-      // Fallback if Spire itself was directly part of the <=2 touching component via another Spire
-      if (bestSourceIdx === -1) {
-        for (let c = 0; c < comp.length; c++) {
-          const candIdx = comp[c];
-          const cn = nodes[candIdx];
-          if (cn.kind === 'SPIRE' && cn.spireIdx === sIdx) {
-            // Find closest non-self node in component touching this Spire
-            for (let c2 = 0; c2 < comp.length; c2++) {
-              const otherIdx = comp[c2];
-              const on = nodes[otherIdx];
-              if (on.kind === 'SPIRE' && on.spireIdx === sIdx) continue;
-              const dx = on.x - spire.x;
-              const dy = on.y - spire.y;
-              const distSq = dx * dx + dy * dy;
-              if (distSq <= 13 && distSq < bestDistSq) {
-                bestDistSq = distSq;
-                bestSourceIdx = otherIdx;
-              }
-            }
-            break;
-          }
+          bestIsPlayer = wn.isPlayer;
         }
       }
 
       if (bestSourceIdx !== -1) {
         for (let k = 0; k < compKeeps.length; k++) {
-          spireKeepSets[sIdx].add(compKeeps[k]);
+          const keepIdx = compKeeps[k];
+          spireKeepSets[sIdx].add(keepIdx);
+          keepSpireSets[keepIdx].add(sIdx);
         }
         const src = nodes[bestSourceIdx];
         pendingConduits.push({
@@ -1099,6 +1407,7 @@ export function computeCitadelCircuitry(
     }
   }
 
+  const keepPoweredSpireCounts = keepSpireSets.map((set) => set.size);
   const spireOverchargeTiers = spireKeepSets.map((set) =>
     Math.min(3, set.size)
   );
@@ -1128,6 +1437,7 @@ export function computeCitadelCircuitry(
     overchargedSpires,
     spireOverchargeTiers,
     linkedKeepIndices,
+    keepPoweredSpireCounts,
     poweredNodeKeys,
     spireConduitLinks,
   };

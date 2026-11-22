@@ -8,8 +8,8 @@ export const ROUNDS: RoundConfig[] = [
   {
     roundNumber: 1,
     title: 'Meadow Gate',
-    subtitle: '2 Storm Spires · 4 Crimson Keeps · Citadel Scout',
-    hint: 'Fold switchbacks past both Storm Spires. Link a Crimson Keep into your wall to boost Spire range and recharge.',
+    subtitle: '2 Storm · 4 Keeps · Citadel Scout',
+    hint: 'Fold switchbacks past both Storm Spires. Link a Crimson Keep into your wall within 1 tile of a Spire to Overcharge it.',
     runnerType: 'SCOUT',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
@@ -31,7 +31,7 @@ export const ROUNDS: RoundConfig[] = [
   {
     roundNumber: 2,
     title: 'Frostbend Crossing',
-    subtitle: '1 Storm · 2 Frost Obelisks · 4 Keeps · Royal Outrider',
+    subtitle: '1 Storm · 2 Frost · 4 Keeps · Royal Outrider',
     hint: 'Outriders sprint fast on open grass, but slows last 25% longer. Wrap tight turns around both Frost Obelisks.',
     runnerType: 'OUTRIDER',
     gridWidth: GRID_WIDTH,
@@ -54,8 +54,8 @@ export const ROUNDS: RoundConfig[] = [
   {
     roundNumber: 3,
     title: 'Switchback Court',
-    subtitle: '2 Storm · 1 Frost Obelisk · 5 Keeps · Citadel Scout',
-    hint: 'Northeast to Southwest gates create a long diagonal. Chain three Crimson Keeps into one wall for max Overcharge.',
+    subtitle: '2 Storm · 1 Frost · 5 Keeps · Waystone · Citadel Scout',
+    hint: 'Runners must visit the Waystone before the South Shrine. Chain three Crimson Keeps into one wall for max Overcharge.',
     runnerType: 'SCOUT',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
@@ -63,7 +63,7 @@ export const ROUNDS: RoundConfig[] = [
     startingGold: 165,
     spawn: { x: 14, y: 0 },
     exit: { x: 4, y: 24 },
-    checkpoints: [],
+    checkpoints: [{ x: 5, y: 10 }],
     obstacleCount: 5,
     spireCount: 3,
     frostMireCount: 0,
@@ -72,13 +72,13 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 39.0,
+    parTimeSeconds: 41.0,
   },
   {
     roundNumber: 4,
     title: 'Westwall Relay',
-    subtitle: '2 Storm · 1 Frost · 1 Chrono Spire · 5 Keeps · Wind Herald',
-    hint: 'Both gates hug the west edge. Space your Spire passes evenly so the Wind Herald never builds Tailwind speed.',
+    subtitle: '2 Storm · 1 Frost · 1 Chrono · 5 Keeps · Wind Herald',
+    hint: 'Both gates hug the west cliff. Space your Spire passes under 3.2 seconds apart so the Wind Herald never triggers Tailwind.',
     runnerType: 'HERALD',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
@@ -95,18 +95,18 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 43.0,
+    parTimeSeconds: 45.0,
   },
   {
     roundNumber: 5,
     title: 'Iron Bastion',
     subtitle: '2 Storm · 1 Frost · 1 Chrono · 7 Keeps · Iron Juggernaut',
-    hint: 'Uncharged Spires lose 20% slow against Juggernaut armor. Link at least one Crimson Keep into every Spire corridor.',
+    hint: 'Juggernaut armor blocks a fifth of uncharged slows. Use the seven Crimson Keeps as anchors and Overcharge every Spire.',
     runnerType: 'JUGGERNAUT',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
     buildTimeSeconds: 105,
-    startingGold: 160,
+    startingGold: 175,
     spawn: { x: 9, y: 0 },
     exit: { x: 9, y: 24 },
     checkpoints: [],
@@ -118,13 +118,13 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 45.0,
+    parTimeSeconds: 48.0,
   },
   {
     roundNumber: 6,
-    title: 'Eastwall Spiral',
-    subtitle: '1 Storm · 2 Frost · 1 Chrono · 5 Keeps · Royal Outrider',
-    hint: 'Each Chrono pulse shaves 1.2s off every other Spire. Route through the Chrono ring right before your Frost spirals.',
+    title: 'Crosswind Spiral',
+    subtitle: '1 Storm · 2 Frost · 1 Chrono · 5 Keeps · Waystone · Royal Outrider',
+    hint: 'Route past Storm and Frost first, then trigger the Chrono Spire to cut 1.2s off their active cooldowns.',
     runnerType: 'OUTRIDER',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
@@ -132,7 +132,7 @@ export const ROUNDS: RoundConfig[] = [
     startingGold: 190,
     spawn: { x: 15, y: 0 },
     exit: { x: 3, y: 24 },
-    checkpoints: [],
+    checkpoints: [{ x: 5, y: 10 }],
     obstacleCount: 5,
     spireCount: 4,
     frostMireCount: 0,
@@ -141,13 +141,13 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 49.0,
+    parTimeSeconds: 51.0,
   },
   {
     roundNumber: 7,
-    title: 'Twin-Chrono Ridge',
+    title: 'Twin Chrono Ridge',
     subtitle: '2 Storm · 1 Frost · 2 Chrono · 6 Keeps · Iron Juggernaut',
-    hint: 'Two Chrono Spires recharge each other rapidly. Overcharge your central wall network to pierce Juggernaut armor.',
+    hint: 'Two Chrono Spires cut 1.2s off each other on every pulse. Overcharge your central wall network to pierce Juggernaut armor.',
     runnerType: 'JUGGERNAUT',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
@@ -164,13 +164,13 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 55.0,
+    parTimeSeconds: 57.0,
   },
   {
     roundNumber: 8,
     title: 'The High Citadel',
-    subtitle: '2 Storm · 2 Frost · 1 Chrono · 6 Keeps · Wind Herald',
-    hint: 'Final round. Guide the Wind Herald across all five Spires without leaving a 3-second sprint gap on the route.',
+    subtitle: '2 Storm · 2 Frost · 1 Chrono · 6 Keeps · Waystone · Wind Herald',
+    hint: 'Final round. Route the Wind Herald through the Waystone and all five Spires without leaving a 3.2-second Tailwind gap.',
     runnerType: 'HERALD',
     gridWidth: GRID_WIDTH,
     gridHeight: GRID_HEIGHT,
@@ -178,7 +178,7 @@ export const ROUNDS: RoundConfig[] = [
     startingGold: 220,
     spawn: { x: 9, y: 0 },
     exit: { x: 9, y: 24 },
-    checkpoints: [],
+    checkpoints: [{ x: 13, y: 12 }],
     obstacleCount: 6,
     spireCount: 5,
     frostMireCount: 0,
@@ -187,7 +187,7 @@ export const ROUNDS: RoundConfig[] = [
     preplacedSpires: [],
     frostMires: [],
     hasteRifts: [],
-    parTimeSeconds: 58.0,
+    parTimeSeconds: 60.0,
   },
 ];
 
@@ -195,9 +195,9 @@ const ROUND_SPIRE_ARCHETYPES: Record<number, SpireType[]> = {
   1: ['THUNDERCLAP', 'THUNDERCLAP'],
   2: ['FROST_OBELISK', 'THUNDERCLAP', 'FROST_OBELISK'],
   3: ['THUNDERCLAP', 'FROST_OBELISK', 'THUNDERCLAP'],
-  4: ['THUNDERCLAP', 'CHRONO_SPIRE', 'FROST_OBELISK', 'THUNDERCLAP'],
+  4: ['THUNDERCLAP', 'FROST_OBELISK', 'CHRONO_SPIRE', 'THUNDERCLAP'],
   5: ['THUNDERCLAP', 'FROST_OBELISK', 'CHRONO_SPIRE', 'THUNDERCLAP'],
-  6: ['CHRONO_SPIRE', 'FROST_OBELISK', 'THUNDERCLAP', 'FROST_OBELISK'],
+  6: ['FROST_OBELISK', 'THUNDERCLAP', 'CHRONO_SPIRE', 'FROST_OBELISK'],
   7: [
     'THUNDERCLAP',
     'CHRONO_SPIRE',
@@ -256,10 +256,11 @@ function normalizeSeed(seed?: number): number {
 }
 
 /**
- * Scales a round's base Par target by the room's Wall Supply multiplier:
- * - 0.80x (80%)   -> 0.86x Par
+ * Scales a round's base Par target by the room's Wall Supply multiplier, tapering on
+ * high-density late rounds so 125% Supply never over-inflates Par under board saturation:
+ * - 0.80x (80%)   -> 0.86x (early) tapering gently to 0.88x (late) [R1 28.0s -> 24.1s]
  * - 1.00x (Normal)-> 1.00x Par
- * - 1.25x (125%)  -> 1.12x Par
+ * - 1.25x (125%)  -> ~1.08x tapered (1.10x on open R1-R2 down to 1.06x on dense R7-R8)
  */
 export function computeEffectivePar(
   baseParSeconds: number,
@@ -272,17 +273,24 @@ export function computeEffectivePar(
       ? goldMultiplier
       : 1.0;
 
+  // Normalized campaign density factor in [0..1] across basePar 28s..60s
+  const densityT = Math.max(0, Math.min(1, (baseParSeconds - 28) / 32));
+  const targetAt80 = 0.86 + 0.02 * densityT;
+  const targetAt125 = 1.10 - 0.04 * densityT;
+
   let scale = 1.0;
   if (Math.abs(mult - 1.0) < 0.005) {
     scale = 1.0;
   } else if (Math.abs(mult - 0.8) < 0.005) {
-    scale = 0.86;
+    scale = targetAt80;
   } else if (Math.abs(mult - 1.25) < 0.005) {
-    scale = 1.12;
+    scale = targetAt125;
   } else if (mult < 1.0) {
-    scale = Math.max(0.6, 1.0 - ((1.0 - mult) * 0.14) / 0.2);
+    const dropAt80 = 1.0 - targetAt80;
+    scale = Math.max(0.6, 1.0 - ((1.0 - mult) * dropAt80) / 0.2);
   } else {
-    scale = Math.min(1.35, 1.0 + ((mult - 1.0) * 0.12) / 0.25);
+    const gainAt125 = targetAt125 - 1.0;
+    scale = Math.min(1.3, 1.0 + ((mult - 1.0) * gainAt125) / 0.25);
   }
 
   return Number((baseParSeconds * scale).toFixed(1));
@@ -316,15 +324,13 @@ function buildSpireZoneBands(
 ): SpireZoneBand[] {
   const minX = 4;
   const maxX = Math.max(minX, gridWidth - 6); // 14 on width 20
-  const minY = 4;
-  const maxY = Math.max(minY, gridHeight - 6); // 20 on height 26
 
-  const leftRange: [number, number] = [minX, Math.min(maxX, minX + 3)]; // [4..7]
+  const leftRange: [number, number] = [minX, Math.min(maxX, minX + 2)]; // [4..6]
   const centerRange: [number, number] = [
-    Math.max(minX, Math.floor(gridWidth / 2) - 3),
-    Math.min(maxX, Math.floor(gridWidth / 2) + 1),
-  ]; // [7..11]
-  const rightRange: [number, number] = [Math.max(minX, maxX - 3), maxX]; // [11..14]
+    Math.max(minX, Math.floor(gridWidth / 2) - 2),
+    Math.min(maxX, Math.floor(gridWidth / 2)),
+  ]; // [8..10]
+  const rightRange: [number, number] = [Math.max(minX, maxX - 2), maxX]; // [12..14]
 
   const pickLateral = (slot: 'L' | 'C' | 'R'): [number, number] => {
     if (slot === 'C') return centerRange;
@@ -365,14 +371,17 @@ function buildSpireZoneBands(
     ];
   }
 
-  // 5+ Spires: alternating L -> R -> C -> L -> R down [4..20]
+  // 5+ Spires: widened across y in [3..21] with separated L/R/C lateral windows so
+  // Slot 0..4 always maintain strict monotonic Y-order and minimal AoE ring overlap.
+  const minY5 = 3;
+  const maxY5 = Math.max(minY5, gridHeight - 5); // 21 on height 26
   const pattern: Array<'L' | 'C' | 'R'> = ['L', 'R', 'C', 'L', 'R'];
   const yBands: Array<[number, number]> = [
-    [4, 6],
+    [3, 5],
     [7, 9],
     [11, 13],
     [15, 17],
-    [18, 20],
+    [19, 21],
   ];
 
   const bands: SpireZoneBand[] = [];
@@ -380,8 +389,8 @@ function buildSpireZoneBands(
     const [xMin, xMax] = pickLateral(pattern[i % pattern.length]);
     const [yMin, yMax] = yBands[Math.min(i, yBands.length - 1)];
     bands.push({
-      yMin: Math.max(minY, yMin),
-      yMax: Math.min(maxY, yMax),
+      yMin: Math.max(minY5, yMin),
+      yMax: Math.min(maxY5, yMax),
       xMin,
       xMax,
     });
@@ -390,13 +399,13 @@ function buildSpireZoneBands(
 }
 
 /**
- * Generates a deterministic, sliver-free 20x26 layout of 2x2 Elemental Spires
- * and 4-7 Crimson Keeps using `mulberry32(seed)`.
- * - Spires sit within x in [4..14], y in [4..20] across longitudinal bands so full 360-degree
- *   1-tile corridor wraps and 2x2 outer walls always fit cleanly.
- * - Keeps sit within x in [2..16], y in [3..21], either forming clean orthogonal 2-block
- *   bastions (gap = 0) or keeping >= 2 walkable tiles of clearance from all structures and borders.
- * - >= 60% of Crimson Keeps spawn within 4-7 tiles of a Spire for readable Overcharge routing.
+ * Generates a deterministic, sliver-free 20x26 layout of 2x2 Elemental Spires,
+ * optional Gilded Checkpoint Waystones (R3, R6, R8), and 4-7 Crimson Keeps using `mulberry32(seed)`.
+ * - Spires sit across widened longitudinal bands (strictly ordered North-to-South) so full 360-degree
+ *   1-tile corridor wraps and 2x2 outer walls always fit inside the island.
+ * - Keeps forbid 3-tile cliff-sliver coordinates (`x in {3,15}`, `y in {3,21}`), either forming
+ *   clean 2-block orthogonal bastions (`gap = 0`) or leaving >= 2 walkable tiles of clearance.
+ * - Deterministic per-Spire round-robin guarantees reachable Keep anchors near Spires.
  */
 export function generateRandomRoundLayout(
   baseRound: RoundConfig,
@@ -410,6 +419,19 @@ export function generateRandomRoundLayout(
     return min + Math.floor(rng() * (max - min + 1));
   };
 
+  const shuffleInPlace = <T>(arr: T[]): T[] => {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = randInt(0, i);
+      const tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+    }
+    return arr;
+  };
+
+  const wantsCheckpoint =
+    Array.isArray(baseRound.checkpoints) && baseRound.checkpoints.length > 0;
+
   const round: RoundConfig = {
     ...baseRound,
     seed: resolvedSeed,
@@ -421,10 +443,10 @@ export function generateRandomRoundLayout(
     waygate: undefined,
   };
 
-  const keyPads: GridPoint[] = [round.spawn, round.exit];
+  const gatePads: GridPoint[] = [round.spawn, round.exit];
 
-  const clearOfKeyPads = (x: number, y: number): boolean => {
-    for (const pad of keyPads) {
+  const clearOfPads = (x: number, y: number, pads: GridPoint[]): boolean => {
+    for (const pad of pads) {
       if (!hasTwoTileClearance(x, y, pad.x, pad.y)) {
         return false;
       }
@@ -432,12 +454,25 @@ export function generateRandomRoundLayout(
     return true;
   };
 
-  // 1. Stratified 2x2 Elemental Spires across longitudinal bands (x in [4..14], y in [4..20])
+  // Orient 5-Spire lateral phase away from corner gates so y=3 / y=21 slots never collide with gates
+  let mirrorX = rng() < 0.5;
+  if (round.spireCount >= 5) {
+    if (round.spawn.x <= 5) {
+      mirrorX = true; // Slot 0 starts on Right [12..14], Slot 4 ends on Left [4..6] away from exit=(15,24)
+    } else if (round.spawn.x >= round.gridWidth - 7) {
+      mirrorX = false; // Slot 0 starts on Left [4..6]
+    }
+  }
+
+  // 1. Stratified 2x2 Elemental Spires in strict North-to-South longitudinal order
   const spireMinX = 4;
-  const spireMaxX = Math.max(spireMinX, round.gridWidth - 6);
-  const spireMinY = 4;
-  const spireMaxY = Math.max(spireMinY, round.gridHeight - 6);
-  const mirrorX = rng() < 0.5;
+  const spireMaxX = Math.max(spireMinX, round.gridWidth - 6); // 14
+  const spireMinY = round.spireCount >= 5 ? 3 : 4;
+  const spireMaxY = Math.max(
+    spireMinY,
+    round.gridHeight - (round.spireCount >= 5 ? 5 : 6)
+  ); // 21 for 5 spires, 20 otherwise
+
   const zoneBands = buildSpireZoneBands(
     round.spireCount,
     round.gridWidth,
@@ -458,7 +493,8 @@ export function generateRandomRoundLayout(
     ) {
       return false;
     }
-    if (!clearOfKeyPads(sx, sy)) return false;
+    // At y=3 or y=21 near central gates (x=9), ensure >= 4 tiles from gate pad
+    if (!clearOfPads(sx, sy, gatePads)) return false;
 
     for (const other of round.preplacedSpires) {
       if (do2x2Overlap(sx, sy, other.x, other.y)) return false;
@@ -471,49 +507,120 @@ export function generateRandomRoundLayout(
   for (let slotIdx = 0; slotIdx < round.spireCount; slotIdx++) {
     const band = zoneBands[slotIdx];
     const spireType = getSpireArchetypeForSlot(round.roundNumber, slotIdx);
+    const prevY =
+      round.preplacedSpires.length > 0
+        ? round.preplacedSpires[round.preplacedSpires.length - 1].y
+        : -1;
     let placed = false;
 
-    // Pass A: Stratified longitudinal + lateral zone candidate sampling
-    for (let attempt = 0; attempt < 90 && !placed; attempt++) {
-      const sx = randInt(band.xMin, band.xMax);
-      const sy = randInt(band.yMin, band.yMax);
-      if (!canPlaceSpireAt(sx, sy, 5.2)) continue;
+    // Pass A: Exact longitudinal + lateral band candidates (shuffled exhaustively)
+    const bandCells: GridPoint[] = [];
+    for (let sy = band.yMin; sy <= band.yMax; sy++) {
+      if (sy <= prevY) continue;
+      for (let sx = band.xMin; sx <= band.xMax; sx++) {
+        bandCells.push({ x: sx, y: sy });
+      }
+    }
+    shuffleInPlace(bandCells);
 
-      round.preplacedSpires.push({ x: sx, y: sy, spireType });
-      if (computeFullMazePath(round, []).valid) {
-        placed = true;
-      } else {
+    for (const targetMinDist of [6.8, 5.2]) {
+      if (placed) break;
+      for (const cand of bandCells) {
+        if (!canPlaceSpireAt(cand.x, cand.y, targetMinDist)) continue;
+        round.preplacedSpires.push({ x: cand.x, y: cand.y, spireType });
+        if (computeFullMazePath(round, []).valid) {
+          placed = true;
+          break;
+        }
         round.preplacedSpires.pop();
       }
     }
 
-    // Pass B: Full-interior fallback preserving strict >= 2-tile clearance & safe wrap bounds
-    for (let attempt = 0; attempt < 180 && !placed; attempt++) {
-      const sx = randInt(spireMinX, spireMaxX);
-      const sy = randInt(spireMinY, spireMaxY);
-      const minDist = attempt < 100 ? 5.0 : 4.2;
-      if (!canPlaceSpireAt(sx, sy, minDist)) continue;
+    // Pass B: In-band full-width fallback preserving strict North-to-South Y-order & >= 5.0m spacing
+    if (!placed) {
+      const yLo = Math.max(spireMinY, prevY + 2, band.yMin - 1);
+      const yHi = Math.min(spireMaxY, band.yMax + 1);
+      const wideBandCells: GridPoint[] = [];
+      for (let sy = yLo; sy <= yHi; sy++) {
+        for (let sx = spireMinX; sx <= spireMaxX; sx++) {
+          wideBandCells.push({ x: sx, y: sy });
+        }
+      }
+      shuffleInPlace(wideBandCells);
 
-      round.preplacedSpires.push({ x: sx, y: sy, spireType });
-      if (computeFullMazePath(round, []).valid) {
-        placed = true;
-      } else {
+      for (const cand of wideBandCells) {
+        if (!canPlaceSpireAt(cand.x, cand.y, 5.0)) continue;
+        round.preplacedSpires.push({ x: cand.x, y: cand.y, spireType });
+        if (computeFullMazePath(round, []).valid) {
+          placed = true;
+          break;
+        }
         round.preplacedSpires.pop();
       }
     }
   }
 
-  // 2. Crimson Keeps (x in [2..16], y in [3..21]), zero 1-tile slivers, >= 60% within 4-7 tiles of a Spire
-  const keepMinX = 2;
-  const keepMaxX = Math.max(keepMinX, round.gridWidth - 4);
-  const keepMinY = 3;
-  const keepMaxY = Math.max(keepMinY, round.gridHeight - 5);
+  // 2. Seeded 2x2 Gilded Checkpoint Waystone on signature rounds (R3, R6, R8)
+  if (wantsCheckpoint) {
+    const cpCandidates: GridPoint[] = [];
+    const preferWestFlank =
+      round.roundNumber === 8 ? mirrorX : !mirrorX;
+    const primaryXRange: [number, number] = preferWestFlank ? [4, 7] : [11, 14];
+    const secondaryXRange: [number, number] = preferWestFlank ? [11, 14] : [4, 7];
 
-  const canPlaceStandaloneKeep = (ox: number, oy: number): boolean => {
+    for (const [xLo, xHi] of [primaryXRange, secondaryXRange, [4, 14] as [number, number]]) {
+      const windowCells: GridPoint[] = [];
+      for (let cy = 8; cy <= 16; cy++) {
+        for (let cx = xLo; cx <= xHi; cx++) {
+          windowCells.push({ x: cx, y: cy });
+        }
+      }
+      shuffleInPlace(windowCells);
+      cpCandidates.push(...windowCells);
+    }
+
+    for (const cp of cpCandidates) {
+      if (!clearOfPads(cp.x, cp.y, gatePads)) continue;
+      if (
+        round.preplacedSpires.some(
+          (s) => !hasTwoTileClearance(cp.x, cp.y, s.x, s.y)
+        )
+      ) {
+        continue;
+      }
+      round.checkpoints = [{ x: cp.x, y: cp.y }];
+      if (computeFullMazePath(round, []).valid) {
+        break;
+      }
+      round.checkpoints = [];
+    }
+  }
+
+  const allKeyPads: GridPoint[] = [
+    round.spawn,
+    ...round.checkpoints,
+    round.exit,
+  ];
+
+  // 3. Crimson Keeps: forbid 3-tile cliff-slivers (x in {3,15}, y in {3,21}) & guarantee per-Spire reachability
+  const keepMinX = 2;
+  const keepMaxX = Math.max(keepMinX, round.gridWidth - 4); // 16
+  const keepMinY = 2;
+  const keepMaxY = Math.max(keepMinY, round.gridHeight - 4); // 22
+
+  const isSliverFreeKeepCoord = (ox: number, oy: number): boolean => {
     if (ox < keepMinX || ox > keepMaxX || oy < keepMinY || oy > keepMaxY) {
       return false;
     }
-    if (!clearOfKeyPads(ox, oy)) return false;
+    // Forbid 3-tile cliff gaps where 2x2 walls cannot seal without a 1-tile edge leak
+    if (ox === 3 || ox === round.gridWidth - 5) return false;
+    if (oy === 3 || oy === round.gridHeight - 5) return false;
+    return true;
+  };
+
+  const canPlaceStandaloneKeep = (ox: number, oy: number): boolean => {
+    if (!isSliverFreeKeepCoord(ox, oy)) return false;
+    if (!clearOfPads(ox, oy, allKeyPads)) return false;
 
     for (const s of round.preplacedSpires) {
       if (!hasTwoTileClearance(ox, oy, s.x, s.y)) return false;
@@ -524,15 +631,16 @@ export function generateRandomRoundLayout(
     return true;
   };
 
+  const bastionMemberIndices = new Set<number>();
+
   const canPlaceFlushBastionPartner = (
     nx: number,
     ny: number,
     anchorIndex: number
   ): boolean => {
-    if (nx < keepMinX || nx > keepMaxX || ny < keepMinY || ny > keepMaxY) {
-      return false;
-    }
-    if (!clearOfKeyPads(nx, ny)) return false;
+    if (bastionMemberIndices.has(anchorIndex)) return false; // Never chain 3 Keeps in a row
+    if (!isSliverFreeKeepCoord(nx, ny)) return false;
+    if (!clearOfPads(nx, ny, allKeyPads)) return false;
 
     for (const s of round.preplacedSpires) {
       if (!hasTwoTileClearance(nx, ny, s.x, s.y)) return false;
@@ -551,114 +659,124 @@ export function generateRandomRoundLayout(
     return round.preplacedSpires.some((s) => {
       const cheb = Math.max(Math.abs(ox - s.x), Math.abs(oy - s.y));
       const euclid = Math.hypot(ox - s.x, oy - s.y);
-      return cheb >= 4 && cheb <= 7 && euclid >= 4.0 && euclid <= 7.0;
+      return cheb >= 4 && cheb <= 7 && euclid >= 4.0 && euclid <= 7.6;
     });
   };
 
+  // Precompute relative ring offsets (cheb in [4..7], euclid <= 8.4), prioritizing 4..6-tile 1-2 wall bridges
+  const nearRingOffsets: GridPoint[] = [];
+  const outerRingOffsets: GridPoint[] = [];
+  for (let dy = -7; dy <= 7; dy++) {
+    for (let dx = -7; dx <= 7; dx++) {
+      const cheb = Math.max(Math.abs(dx), Math.abs(dy));
+      const euclid = Math.hypot(dx, dy);
+      if (cheb < 4 || cheb > 7 || euclid > 8.4) continue;
+      if (cheb <= 6 && euclid <= 6.8) {
+        nearRingOffsets.push({ x: dx, y: dy });
+      } else {
+        outerRingOffsets.push({ x: dx, y: dy });
+      }
+    }
+  }
+
+  // Pass A: Deterministic per-Spire round-robin so every Spire gets a reachable Keep anchor
+  const spireOrder = shuffleInPlace(
+    round.preplacedSpires.map((_, idx) => idx)
+  );
+  for (const sIdx of spireOrder) {
+    if (round.obstacles.length >= round.obstacleCount) break;
+    const spire = round.preplacedSpires[sIdx];
+
+    const alreadyAnchored = round.obstacles.some(
+      (k) => Math.hypot(k.x - spire.x, k.y - spire.y) <= 8.2
+    );
+    if (alreadyAnchored) continue;
+
+    const ringTry = [
+      ...shuffleInPlace([...nearRingOffsets]),
+      ...shuffleInPlace([...outerRingOffsets]),
+    ];
+
+    for (const off of ringTry) {
+      const ox = spire.x + off.x;
+      const oy = spire.y + off.y;
+      if (!canPlaceStandaloneKeep(ox, oy)) continue;
+
+      round.obstacles.push({ x: ox, y: oy });
+      if (computeFullMazePath(round, []).valid) {
+        break;
+      }
+      round.obstacles.pop();
+    }
+  }
+
+  // Pass B: Remaining Keeps — optional clean orthogonal 2-Keep bastions + Spire-bridge meadow slots
   const orthogonalBastionOffsets: GridPoint[] = [
     { x: 2, y: 0 },
     { x: -2, y: 0 },
     { x: 0, y: 2 },
     { x: 0, y: -2 },
   ];
-
-  const maxBastionPairs = round.obstacleCount >= 7 ? 2 : round.obstacleCount >= 5 ? 1 : 0;
+  const maxBastionPairs =
+    round.obstacleCount >= 7 ? 2 : round.obstacleCount >= 5 ? 1 : 0;
   let bastionPairsCreated = 0;
 
-  // Pass A: Place Spire-proximate Crimson Keeps (4-7 tiles from rotating Spires)
-  const targetBridgeKeeps = Math.min(
-    round.obstacleCount,
-    Math.max(Math.ceil(round.obstacleCount * 0.75), 3)
-  );
-
-  let bridgeAttempts = 0;
-  while (
-    round.obstacles.length < targetBridgeKeeps &&
-    round.preplacedSpires.length > 0 &&
-    bridgeAttempts < 320
+  if (
+    bastionPairsCreated < maxBastionPairs &&
+    round.obstacles.length < round.obstacleCount &&
+    rng() < 0.45
   ) {
-    bridgeAttempts++;
-    const spire =
-      round.preplacedSpires[
-        (round.obstacles.length + bridgeAttempts) % round.preplacedSpires.length
-      ];
-    const dx = randInt(-6, 6);
-    const dy = randInt(-6, 6);
-    const ox = spire.x + dx;
-    const oy = spire.y + dy;
-
-    const cheb = Math.max(Math.abs(dx), Math.abs(dy));
-    const euclid = Math.hypot(dx, dy);
-    if (cheb < 4 || cheb > 7 || euclid > 7.0) continue;
-    if (!canPlaceStandaloneKeep(ox, oy)) continue;
-
-    round.obstacles.push({ x: ox, y: oy });
-    if (!computeFullMazePath(round, []).valid) {
-      round.obstacles.pop();
-      continue;
-    }
-
-    // Optional clean orthogonal 2-block Keep bastion (gap = 0, zero half-tile staggers)
-    if (
-      bastionPairsCreated < maxBastionPairs &&
-      round.obstacles.length < round.obstacleCount &&
-      rng() < 0.35
-    ) {
-      const anchorIdx = round.obstacles.length - 1;
-      const startOff = randInt(0, orthogonalBastionOffsets.length - 1);
-      for (let k = 0; k < orthogonalBastionOffsets.length; k++) {
-        const off =
-          orthogonalBastionOffsets[(startOff + k) % orthogonalBastionOffsets.length];
-        const nx = ox + off.x;
-        const ny = oy + off.y;
+    const anchorIndices = shuffleInPlace(
+      round.obstacles.map((_, idx) => idx)
+    );
+    for (const anchorIdx of anchorIndices) {
+      if (
+        bastionPairsCreated >= maxBastionPairs ||
+        round.obstacles.length >= round.obstacleCount
+      ) {
+        break;
+      }
+      const anchor = round.obstacles[anchorIdx];
+      const dirs = shuffleInPlace([...orthogonalBastionOffsets]);
+      for (const off of dirs) {
+        const nx = anchor.x + off.x;
+        const ny = anchor.y + off.y;
         if (
           isWithinSpireBridgeBand(nx, ny) &&
           canPlaceFlushBastionPartner(nx, ny, anchorIdx)
         ) {
           round.obstacles.push({ x: nx, y: ny });
           if (computeFullMazePath(round, []).valid) {
+            bastionMemberIndices.add(anchorIdx);
+            bastionMemberIndices.add(round.obstacles.length - 1);
             bastionPairsCreated++;
             break;
-          } else {
-            round.obstacles.pop();
           }
+          round.obstacles.pop();
         }
       }
     }
   }
 
-  // Pass B: Fill remaining Keeps cleanly across the meadow (preferring Spire-bridge band first)
-  let fillAttempts = 0;
-  while (round.obstacles.length < round.obstacleCount && fillAttempts < 400) {
-    fillAttempts++;
-    const ox = randInt(keepMinX, keepMaxX);
-    const oy = randInt(keepMinY, keepMaxY);
-
-    if (fillAttempts < 220 && !isWithinSpireBridgeBand(ox, oy)) continue;
-    if (!canPlaceStandaloneKeep(ox, oy)) continue;
-
-    round.obstacles.push({ x: ox, y: oy });
-    if (!computeFullMazePath(round, []).valid) {
-      round.obstacles.pop();
-    }
-  }
-
-  // Pass C: Deterministic shuffled grid sweep so rare dense seeds still hit exact obstacleCount
   if (round.obstacles.length < round.obstacleCount) {
-    const remainingCells: GridPoint[] = [];
+    const bridgeCells: GridPoint[] = [];
+    const openCells: GridPoint[] = [];
     for (let oy = keepMinY; oy <= keepMaxY; oy++) {
       for (let ox = keepMinX; ox <= keepMaxX; ox++) {
-        remainingCells.push({ x: ox, y: oy });
+        if (!isSliverFreeKeepCoord(ox, oy)) continue;
+        if (isWithinSpireBridgeBand(ox, oy)) {
+          bridgeCells.push({ x: ox, y: oy });
+        } else {
+          openCells.push({ x: ox, y: oy });
+        }
       }
     }
-    for (let i = remainingCells.length - 1; i > 0; i--) {
-      const j = randInt(0, i);
-      const tmp = remainingCells[i];
-      remainingCells[i] = remainingCells[j];
-      remainingCells[j] = tmp;
-    }
+    const candidates = [
+      ...shuffleInPlace(bridgeCells),
+      ...shuffleInPlace(openCells),
+    ];
 
-    for (const cell of remainingCells) {
+    for (const cell of candidates) {
       if (round.obstacles.length >= round.obstacleCount) break;
       if (!canPlaceStandaloneKeep(cell.x, cell.y)) continue;
       round.obstacles.push({ x: cell.x, y: cell.y });
@@ -667,7 +785,7 @@ export function generateRandomRoundLayout(
       }
     }
 
-    // Fallback orthogonal 2-block bastion partner if standalone slots are saturated
+    // Fallback 2-Keep bastion partner (never chaining 3 Keeps) if standalone slots saturate
     for (
       let anchorIdx = 0;
       anchorIdx < round.obstacles.length &&
@@ -675,16 +793,18 @@ export function generateRandomRoundLayout(
       anchorIdx++
     ) {
       const anchor = round.obstacles[anchorIdx];
-      for (const off of orthogonalBastionOffsets) {
+      const dirs = shuffleInPlace([...orthogonalBastionOffsets]);
+      for (const off of dirs) {
         const nx = anchor.x + off.x;
         const ny = anchor.y + off.y;
         if (canPlaceFlushBastionPartner(nx, ny, anchorIdx)) {
           round.obstacles.push({ x: nx, y: ny });
           if (computeFullMazePath(round, []).valid) {
+            bastionMemberIndices.add(anchorIdx);
+            bastionMemberIndices.add(round.obstacles.length - 1);
             break;
-          } else {
-            round.obstacles.pop();
           }
+          round.obstacles.pop();
         }
       }
     }

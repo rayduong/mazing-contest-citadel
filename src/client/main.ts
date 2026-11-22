@@ -7,6 +7,7 @@ import { MazeRunnerSimulator, SIM_DT } from '../shared/simulation.js';
 import {
   ActiveBuildTool,
   ClientToServerMessage,
+  getEffectiveSpireStats,
   GridPoint,
   LeaderboardPayload,
   LobbyRoomSummary,
@@ -35,18 +36,45 @@ import {
 } from './renderer3d.js';
 
 type UndoEntry =
-  | { kind: 'PLACE'; x: number; y: number; clientId: string }
+  | { kind: 'PLACE'; x: number; y: number; clientId: string; seq?: number }
+  | { kind: 'SELL'; x: number; y: number; seq?: number }
+  | {
+      kind: 'BATCH_REPLACE';
+      previousTowers: GridPoint[];
+      previousUsedSampleMaze: boolean;
+      seq?: number;
+    };
+
+type RedoEntry =
+  | { kind: 'PLACE'; x: number; y: number }
   | { kind: 'SELL'; x: number; y: number }
-  | { kind: 'BATCH_REPLACE'; previousTowers: GridPoint[] };
+  | {
+      kind: 'BATCH_REPLACE';
+      nextTowers: GridPoint[];
+      nextUsedSampleMaze: boolean;
+    };
+
+type PendingMutation =
+  | { seq: number; kind: 'PLACE'; x: number; y: number; clientId: string }
+  | { seq: number; kind: 'SELL'; towerId: string; x?: number; y?: number }
+  | { seq: number; kind: 'CLEAR' }
+  | {
+      seq: number;
+      kind: 'RESTORE';
+      towers: GridPoint[];
+      usedSampleMaze: boolean;
+    }
+  | { seq: number; kind: 'SAMPLE' }
+  | { seq: number; kind: 'READY'; ready: boolean };
 
 interface ArmedButtonEntry {
   timer: number;
   restoreHtml: string;
+  armedAt: number;
 }
 
 const NAME_STORAGE_KEY = 'mc2026_player_name';
-const SESSION_STORAGE_KEY = 'mc2026_session_id';
-const SESSION_LEGACY_KEY = 'mc2026_session';
+const TAB_SESSION_STORAGE_KEY = 'mc2026_tab_session_id';
 
 function escapeHtml(raw: string): string {
   return raw
@@ -64,25 +92,24 @@ function formatOrdinal(rank: number): string {
   return `${rank}th`;
 }
 
+function formatParTarget(par: number): string {
+  const rounded = Math.round(par * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded}s+` : `${rounded.toFixed(1)}s+`;
+}
+
 function readOrCreateSessionId(): string {
+  const generated = `sess_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
   try {
-    const existing =
-      localStorage.getItem(SESSION_STORAGE_KEY) ||
-      localStorage.getItem(SESSION_LEGACY_KEY);
+    const existing = sessionStorage.getItem(TAB_SESSION_STORAGE_KEY);
     if (existing && existing.trim().length >= 8) {
-      const clean = existing.trim();
-      localStorage.setItem(SESSION_STORAGE_KEY, clean);
-      localStorage.setItem(SESSION_LEGACY_KEY, clean);
-      return clean;
+      return existing.trim();
     }
-    const generated = `sess_${Date.now().toString(36)}_${Math.random()
-      .toString(36)
-      .slice(2, 10)}`;
-    localStorage.setItem(SESSION_STORAGE_KEY, generated);
-    localStorage.setItem(SESSION_LEGACY_KEY, generated);
+    sessionStorage.setItem(TAB_SESSION_STORAGE_KEY, generated);
     return generated;
   } catch {
-    return `sess_${Math.random().toString(36).slice(2, 12)}`;
+    return generated;
   }
 }
 
@@ -134,9 +161,22 @@ class MazingContestClient {
   private runPhaseActive = false;
 
   private undoStack: UndoEntry[] = [];
+  private redoStack: RedoEntry[] = [];
   private optSeq = 0;
+  private clientSeq = 0;
+  private pendingMutations: PendingMutation[] = [];
   private lastUndoRoundSignature = '';
   private sortedStandingsIds: string[] = [];
+
+  private wsSuperseded = false;
+  private pendingJoinToast: string | null = null;
+  private unreadChatCount = 0;
+  private lastErrorToastText = '';
+  private lastErrorToastAt = 0;
+
+  private localParAchievedThisRun = false;
+  private localFinishPlayedThisRun = false;
+  private lastRunDomCache = new Map<string, string>();
 
   private armedTimers = new Map<HTMLElement, ArmedButtonEntry>();
   private lastPillSignature = '';
@@ -149,7 +189,11 @@ class MazingContestClient {
 
   private cachedTopHudBottom = 56;
   private cachedBottomHudInset = 84;
+  private cachedTrayTop = 0;
   private insetRafPending = false;
+
+  private nudgeHoldDelayTimer: number | null = null;
+  private nudgeHoldInterval: number | null = null;
 
   constructor() {
     this.hydrateSingleSourceGuide();
@@ -287,13 +331,44 @@ class MazingContestClient {
         }
       }
 
+      // Measure precision tray separately for floating pill clamp WITHOUT shifting camera target
+      let trayTop = h;
+      const trayEl = document.getElementById('touch-precision-tray');
+      if (trayEl && !trayEl.classList.contains('hidden')) {
+        const tStyle = window.getComputedStyle(trayEl);
+        if (tStyle.display !== 'none' && tStyle.opacity !== '0') {
+          const tRect = trayEl.getBoundingClientRect();
+          if (tRect.height > 0 && tRect.top < h) {
+            trayTop = tRect.top;
+          }
+        }
+      }
+      this.cachedTrayTop = trayTop;
+
       let minBottomTop = h - 16;
-      const bottomCandidates = [
+      const isTouchBuild =
+        document.body.dataset.input === 'touch' &&
+        this.roomState?.phase === 'BUILD';
+
+      const bottomCandidates: Array<HTMLElement | null> = [
         document.getElementById('hud-bottom-dock'),
-        document.getElementById('touch-precision-tray'),
         document.getElementById('spectator-bar'),
         document.getElementById('hud-run-dock'),
       ];
+      if (!isTouchBuild) {
+        bottomCandidates.push(trayEl);
+      }
+
+      const resultsModal = document.getElementById('results-modal');
+      if (
+        resultsModal &&
+        !resultsModal.classList.contains('hidden') &&
+        resultsModal.classList.contains('peek-minimized')
+      ) {
+        bottomCandidates.push(
+          resultsModal.querySelector<HTMLElement>('.results-modal-card')
+        );
+      }
 
       for (const el of bottomCandidates) {
         if (!el || el.classList.contains('hidden')) continue;
@@ -409,7 +484,12 @@ class MazingContestClient {
       return;
     }
 
-    if (this.armedTimers.has(btn)) {
+    const existing = this.armedTimers.get(btn);
+    if (existing) {
+      // 180ms minimum bounce floor prevents synthetic touch/click double-fire from auto-confirming
+      if (performance.now() - existing.armedAt < 180) {
+        return;
+      }
       this.disarmButton(btn);
       onConfirm();
       return;
@@ -428,12 +508,48 @@ class MazingContestClient {
     const timer = window.setTimeout(() => {
       this.disarmButton(btn);
     }, 3500);
-    this.armedTimers.set(btn, { timer, restoreHtml });
+    this.armedTimers.set(btn, {
+      timer,
+      restoreHtml,
+      armedAt: performance.now(),
+    });
   }
 
   // ==========================================================================
   // NETWORKING & LIFECYCLE
   // ==========================================================================
+
+  private updateWsStatusPill(message: string | null) {
+    const pill = document.getElementById('ws-status-pill');
+    if (!pill) return;
+    if (!message) {
+      pill.classList.add('hidden');
+      return;
+    }
+    pill.textContent = message;
+    pill.classList.remove('hidden');
+  }
+
+  private ensureConnectedForAction(): boolean {
+    if (this.wsSuperseded) {
+      this.showToast('Session moved to another tab. Refresh to reconnect here.');
+      return false;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.updateWsStatusPill('Reconnecting…');
+      const now = performance.now();
+      if (now - this.lastErrorToastAt > 1200) {
+        this.lastErrorToastAt = now;
+        this.showToast('Reconnecting to server…');
+      }
+      return false;
+    }
+    return true;
+  }
+
+  private nextSeq(): number {
+    return ++this.clientSeq;
+  }
 
   private async fetchInitialHubData() {
     try {
@@ -458,11 +574,13 @@ class MazingContestClient {
   }
 
   private connectWebSocket() {
+    if (this.wsSuperseded) return;
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${proto}//${window.location.host}/ws`;
     this.ws = new WebSocket(wsUrl);
 
     this.ws.addEventListener('open', () => {
+      this.updateWsStatusPill(null);
       this.send({
         type: 'JOIN_ROOM',
         roomCode: this.roomCode,
@@ -480,18 +598,32 @@ class MazingContestClient {
       }
 
       if (msg.type === 'WELCOME') {
+        this.wsSuperseded = false;
+        this.updateWsStatusPill(null);
         this.localPlayerId = msg.playerId;
         if (msg.sessionId) {
           this.sessionId = msg.sessionId;
           try {
-            localStorage.setItem(SESSION_STORAGE_KEY, msg.sessionId);
-            localStorage.setItem(SESSION_LEGACY_KEY, msg.sessionId);
+            sessionStorage.setItem(TAB_SESSION_STORAGE_KEY, msg.sessionId);
           } catch {
             // ignore
           }
         }
         this.roomCode = msg.state.roomCode;
         this.syncUrlRoomCode(this.roomCode);
+
+        const joinToast = this.pendingJoinToast;
+        this.pendingJoinToast = null;
+        if (joinToast) {
+          this.showToast(joinToast, true);
+          this.closeHub();
+        } else {
+          this.send({
+            type: 'CLIENT_ARENA_ACTIVE',
+            active: !this.isHubOpen(),
+          });
+        }
+
         this.applyRoomState(msg.state);
         this.syncConfigFormFromSettings(msg.state.settings);
       } else if (msg.type === 'ROOM_STATE') {
@@ -501,11 +633,17 @@ class MazingContestClient {
       } else if (msg.type === 'TIMER_TICK') {
         if (this.roomState) {
           this.roomState.phaseTimeRemaining = msg.phaseTimeRemaining;
+          if (typeof msg.buildTimerPaused === 'boolean') {
+            this.roomState.buildTimerPaused = msg.buildTimerPaused;
+          }
           if (typeof msg.runElapsed === 'number') {
             this.roomState.runElapsed = msg.runElapsed;
             this.reconcileRunDrift(msg.runElapsed);
           }
           this.updateTimerDOM(true);
+          if (this.isHubOpen()) {
+            this.updateHubHeroStatus();
+          }
           if (this.roomState.phase === 'ROUND_RESULTS') {
             this.updateResultsCountdownDOM();
           }
@@ -520,15 +658,54 @@ class MazingContestClient {
         if (this.roomState) {
           this.roomState.chat.push(msg.message);
           this.renderChat();
+          const lobbyDrawer = document.getElementById('lobby-drawer');
+          const drawerHidden =
+            !lobbyDrawer || lobbyDrawer.classList.contains('hidden');
+          if (
+            drawerHidden &&
+            !msg.message.isSystem &&
+            msg.message.senderName !== this.playerName
+          ) {
+            this.unreadChatCount++;
+            document
+              .getElementById('lobby-unread-dot')
+              ?.classList.remove('hidden');
+          }
         }
       } else if (msg.type === 'ERROR_TOAST') {
-        soundEngine.playError();
-        soundEngine.haptic('error');
-        this.showToast(msg.message);
+        this.pendingJoinToast = null;
+        if (typeof msg.rejectedSeq === 'number') {
+          this.pendingMutations = this.pendingMutations.filter(
+            (m) => m.seq !== msg.rejectedSeq
+          );
+          this.undoStack = this.undoStack.filter(
+            (u) => u.seq !== msg.rejectedSeq
+          );
+        }
+        if (msg.state) {
+          this.applyRoomState(msg.state);
+        }
+        const now = performance.now();
+        if (
+          msg.message !== this.lastErrorToastText ||
+          now - this.lastErrorToastAt > 900
+        ) {
+          this.lastErrorToastText = msg.message;
+          this.lastErrorToastAt = now;
+          soundEngine.playError();
+          soundEngine.haptic('error');
+          this.showToast(msg.message);
+        }
       }
     });
 
-    this.ws.addEventListener('close', () => {
+    this.ws.addEventListener('close', (ev) => {
+      if (ev.code === 4001) {
+        this.wsSuperseded = true;
+        this.updateWsStatusPill('Disconnected · Opened in another tab');
+        return;
+      }
+      this.updateWsStatusPill('Reconnecting…');
       setTimeout(() => this.connectWebSocket(), 2000);
     });
   }
@@ -575,11 +752,18 @@ class MazingContestClient {
       standingsDropdown?.classList.add('hidden');
       dockToolsPopover?.classList.add('hidden');
       lobbyDrawer?.classList.add('hidden');
-      document
-        .getElementById('btn-standings-toggle')
-        ?.classList.remove('active');
-      document.getElementById('btn-dock-tools')?.classList.remove('active');
-      document.getElementById('btn-toggle-lobby')?.classList.remove('active');
+      const roundBtn = document.getElementById('btn-round-picker');
+      roundBtn?.classList.remove('active');
+      roundBtn?.setAttribute('aria-expanded', 'false');
+      const standingsBtn = document.getElementById('btn-standings-toggle');
+      standingsBtn?.classList.remove('active');
+      standingsBtn?.setAttribute('aria-expanded', 'false');
+      const dockToolsBtn = document.getElementById('btn-dock-tools');
+      dockToolsBtn?.classList.remove('active');
+      dockToolsBtn?.setAttribute('aria-expanded', 'false');
+      const lobbyBtn = document.getElementById('btn-toggle-lobby');
+      lobbyBtn?.classList.remove('active');
+      lobbyBtn?.setAttribute('aria-expanded', 'false');
     }
 
     return anyOpen;
@@ -588,10 +772,17 @@ class MazingContestClient {
   private hideTransientPopovers() {
     this.disarmAllButtons();
     document.getElementById('round-dropdown')?.classList.add('hidden');
+    const roundBtn = document.getElementById('btn-round-picker');
+    roundBtn?.classList.remove('active');
+    roundBtn?.setAttribute('aria-expanded', 'false');
     document.getElementById('standings-dropdown')?.classList.add('hidden');
-    document.getElementById('btn-standings-toggle')?.classList.remove('active');
+    const standingsBtn = document.getElementById('btn-standings-toggle');
+    standingsBtn?.classList.remove('active');
+    standingsBtn?.setAttribute('aria-expanded', 'false');
     document.getElementById('dock-tools-popover')?.classList.add('hidden');
-    document.getElementById('btn-dock-tools')?.classList.remove('active');
+    const dockToolsBtn = document.getElementById('btn-dock-tools');
+    dockToolsBtn?.classList.remove('active');
+    dockToolsBtn?.setAttribute('aria-expanded', 'false');
   }
 
   private hideCursorPill() {
@@ -604,6 +795,7 @@ class MazingContestClient {
   }
 
   private hideTouchPrecisionTray() {
+    this.stopNudgeHold();
     const tray = document.getElementById('touch-precision-tray');
     if (tray && !tray.classList.contains('hidden')) {
       tray.classList.add('hidden');
@@ -617,6 +809,7 @@ class MazingContestClient {
       window.clearTimeout(this.briefDismissTimer);
       this.briefDismissTimer = null;
     }
+    document.body.dataset.briefVisible = 'false';
     document.getElementById('round-brief-banner')?.classList.add('hidden');
   }
 
@@ -635,23 +828,106 @@ class MazingContestClient {
     const textEl = document.getElementById('round-brief-text');
     if (!banner || !textEl) return;
 
-    textEl.innerHTML = `${getRunnerIcon(archKey, 14)} <strong>${escapeHtml(
-      arch.name
-    )}:</strong> <span>${escapeHtml(arch.traitSummary)}</span>`;
+    textEl.innerHTML = `
+      <span class="brief-head-line">
+        ${getRunnerIcon(archKey, 14)}
+        <strong>${escapeHtml(arch.name)}</strong>
+        <span class="brief-trait">· ${escapeHtml(arch.traitSummary)}</span>
+        <span class="brief-par-chip">${icon('starFilled', 11)} Par ${escapeHtml(
+          formatParTarget(round.parTimeSeconds)
+        )}</span>
+      </span>
+      <span class="brief-hint-line">${escapeHtml(round.hint)}</span>
+    `;
+    document.body.dataset.briefVisible = 'true';
     banner.classList.remove('hidden');
 
     if (this.briefDismissTimer !== null) {
       window.clearTimeout(this.briefDismissTimer);
     }
+    const holdMs = round.roundNumber === 1 ? 8500 : 6200;
     this.briefDismissTimer = window.setTimeout(() => {
+      document.body.dataset.briefVisible = 'false';
       banner.classList.add('hidden');
       this.briefDismissTimer = null;
-    }, 4500);
+    }, holdMs);
   }
 
   // ==========================================================================
   // ROOM STATE APPLICATION & RUN SIMULATION
   // ==========================================================================
+
+  private replayPendingMutationsOntoLocalPlayer(state: RoomState) {
+    if (!this.localPlayerId || this.pendingMutations.length === 0) return;
+    const me = state.players.find((p) => p.id === this.localPlayerId);
+    if (!me) return;
+
+    const wallCost = TOWER_SPECS.BLOCK.goldCost;
+    const round = state.roundConfig;
+
+    for (const mut of this.pendingMutations) {
+      if (mut.kind === 'PLACE') {
+        const exists = me.towers.some(
+          (t) => t.id === mut.clientId || (t.x === mut.x && t.y === mut.y)
+        );
+        if (!exists && me.gold >= wallCost) {
+          const check = validateTowerPlacement(round, me.towers, mut.x, mut.y);
+          if (check.valid && check.pathResult) {
+            me.towers.push({
+              id: mut.clientId,
+              type: 'BLOCK',
+              x: mut.x,
+              y: mut.y,
+              createdAt: Date.now(),
+            });
+            me.gold = Math.max(0, me.gold - wallCost);
+            me.pathDistance = Number(check.pathResult.totalDistance.toFixed(1));
+            me.ready = false;
+          }
+        }
+      } else if (mut.kind === 'SELL') {
+        const idx = me.towers.findIndex(
+          (t) =>
+            t.id === mut.towerId ||
+            (mut.x !== undefined &&
+              mut.y !== undefined &&
+              t.x === mut.x &&
+              t.y === mut.y)
+        );
+        if (idx !== -1) {
+          me.towers.splice(idx, 1);
+          me.gold += wallCost;
+          me.ready = false;
+        }
+      } else if (mut.kind === 'CLEAR') {
+        me.towers = [];
+        me.gold = round.startingGold;
+        me.ready = false;
+      } else if (mut.kind === 'RESTORE') {
+        me.towers = [];
+        me.gold = round.startingGold;
+        me.usedSampleMaze = Boolean(me.usedSampleMaze || mut.usedSampleMaze);
+        me.ready = false;
+        for (const pt of mut.towers) {
+          if (me.gold < wallCost) break;
+          const check = validateTowerPlacement(round, me.towers, pt.x, pt.y);
+          if (check.valid && check.pathResult) {
+            me.towers.push({
+              id: `opt_${++this.optSeq}`,
+              type: 'BLOCK',
+              x: pt.x,
+              y: pt.y,
+              createdAt: Date.now(),
+            });
+            me.gold = Math.max(0, me.gold - wallCost);
+            me.pathDistance = Number(check.pathResult.totalDistance.toFixed(1));
+          }
+        }
+      } else if (mut.kind === 'READY') {
+        me.ready = mut.ready;
+      }
+    }
+  }
 
   private applyRoomState(state: RoomState) {
     const prevPhase = this.roomState?.phase;
@@ -663,11 +939,28 @@ class MazingContestClient {
     }`;
     if (state.phase !== 'BUILD' || undoSig !== this.lastUndoRoundSignature) {
       this.undoStack = [];
+      this.redoStack = [];
+      this.pendingMutations = [];
       this.lastUndoRoundSignature = undoSig;
       this.lastCountdownTickSec = -1;
+    } else {
+      const acked = state.lastAckedSeq ?? 0;
+      if (acked > 0) {
+        this.pendingMutations = this.pendingMutations.filter(
+          (m) => m.seq > acked
+        );
+      }
+      this.replayPendingMutationsOntoLocalPlayer(state);
     }
 
     this.renderer3d.syncRoomState(state, this.localPlayerId);
+    if (state.phase === 'BUILD' && this.pendingMutations.length > 0) {
+      const me = this.getLocalPlayer();
+      const evalRes = this.renderer3d.getLocalMazeEval();
+      if (me && evalRes) {
+        me.pathDistance = Number(evalRes.distance.toFixed(1));
+      }
+    }
 
     if (state.phase === 'RUN') {
       if (prevPhase !== 'RUN' || !this.runPhaseActive) {
@@ -679,7 +972,7 @@ class MazingContestClient {
       this.runPhaseActive = false;
     }
 
-    // Trigger 4.5s Round Brief at start of each round's BUILD phase
+    // Trigger Round Brief at start of each round's BUILD phase
     if (state.phase === 'BUILD') {
       const briefSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
         state.roundConfig.seed ?? ''
@@ -719,7 +1012,9 @@ class MazingContestClient {
     const resultsModal = document.getElementById('results-modal')!;
     if (state.phase === 'ROUND_RESULTS' || state.phase === 'GAME_OVER') {
       if (prevPhase !== state.phase) {
-        soundEngine.playFinish();
+        if (!this.localFinishPlayedThisRun) {
+          soundEngine.playFinish();
+        }
         resultsModal.classList.remove('peek-minimized');
         this.syncPeekMazesButton(false);
       }
@@ -736,6 +1031,7 @@ class MazingContestClient {
     this.updateUndoAndToolAvailability();
     this.updateTopBarAndResources();
     this.updateScoreboardDOM();
+    this.renderDrawerRoster();
     this.updateHubHeroStatus();
     this.renderChat();
     this.renderLobbyBrowser();
@@ -744,6 +1040,10 @@ class MazingContestClient {
 
   private startClientRunPhase(state: RoomState) {
     this.simulators.clear();
+    this.lastRunDomCache.clear();
+    this.localParAchievedThisRun = false;
+    this.localFinishPlayedThisRun = false;
+
     const initialElapsed = Math.max(0, state.runElapsed || 0);
     for (const p of state.players) {
       const sim = new MazeRunnerSimulator(p.id, state.roundConfig, p.towers);
@@ -751,6 +1051,9 @@ class MazingContestClient {
         sim.fastForwardTo(initialElapsed);
       }
       this.simulators.set(p.id, sim);
+    }
+    if (initialElapsed < 0.2) {
+      soundEngine.playRunStart();
     }
     this.simAccumulator = 0;
     this.runPhaseActive = true;
@@ -764,10 +1067,23 @@ class MazingContestClient {
   }
 
   private reconcileRunDrift(serverElapsed: number) {
-    if (!this.runPhaseActive || serverElapsed <= 0) return;
-    for (const sim of this.simulators.values()) {
-      if (!sim.state.finished && serverElapsed - sim.elapsedSeconds > 1.25) {
+    if (!this.runPhaseActive || !this.roomState || serverElapsed <= 0) return;
+    for (const p of this.roomState.players) {
+      const sim = this.simulators.get(p.id);
+      if (!sim || sim.state.finished) continue;
+      const drift = serverElapsed - sim.elapsedSeconds;
+      if (drift > 1.25) {
         sim.fastForwardTo(serverElapsed);
+      } else if (drift < -1.25) {
+        const fresh = new MazeRunnerSimulator(
+          p.id,
+          this.roomState.roundConfig,
+          p.towers
+        );
+        fresh.fastForwardTo(serverElapsed);
+        this.simulators.set(p.id, fresh);
+      } else if (Math.abs(drift) > 0.18) {
+        this.simAccumulator = Math.max(0, this.simAccumulator + drift * 0.25);
       }
     }
   }
@@ -795,23 +1111,52 @@ class MazingContestClient {
       }
     }
 
+    const focusId = this.renderer3d.focusedPlayerId || this.localPlayerId;
     for (const ev of allEvents) {
       const isFocused =
-        ev.playerId ===
-        (this.renderer3d.focusedPlayerId || this.localPlayerId);
+        !this.renderer3d.arenaOverviewMode && ev.playerId === focusId;
       if (isFocused || this.renderer3d.arenaOverviewMode) {
+        const vol = isFocused
+          ? 1.0
+          : ev.playerId === this.localPlayerId
+          ? 0.72
+          : 0.42;
         if (ev.type === 'CLAP') {
-          soundEngine.playSpirePulse(
-            ev.spireType || 'THUNDERCLAP',
-            ev.overchargeTier || 0
-          );
+          if (ev.armoredResisted) {
+            soundEngine.playArmorDeflect(vol);
+          } else {
+            soundEngine.playSpirePulse(
+              ev.spireType || 'THUNDERCLAP',
+              ev.overchargeTier || 0,
+              vol
+            );
+          }
         } else if (ev.type === 'WAYGATE') {
-          soundEngine.playChronoWarp();
+          soundEngine.playChronoWarp(vol);
         } else if (ev.type === 'CHECKPOINT') {
-          soundEngine.playCheckpoint();
+          soundEngine.playCheckpoint(vol);
         } else if (ev.type === 'FINISH') {
-          soundEngine.playFinish();
+          if (isFocused || ev.playerId === this.localPlayerId) {
+            soundEngine.playFinish();
+            this.localFinishPlayedThisRun = true;
+          }
         }
+      }
+    }
+
+    // Celebrate the exact moment the local/focused runner crosses the Round Par threshold
+    if (!this.localParAchievedThisRun) {
+      const watchId = this.localPlayerId || focusId || '';
+      const watchSim = this.simulators.get(watchId);
+      const parSecs = this.roomState.roundConfig.parTimeSeconds;
+      if (watchSim && watchSim.elapsedSeconds >= parSecs) {
+        this.localParAchievedThisRun = true;
+        soundEngine.playParAchieved();
+        soundEngine.haptic('ready');
+        this.showToast(
+          `Par achieved (${formatParTarget(parSecs)}) · +2 bonus pts`,
+          true
+        );
       }
     }
 
@@ -830,14 +1175,19 @@ class MazingContestClient {
 
   private handleOptimisticPlaceTower(x: number, y: number) {
     if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    if (!this.ensureConnectedForAction()) return;
     const me = this.getLocalPlayer();
     if (!me) return;
 
     const wallCost = TOWER_SPECS.BLOCK.goldCost;
     if (me.gold < wallCost) {
-      soundEngine.playError();
-      soundEngine.haptic('error');
-      this.showToast('No walls left. Remove a wall first.');
+      const now = performance.now();
+      if (now - this.lastErrorToastAt > 900) {
+        this.lastErrorToastAt = now;
+        soundEngine.playError();
+        soundEngine.haptic('error');
+        this.showToast('No walls left. Remove a wall first.');
+      }
       return;
     }
 
@@ -848,10 +1198,16 @@ class MazingContestClient {
       y
     );
     if (!validation.valid || !validation.pathResult) {
-      soundEngine.playError();
-      soundEngine.haptic('error');
-      if (validation.reason) {
-        this.showToast(validation.reason);
+      const msg = validation.reason || 'Blocked';
+      const now = performance.now();
+      if (msg !== this.lastErrorToastText || now - this.lastErrorToastAt > 900) {
+        this.lastErrorToastText = msg;
+        this.lastErrorToastAt = now;
+        soundEngine.playError();
+        soundEngine.haptic('error');
+        this.showToast(msg);
+      } else {
+        soundEngine.playError();
       }
       return;
     }
@@ -862,6 +1218,7 @@ class MazingContestClient {
         .overchargedSpires;
 
     const clientId = `opt_${++this.optSeq}`;
+    const seq = this.nextSeq();
     me.towers.push({
       id: clientId,
       type: 'BLOCK',
@@ -873,7 +1230,9 @@ class MazingContestClient {
     me.pathDistance = Number(validation.pathResult.totalDistance.toFixed(1));
     me.ready = false;
 
-    this.pushUndo({ kind: 'PLACE', x, y, clientId });
+    this.redoStack = [];
+    this.pushUndo({ kind: 'PLACE', x, y, clientId, seq });
+    this.pendingMutations.push({ seq, kind: 'PLACE', x, y, clientId });
 
     this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
     const nextOvercharge =
@@ -887,7 +1246,7 @@ class MazingContestClient {
     this.updateTopBarAndResources();
     this.updateScoreboardDOM();
 
-    this.send({ type: 'PLACE_TOWER', x, y, clientId });
+    this.send({ type: 'PLACE_TOWER', x, y, clientId, clientSeq: seq });
   }
 
   private handleOptimisticSellTower(
@@ -896,6 +1255,7 @@ class MazingContestClient {
     y?: number
   ) {
     if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    if (!this.ensureConnectedForAction()) return;
     const me = this.getLocalPlayer();
     if (!me) return;
 
@@ -907,10 +1267,19 @@ class MazingContestClient {
     if (idx === -1) return;
 
     const [removed] = me.towers.splice(idx, 1);
+    const seq = this.nextSeq();
     me.gold += TOWER_SPECS.BLOCK.goldCost;
     me.ready = false;
 
-    this.pushUndo({ kind: 'SELL', x: removed.x, y: removed.y });
+    this.redoStack = [];
+    this.pushUndo({ kind: 'SELL', x: removed.x, y: removed.y, seq });
+    this.pendingMutations.push({
+      seq,
+      kind: 'SELL',
+      towerId: removed.id,
+      x: removed.x,
+      y: removed.y,
+    });
 
     this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
     const evalRes = this.renderer3d.getLocalMazeEval();
@@ -930,6 +1299,7 @@ class MazingContestClient {
       towerId: removed.id,
       x: removed.x,
       y: removed.y,
+      clientSeq: seq,
     });
   }
 
@@ -937,6 +1307,13 @@ class MazingContestClient {
     this.undoStack.push(entry);
     if (this.undoStack.length > 64) {
       this.undoStack.shift();
+    }
+  }
+
+  private pushRedo(entry: RedoEntry) {
+    this.redoStack.push(entry);
+    if (this.redoStack.length > 64) {
+      this.redoStack.shift();
     }
   }
 
@@ -950,6 +1327,7 @@ class MazingContestClient {
     ) {
       return;
     }
+    if (!this.ensureConnectedForAction()) return;
     const me = this.getLocalPlayer();
     if (!me) return;
 
@@ -959,6 +1337,7 @@ class MazingContestClient {
 
     const entry = this.undoStack.pop()!;
     const wallCost = TOWER_SPECS.BLOCK.goldCost;
+    const seq = this.nextSeq();
 
     if (entry.kind === 'PLACE') {
       const idx = me.towers.findIndex(
@@ -971,6 +1350,14 @@ class MazingContestClient {
         me.gold += wallCost;
         me.ready = false;
       }
+      this.pushRedo({ kind: 'PLACE', x: entry.x, y: entry.y });
+      this.pendingMutations.push({
+        seq,
+        kind: 'SELL',
+        towerId: removedId,
+        x: entry.x,
+        y: entry.y,
+      });
       this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
       const evalRes = this.renderer3d.getLocalMazeEval();
       if (evalRes) {
@@ -983,6 +1370,7 @@ class MazingContestClient {
         towerId: removedId,
         x: entry.x,
         y: entry.y,
+        clientSeq: seq,
       });
     } else if (entry.kind === 'SELL') {
       if (me.gold >= wallCost) {
@@ -1006,6 +1394,14 @@ class MazingContestClient {
             validation.pathResult.totalDistance.toFixed(1)
           );
           me.ready = false;
+          this.pushRedo({ kind: 'SELL', x: entry.x, y: entry.y });
+          this.pendingMutations.push({
+            seq,
+            kind: 'PLACE',
+            x: entry.x,
+            y: entry.y,
+            clientId,
+          });
           this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
           soundEngine.playBuild('BLOCK', 0);
           soundEngine.haptic('undo');
@@ -1014,14 +1410,26 @@ class MazingContestClient {
             x: entry.x,
             y: entry.y,
             clientId,
+            clientSeq: seq,
           });
         }
       }
     } else if (entry.kind === 'BATCH_REPLACE') {
       const round = this.roomState.roundConfig;
+      const nextTowers = me.towers.map((t) => ({ x: t.x, y: t.y }));
+      const nextUsedSampleMaze = Boolean(me.usedSampleMaze);
+      this.pushRedo({
+        kind: 'BATCH_REPLACE',
+        nextTowers,
+        nextUsedSampleMaze,
+      });
+
+      const stickySample = Boolean(
+        me.usedSampleMaze || entry.previousUsedSampleMaze
+      );
       me.towers = [];
       me.gold = round.startingGold;
-      me.usedSampleMaze = false;
+      me.usedSampleMaze = stickySample;
       me.ready = false;
 
       for (const pt of entry.previousTowers) {
@@ -1040,6 +1448,12 @@ class MazingContestClient {
         }
       }
 
+      this.pendingMutations.push({
+        seq,
+        kind: 'RESTORE',
+        towers: entry.previousTowers,
+        usedSampleMaze: stickySample,
+      });
       this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
       const evalRes = this.renderer3d.getLocalMazeEval();
       if (evalRes) {
@@ -1047,7 +1461,174 @@ class MazingContestClient {
       }
       soundEngine.playBuild('RESTORE', 0);
       soundEngine.haptic('undo');
-      this.send({ type: 'RESTORE_TOWERS', towers: entry.previousTowers });
+      this.send({
+        type: 'RESTORE_TOWERS',
+        towers: entry.previousTowers,
+        usedSampleMaze: stickySample,
+        clientSeq: seq,
+      });
+    }
+
+    this.updateUndoAndToolAvailability();
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+  }
+
+  private performRedo() {
+    if (
+      !this.roomState ||
+      this.roomState.phase !== 'BUILD' ||
+      this.isSpectatingRival() ||
+      this.renderer3d.arenaOverviewMode ||
+      this.redoStack.length === 0
+    ) {
+      return;
+    }
+    if (!this.ensureConnectedForAction()) return;
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
+    this.disarmAllButtons();
+
+    const entry = this.redoStack.pop()!;
+    const wallCost = TOWER_SPECS.BLOCK.goldCost;
+    const seq = this.nextSeq();
+
+    if (entry.kind === 'PLACE') {
+      if (me.gold >= wallCost) {
+        const validation = validateTowerPlacement(
+          this.roomState.roundConfig,
+          me.towers,
+          entry.x,
+          entry.y
+        );
+        if (validation.valid && validation.pathResult) {
+          const clientId = `opt_${++this.optSeq}`;
+          me.towers.push({
+            id: clientId,
+            type: 'BLOCK',
+            x: entry.x,
+            y: entry.y,
+            createdAt: Date.now(),
+          });
+          me.gold = Math.max(0, me.gold - wallCost);
+          me.pathDistance = Number(
+            validation.pathResult.totalDistance.toFixed(1)
+          );
+          me.ready = false;
+          this.pushUndo({
+            kind: 'PLACE',
+            x: entry.x,
+            y: entry.y,
+            clientId,
+            seq,
+          });
+          this.pendingMutations.push({
+            seq,
+            kind: 'PLACE',
+            x: entry.x,
+            y: entry.y,
+            clientId,
+          });
+          this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+          soundEngine.playBuild('BLOCK', 0);
+          soundEngine.haptic('build');
+          this.send({
+            type: 'PLACE_TOWER',
+            x: entry.x,
+            y: entry.y,
+            clientId,
+            clientSeq: seq,
+          });
+        }
+      }
+    } else if (entry.kind === 'SELL') {
+      const idx = me.towers.findIndex(
+        (t) => t.x === entry.x && t.y === entry.y
+      );
+      if (idx !== -1) {
+        const [removed] = me.towers.splice(idx, 1);
+        me.gold += wallCost;
+        me.ready = false;
+        this.pushUndo({ kind: 'SELL', x: removed.x, y: removed.y, seq });
+        this.pendingMutations.push({
+          seq,
+          kind: 'SELL',
+          towerId: removed.id,
+          x: removed.x,
+          y: removed.y,
+        });
+        this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+        const evalRes = this.renderer3d.getLocalMazeEval();
+        if (evalRes) {
+          me.pathDistance = Number(evalRes.distance.toFixed(1));
+        }
+        soundEngine.playSell();
+        soundEngine.haptic('sell');
+        this.send({
+          type: 'SELL_TOWER',
+          towerId: removed.id,
+          x: removed.x,
+          y: removed.y,
+          clientSeq: seq,
+        });
+      }
+    } else if (entry.kind === 'BATCH_REPLACE') {
+      const round = this.roomState.roundConfig;
+      const previousTowers = me.towers.map((t) => ({ x: t.x, y: t.y }));
+      const previousUsedSampleMaze = Boolean(me.usedSampleMaze);
+      this.pushUndo({
+        kind: 'BATCH_REPLACE',
+        previousTowers,
+        previousUsedSampleMaze,
+        seq,
+      });
+
+      const stickySample = Boolean(
+        me.usedSampleMaze || entry.nextUsedSampleMaze
+      );
+      me.towers = [];
+      me.gold = round.startingGold;
+      me.usedSampleMaze = stickySample;
+      me.ready = false;
+
+      for (const pt of entry.nextTowers) {
+        if (me.gold < wallCost) break;
+        const check = validateTowerPlacement(round, me.towers, pt.x, pt.y);
+        if (check.valid && check.pathResult) {
+          me.towers.push({
+            id: `opt_${++this.optSeq}`,
+            type: 'BLOCK',
+            x: pt.x,
+            y: pt.y,
+            createdAt: Date.now(),
+          });
+          me.gold = Math.max(0, me.gold - wallCost);
+          me.pathDistance = Number(check.pathResult.totalDistance.toFixed(1));
+        }
+      }
+
+      this.pendingMutations.push({
+        seq,
+        kind: 'RESTORE',
+        towers: entry.nextTowers,
+        usedSampleMaze: stickySample,
+      });
+      this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+      const evalRes = this.renderer3d.getLocalMazeEval();
+      if (evalRes) {
+        me.pathDistance = Number(evalRes.distance.toFixed(1));
+      }
+      soundEngine.playBuild('RESTORE', 0);
+      soundEngine.haptic('undo');
+      this.send({
+        type: 'RESTORE_TOWERS',
+        towers: entry.nextTowers,
+        usedSampleMaze: stickySample,
+        clientSeq: seq,
+      });
     }
 
     this.updateUndoAndToolAvailability();
@@ -1070,6 +1651,13 @@ class MazingContestClient {
       undoBtn.disabled = !canEdit || this.undoStack.length === 0;
     }
 
+    const redoBtn = document.getElementById(
+      'btn-redo'
+    ) as HTMLButtonElement | null;
+    if (redoBtn) {
+      redoBtn.disabled = !canEdit || this.redoStack.length === 0;
+    }
+
     const clearBtn = document.getElementById(
       'btn-clear-maze'
     ) as HTMLButtonElement | null;
@@ -1088,6 +1676,17 @@ class MazingContestClient {
   // ==========================================================================
   // 3D RENDERER CALLBACKS, HOVER INSPECTION & PRECISION TOUCH TRAY
   // ==========================================================================
+
+  private stopNudgeHold() {
+    if (this.nudgeHoldDelayTimer !== null) {
+      window.clearTimeout(this.nudgeHoldDelayTimer);
+      this.nudgeHoldDelayTimer = null;
+    }
+    if (this.nudgeHoldInterval !== null) {
+      window.clearInterval(this.nudgeHoldInterval);
+      this.nudgeHoldInterval = null;
+    }
+  }
 
   private setupRendererCallbacks() {
     this.renderer3d.onPlaceTower = (x, y) => {
@@ -1112,6 +1711,17 @@ class MazingContestClient {
       this.updateUndoAndToolAvailability();
       this.updateScoreboardDOM();
       this.scheduleHudSafeInsetsSync();
+    };
+
+    this.renderer3d.onDesktopMouseActive = () => {
+      if (document.body.dataset.input !== 'mouse') {
+        document.body.dataset.input = 'mouse';
+        if (this.renderer3d.activeTool === 'PAN') {
+          this.selectTool('BLOCK');
+        }
+        this.hideTouchPrecisionTray();
+        this.scheduleHudSafeInsetsSync();
+      }
     };
 
     // Support clicking/tapping projected .island-3d-badge labels in All Islands Overview
@@ -1147,27 +1757,69 @@ class MazingContestClient {
       e.stopPropagation();
     });
 
+    const stepNudge = (dx: number, dy: number) => {
+      if (this.renderer3d.activeTool === 'SELL') {
+        this.stopNudgeHold();
+        return;
+      }
+      const moved = this.renderer3d.nudgeTouchGhost(dx, dy);
+      if (!moved) {
+        soundEngine.haptic('error');
+        this.stopNudgeHold();
+      }
+    };
+
     tray
       .querySelectorAll<HTMLButtonElement>('.touch-nudge-btn')
       .forEach((btn) => {
+        const dx = Number(btn.dataset.nudgeDx || 0);
+        const dy = Number(btn.dataset.nudgeDy || 0);
+
+        btn.addEventListener('pointerdown', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.stopNudgeHold();
+          stepNudge(dx, dy);
+          this.nudgeHoldDelayTimer = window.setTimeout(() => {
+            this.nudgeHoldDelayTimer = null;
+            this.nudgeHoldInterval = window.setInterval(() => {
+              stepNudge(dx, dy);
+            }, 85);
+          }, 240);
+        });
+
+        btn.addEventListener('pointerup', () => this.stopNudgeHold());
+        btn.addEventListener('pointercancel', () => this.stopNudgeHold());
+        btn.addEventListener('pointerleave', () => this.stopNudgeHold());
+
+        // Keyboard accessibility fallback (detail === 0)
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
-          const dx = Number(btn.dataset.nudgeDx || 0);
-          const dy = Number(btn.dataset.nudgeDy || 0);
-          const moved = this.renderer3d.nudgeTouchGhost(dx, dy);
-          if (!moved) {
-            soundEngine.haptic('error');
+          if (e.detail === 0) {
+            stepNudge(dx, dy);
           }
         });
       });
+
+    window.addEventListener('blur', () => this.stopNudgeHold());
 
     document
       .getElementById('btn-touch-confirm')
       ?.addEventListener('click', (e) => {
         e.stopPropagation();
-        const ok = this.renderer3d.confirmTouchGhost();
+        if (!this.ensureConnectedForAction()) return;
+        const confirmBtn = e.currentTarget as HTMLButtonElement | null;
+        if (
+          this.renderer3d.activeTool === 'SELL' &&
+          !confirmBtn?.classList.contains('reclaim-action')
+        ) {
+          return;
+        }
+        const ok = this.renderer3d.confirmTouchGhost({ chainAdvance: true });
         if (ok) {
-          this.hideTouchPrecisionTray();
+          if (!this.renderer3d.hasActiveTouchGhost()) {
+            this.hideTouchPrecisionTray();
+          }
         } else {
           soundEngine.playError();
           soundEngine.haptic('error');
@@ -1185,6 +1837,14 @@ class MazingContestClient {
       });
 
     const pill = document.getElementById('cursor-telemetry-pill')!;
+    pill.addEventListener('click', (e) => {
+      if ((e.target as HTMLElement).closest('[data-dismiss-inspect]')) {
+        e.stopPropagation();
+        soundEngine.playUiClick();
+        this.renderer3d.cancelTouchGhost();
+        this.hideCursorPill();
+      }
+    });
 
     this.renderer3d.onHoverStatusChange = (info: HoverStatusInfo) => {
       if (this.renderer3d.modalOpen || !this.roomState) {
@@ -1193,7 +1853,51 @@ class MazingContestClient {
         return;
       }
 
-      // 1. Mobile Touch Two-Stage Precision Preview (Stationary Tray + Non-Blocking Micro-Tag)
+      // 1. Mobile Clean-Tap World Feature Inspect Card (Spire, Keep, Runner, Gate)
+      if (info.isTouchInspect && info.inspectedFeature && !info.offscreen) {
+        if (!this.renderer3d.hasActiveTouchGhost()) {
+          this.hideTouchPrecisionTray();
+        }
+        const cardHtml = this.renderInspectedFeatureHtml(
+          info.inspectedFeature,
+          true
+        );
+        const nextClass =
+          'cursor-telemetry-pill inspect-card touch-inspect-card neutral';
+        const sig = `touch-inspect|${cardHtml}`;
+        if (this.lastPillSignature !== sig) {
+          pill.className = nextClass;
+          pill.innerHTML = cardHtml;
+          this.lastPillSignature = sig;
+        }
+        pill.classList.remove('hidden');
+        pill.style.opacity = '1';
+
+        const pillW = pill.offsetWidth || 220;
+        const pillH = pill.offsetHeight || 64;
+        const minTop = this.cachedTopHudBottom + 8;
+        const bottomCeil = Math.min(
+          window.innerHeight - this.cachedBottomHudInset,
+          this.cachedTrayTop || window.innerHeight
+        );
+        const maxTop = Math.max(minTop, bottomCeil - pillH - 10);
+
+        let rawY = info.screenY - pillH - 22;
+        if (rawY < minTop) {
+          rawY = info.screenY + 26;
+        }
+        const clampedX = Math.max(
+          10,
+          Math.min(window.innerWidth - pillW - 10, info.screenX - pillW * 0.5)
+        );
+        const clampedY = Math.max(minTop, Math.min(maxTop, rawY));
+        pill.style.transform = `translate3d(${Math.round(
+          clampedX
+        )}px, ${Math.round(clampedY)}px, 0)`;
+        return;
+      }
+
+      // 2. Mobile Touch Two-Stage Precision Preview (Stationary Tray + Non-Blocking Micro-Tag)
       if (info.isTouchPreview) {
         if (this.roomState.phase !== 'BUILD' || !info.cell) {
           this.hideTouchPrecisionTray();
@@ -1213,7 +1917,15 @@ class MazingContestClient {
 
         if (info.existingTower) {
           tagTone = 'neutral';
-          tagHtml = `${icon('reclaim', 12)}<span>Remove (+1)</span>`;
+          const dt = info.deltaTime;
+          const deltaSuffix =
+            typeof dt === 'number'
+              ? ` · ${dt >= 0 ? '+' : ''}${dt.toFixed(1)}s`
+              : '';
+          tagHtml = `${icon('reclaim', 12)}<span>Remove (+1)${deltaSuffix}</span>`;
+        } else if (this.renderer3d.activeTool === 'SELL') {
+          tagTone = 'neutral';
+          tagHtml = `${icon('reclaim', 12)}<span>Tap a wall to remove</span>`;
         } else if (info.valid) {
           const dt = info.deltaTime ?? 0;
           const dOver = info.deltaOvercharge ?? 0;
@@ -1256,10 +1968,11 @@ class MazingContestClient {
         const pillW = pill.offsetWidth || 104;
         const pillH = pill.offsetHeight || 28;
         const minTop = this.cachedTopHudBottom + 8;
-        const maxTop = Math.max(
-          minTop,
-          window.innerHeight - this.cachedBottomHudInset - pillH - 8
+        const bottomCeil = Math.min(
+          window.innerHeight - this.cachedBottomHudInset,
+          this.cachedTrayTop || window.innerHeight
         );
+        const maxTop = Math.max(minTop, bottomCeil - pillH - 8);
 
         let rawY = info.screenY - 38 - pillH * 0.5;
         if (info.placeNearTopEdge || rawY < minTop) {
@@ -1282,9 +1995,12 @@ class MazingContestClient {
         this.hideTouchPrecisionTray();
       }
 
-      // 2. Desktop World Feature Inspection Card (Spire, Keep, Runner, Gate in BUILD & RUN)
+      // 3. Desktop World Feature Inspection Card (Spire, Keep, Runner, Gate in BUILD & RUN)
       if (info.inspectedFeature && !info.offscreen) {
-        const cardHtml = this.renderInspectedFeatureHtml(info.inspectedFeature);
+        const cardHtml = this.renderInspectedFeatureHtml(
+          info.inspectedFeature,
+          false
+        );
         const nextClass = 'cursor-telemetry-pill inspect-card neutral';
         const sig = `inspect|${cardHtml}`;
         if (this.lastPillSignature !== sig) {
@@ -1298,7 +2014,7 @@ class MazingContestClient {
         return;
       }
 
-      // 3. Desktop Build / Remove Hover Delta Pill
+      // 4. Desktop Build / Remove Hover Delta Pill
       if (
         !info.cell ||
         info.offscreen ||
@@ -1316,8 +2032,16 @@ class MazingContestClient {
           this.renderer3d.activeTool === 'SELL'
             ? 'Click · Remove (+1)'
             : 'Right-click · Remove (+1)';
+        const dt = info.deltaTime;
+        const dtSuffix =
+          typeof dt === 'number'
+            ? ` · ${dt >= 0 ? '+' : ''}${dt.toFixed(1)}s`
+            : '';
         nextClass = 'cursor-telemetry-pill neutral';
-        nextHtml = `${icon('reclaim', 13)}<span>${label}</span>`;
+        nextHtml = `${icon('reclaim', 13)}<span>${label}${dtSuffix}</span>`;
+      } else if (this.renderer3d.activeTool === 'SELL') {
+        this.hideCursorPill();
+        return;
       } else if (info.valid) {
         const dt = info.deltaTime ?? 0;
         const dOver = info.deltaOvercharge ?? 0;
@@ -1398,6 +2122,18 @@ class MazingContestClient {
       this.scheduleHudSafeInsetsSync();
     }
 
+    const nudgeCluster = tray.querySelector<HTMLElement>('.touch-nudge-cluster');
+    const hideNudges =
+      Boolean(info.existingTower) ||
+      this.renderer3d.activeTool === 'SELL' ||
+      Boolean(info.isTouchInspect);
+    if (nudgeCluster) {
+      nudgeCluster.style.display = hideNudges ? 'none' : '';
+    }
+    if (hideNudges) {
+      this.stopNudgeHold();
+    }
+
     let btnClass = 'touch-confirm-btn';
     let btnDisabled = false;
     let btnHtml = '';
@@ -1408,13 +2144,20 @@ class MazingContestClient {
         'reclaim',
         15
       )}<span id="touch-confirm-label">Remove (+1)</span>`;
+    } else if (this.renderer3d.activeTool === 'SELL') {
+      btnClass = 'touch-confirm-btn invalid';
+      btnDisabled = true;
+      btnHtml = `${icon(
+        'reclaim',
+        14
+      )}<span id="touch-confirm-label">Tap a wall to remove</span>`;
     } else if (info.valid) {
       const dt = info.deltaTime ?? 0;
       const dOver = info.deltaOvercharge ?? 0;
       const sign = dt >= 0 ? '+' : '';
       const overBadge =
         dOver > 0
-          ? `<span class="overcharge-pips" style="color:#fef08a">+${dOver}${icon(
+          ? `<span class="overcharge-pips">+${dOver}${icon(
               'diamondFilled',
               11
             )}</span>`
@@ -1434,7 +2177,7 @@ class MazingContestClient {
       )}</span>`;
     }
 
-    const sig = `${btnClass}|${btnDisabled}|${btnHtml}`;
+    const sig = `${hideNudges}|${btnClass}|${btnDisabled}|${btnHtml}`;
     if (this.lastTraySignature !== sig) {
       confirmBtn.className = btnClass;
       confirmBtn.disabled = btnDisabled;
@@ -1455,40 +2198,55 @@ class MazingContestClient {
     return `<span class="overcharge-pips" title="Overcharge Tier ${clamped}">${pips}</span>`;
   }
 
-  private renderInspectedFeatureHtml(f: InspectedWorldFeature): string {
+  private renderInspectedFeatureHtml(
+    f: InspectedWorldFeature,
+    isTouchInspect = false
+  ): string {
+    const closeBtn = isTouchInspect
+      ? `<button type="button" class="inspect-dismiss-btn" data-dismiss-inspect="true" aria-label="Dismiss">${icon(
+          'close',
+          12
+        )}</button>`
+      : '';
+
     if (f.kind === 'SPIRE') {
       const spec = TOWER_SPECS[f.spireType];
       const pips = this.renderOverchargeDiamonds(f.overchargeTier);
+      const runnerType = this.roomState?.roundConfig.runnerType || 'SCOUT';
+      const eff = getEffectiveSpireStats(
+        f.spireType,
+        f.overchargeTier,
+        runnerType
+      );
+
       let statsLine = '';
       if (f.spireType === 'FROST_OBELISK') {
-        const auraPct = Math.round((f.auraSlowPercent ?? 0.22) * 100);
+        const auraPct = Math.round(eff.auraSlowPercent * 100);
         statsLine = `${auraPct}% ring chill · ${Math.round(
-          f.slowPercent * 100
-        )}% burst / ${f.effectiveCooldown.toFixed(
+          eff.slowPercent * 100
+        )}% burst (${eff.slowDuration.toFixed(1)}s) / ${eff.effectiveCooldown.toFixed(
           1
-        )}s · ${f.effectiveRange.toFixed(1)}m`;
+        )}s · ${eff.effectiveRange.toFixed(1)}m`;
       } else if (f.spireType === 'CHRONO_SPIRE') {
         statsLine = `${Math.round(
-          f.slowPercent * 100
-        )}% slow / ${f.effectiveCooldown.toFixed(1)}s · -${(
-          f.cdrPulseSeconds ?? 1.2
-        ).toFixed(1)}s spire recharge`;
+          eff.slowPercent * 100
+        )}% slow (${eff.slowDuration.toFixed(1)}s) / ${eff.effectiveCooldown.toFixed(
+          1
+        )}s · -${eff.cdrPulseSeconds.toFixed(1)}s spire recharge`;
       } else {
         statsLine = `${Math.round(
-          f.slowPercent * 100
-        )}% slow for ${f.slowDuration.toFixed(
+          eff.slowPercent * 100
+        )}% slow (${eff.slowDuration.toFixed(1)}s) / ${eff.effectiveCooldown.toFixed(
           1
-        )}s · Every ${f.effectiveCooldown.toFixed(
-          1
-        )}s · ${f.effectiveRange.toFixed(1)}m`;
+        )}s · ${eff.effectiveRange.toFixed(1)}m`;
       }
 
       const isRun = this.roomState?.phase === 'RUN';
       const metaLine = isRun
-        ? `Pulses this run: ${f.projectedOrLiveHits}`
-        : `Projected hits: ${f.projectedOrLiveHits}${
+        ? `Spire Hits this run: ${f.projectedOrLiveHits}`
+        : `Projected Spire Hits: ${f.projectedOrLiveHits}${
             f.overchargeTier < 3
-              ? ' · Link Crimson Keeps to boost'
+              ? ' · Link Crimson Keeps within 1 tile for +1◆'
               : ' · Max Overcharge'
           }`;
 
@@ -1497,6 +2255,7 @@ class MazingContestClient {
           ${getSpireIcon(f.spireType, 14)}
           <span>${escapeHtml(spec.name)}</span>
           ${pips}
+          ${closeBtn}
         </div>
         <div class="inspect-sub">${escapeHtml(statsLine)}</div>
         <div class="inspect-meta">${escapeHtml(metaLine)}</div>
@@ -1504,17 +2263,27 @@ class MazingContestClient {
     }
 
     if (f.kind === 'KEEP') {
-      const badge = f.linked
-        ? `<span class="overcharge-pips">${icon('diamondFilled', 11)} Linked</span>`
-        : `<span class="inspect-meta">Unlinked</span>`;
-      const desc = f.linked
-        ? 'Connected to your walls. Grants +1 Overcharge to nearby Spires.'
-        : 'Link Stone Walls here to Overcharge nearby Spires.';
+      const poweredCount = f.poweredSpireCount ?? 0;
+      let badge = `<span class="inspect-meta">Unlinked</span>`;
+      let desc =
+        'Connect Stone Walls here and within 1 tile of a Spire for +1◆ Overcharge.';
+      if (f.linked && poweredCount >= 1) {
+        badge = `<span class="overcharge-pips">${icon(
+          'diamondFilled',
+          11
+        )} Powering ${poweredCount} Spire${poweredCount > 1 ? 's' : ''}</span>`;
+        desc = 'Granting +1◆ Overcharge tier to each connected Spire.';
+      } else if (f.linked) {
+        badge = `<span class="inspect-meta">Wall-linked</span>`;
+        desc =
+          'Connected to your walls · Extend this chain within 1 tile of a Spire for +1◆';
+      }
       return `
         <div class="inspect-head">
           ${icon('keep', 14)}
           <span>Crimson Keep</span>
           ${badge}
+          ${closeBtn}
         </div>
         <div class="inspect-sub">${escapeHtml(desc)}</div>
       `;
@@ -1536,6 +2305,7 @@ class MazingContestClient {
           ${getRunnerIcon(f.archetype, 14)}
           <span>${escapeHtml(arch.name)}</span>
           ${statusPart}
+          ${closeBtn}
         </div>
         <div class="inspect-sub">${escapeHtml(subText)}</div>
       `;
@@ -1547,6 +2317,7 @@ class MazingContestClient {
         <div class="inspect-head">
           ${icon('compass', 14)}
           <span>North Gate · Entrance</span>
+          ${closeBtn}
         </div>
         <div class="inspect-sub">Runners enter here and route toward the South Shrine.</div>
       `;
@@ -1556,10 +2327,11 @@ class MazingContestClient {
       <div class="inspect-head">
         ${icon('flag', 14)}
         <span>South Shrine · Exit</span>
+        ${closeBtn}
       </div>
-      <div class="inspect-sub">Round Par ${f.parTimeSeconds.toFixed(
-        1
-      )}s (+2 bonus points for beating Par)</div>
+      <div class="inspect-sub">Round Par ${escapeHtml(
+        formatParTarget(f.parTimeSeconds)
+      )} (+2 bonus pts for beating Par)</div>
     `;
   }
 
@@ -1569,7 +2341,7 @@ class MazingContestClient {
 
   private syncAudioMuteButtons() {
     const hudIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 18);
-    const drawerIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 17);
+    const subIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 17);
 
     const muteBtn = document.getElementById('btn-mute');
     const muteIconSlot = document.getElementById('mute-icon-slot');
@@ -1578,8 +2350,13 @@ class MazingContestClient {
 
     const drawerMuteBtn = document.getElementById('btn-drawer-mute');
     const drawerMuteIconSlot = document.getElementById('drawer-mute-icon-slot');
-    if (drawerMuteIconSlot) drawerMuteIconSlot.innerHTML = drawerIcon;
+    if (drawerMuteIconSlot) drawerMuteIconSlot.innerHTML = subIcon;
     drawerMuteBtn?.classList.toggle('active', soundEngine.muted);
+
+    const hubMuteBtn = document.getElementById('btn-hub-mute');
+    const hubMuteIconSlot = document.getElementById('hub-mute-icon-slot');
+    if (hubMuteIconSlot) hubMuteIconSlot.innerHTML = subIcon;
+    hubMuteBtn?.classList.toggle('active', soundEngine.muted);
   }
 
   private syncSpectatorStateDOM() {
@@ -1648,6 +2425,7 @@ class MazingContestClient {
     this.hideCursorPill();
     document.getElementById('home-hub-modal')?.classList.remove('hidden');
     this.syncModalOpenState();
+    this.send({ type: 'CLIENT_ARENA_ACTIVE', active: false });
     this.send({ type: 'REQUEST_LOBBIES' });
   }
 
@@ -1655,6 +2433,7 @@ class MazingContestClient {
     this.disarmAllButtons();
     document.getElementById('home-hub-modal')?.classList.add('hidden');
     this.syncModalOpenState();
+    this.send({ type: 'CLIENT_ARENA_ACTIVE', active: true });
     if (this.pendingRoundBrief) {
       this.triggerRoundBriefBanner();
     }
@@ -1678,7 +2457,9 @@ class MazingContestClient {
     document
       .querySelectorAll<HTMLButtonElement>('.hub-tab-btn')
       .forEach((btn) => {
-        btn.classList.toggle('active', btn.dataset.hubTab === tab);
+        const isActive = btn.dataset.hubTab === tab;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-selected', String(isActive));
       });
 
     document
@@ -1699,16 +2480,31 @@ class MazingContestClient {
   private updateHubHeroStatus() {
     const statusEl = document.getElementById('hub-hero-status');
     const heroPlayBtn = document.getElementById('btn-hero-play');
+    const closeHubBtn = document.getElementById('btn-close-hub');
     if (!statusEl || !this.roomState) return;
 
     const rNum = this.roomState.roundConfig.roundNumber;
     const total = this.roomState.settings?.totalRounds || ROUNDS.length;
-    const phaseDesc =
-      this.roomState.phase === 'BUILD'
-        ? `Round ${rNum}/${total} · Build phase`
-        : this.roomState.phase === 'RUN'
-        ? `Round ${rNum}/${total} · Run in progress`
-        : `Round ${rNum}/${total} · Standings`;
+    let phaseDesc = '';
+
+    if (this.roomState.phase === 'BUILD') {
+      if (this.roomState.buildTimerPaused) {
+        phaseDesc = `Round ${rNum}/${total} · Paused · Ready when you are`;
+      } else if (this.roomState.settings?.buildTimeSeconds === 999) {
+        phaseDesc = `Round ${rNum}/${total} · Build phase (∞)`;
+      } else {
+        const secs = Math.max(0, Math.ceil(this.roomState.phaseTimeRemaining));
+        const mm = String(Math.floor(secs / 60)).padStart(2, '0');
+        const ss = String(secs % 60).padStart(2, '0');
+        phaseDesc = `Round ${rNum}/${total} · Build ${mm}:${ss}`;
+      }
+    } else if (this.roomState.phase === 'RUN') {
+      phaseDesc = `Round ${rNum}/${total} · Run in progress`;
+    } else if (this.roomState.phase === 'GAME_OVER') {
+      phaseDesc = `Final Standings · ${total} Rounds`;
+    } else {
+      phaseDesc = `Round ${rNum}/${total} · Standings`;
+    }
 
     statusEl.innerHTML = `
       <span class="status-dot"></span>
@@ -1717,11 +2513,23 @@ class MazingContestClient {
       )}</strong> · ${escapeHtml(phaseDesc)}</span>
     `;
 
+    const me = this.getLocalPlayer();
+    const hasActiveProgress = Boolean(
+      (me && me.towers.length > 0) ||
+        rNum > 1 ||
+        this.roomState.phase !== 'BUILD'
+    );
+
     if (heroPlayBtn) {
-      const me = this.getLocalPlayer();
-      const label =
-        me && me.towers.length > 0 ? 'Resume Match' : 'Play Now';
+      const label = hasActiveProgress ? 'Resume Match' : 'Play Now';
       heroPlayBtn.innerHTML = `${icon('play', 14)}<span>${label}</span>`;
+    }
+    if (closeHubBtn) {
+      const resumeLabel = hasActiveProgress ? 'Resume' : 'Enter Island';
+      const resumeSpan = closeHubBtn.querySelector('.resume-btn-text');
+      if (resumeSpan) resumeSpan.textContent = resumeLabel;
+      closeHubBtn.title = `${resumeLabel} (Esc)`;
+      closeHubBtn.setAttribute('aria-label', resumeLabel);
     }
   }
 
@@ -1795,8 +2603,19 @@ class MazingContestClient {
       .getElementById('btn-drawer-open-config')
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
+        const expandChk = document.getElementById(
+          'chk-expand-rules'
+        ) as HTMLInputElement | null;
+        if (expandChk) expandChk.checked = true;
         this.dismissAllTransientOverlays();
         this.openHub('play', 'setup');
+      });
+
+    document
+      .getElementById('btn-hub-mute')
+      ?.addEventListener('click', () => {
+        soundEngine.toggleMuted();
+        this.syncAudioMuteButtons();
       });
 
     document
@@ -1882,11 +2701,12 @@ class MazingContestClient {
       }
     });
 
-    // Join by Room Code
+    // Join by Room Code (Honest Toast Fired on Server WELCOME)
     const joinCodeInput = document.getElementById(
       'join-code-input'
     ) as HTMLInputElement | null;
     const handleJoinByCode = () => {
+      if (!this.ensureConnectedForAction()) return;
       const code = (joinCodeInput?.value || '')
         .trim()
         .toUpperCase()
@@ -1897,6 +2717,7 @@ class MazingContestClient {
         return;
       }
       this.roomCode = code;
+      this.pendingJoinToast = `Joined room ${code}`;
       this.send({
         type: 'JOIN_ROOM',
         roomCode: code,
@@ -1904,8 +2725,6 @@ class MazingContestClient {
         sessionId: this.sessionId,
       });
       if (joinCodeInput) joinCodeInput.value = '';
-      this.showToast(`Joined room ${code}`, true);
-      this.closeHub();
     };
     document
       .getElementById('btn-join-code')
@@ -1917,34 +2736,49 @@ class MazingContestClient {
       }
     });
 
-    // Solo vs Bots (1-click private match)
-    document.getElementById('btn-quick-solo')?.addEventListener('click', () => {
-      soundEngine.playUiClick();
-      const soloCode = `SOLO${Math.floor(10 + Math.random() * 89)}`;
-      this.roomCode = soloCode;
-      this.send({
-        type: 'CREATE_ROOM',
-        roomCode: soloCode,
-        playerName: this.playerName,
-        sessionId: this.sessionId,
-        settings: {
-          roomName: `${this.playerName}'s Island`,
-          isPublic: false,
-          totalRounds: 8,
-          buildTimeSeconds: 0,
-          goldMultiplier: 1.0,
-          botCount: 3,
-          botDifficulty: 'ARCHITECT',
-          fogOfWar: false,
-        },
-      });
-      this.showToast(`Started solo match (${soloCode})`, true);
-      this.closeHub();
+    // Solo vs Bots (1-Click Private Match, Guarded If Mid-Build Walls Exist)
+    const quickSoloBtn = document.getElementById('btn-quick-solo');
+    quickSoloBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
+      const me = this.getLocalPlayer();
+      const hasWalls = Boolean(
+        this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
+      );
+      this.armDestructiveButton(
+        quickSoloBtn,
+        hasWalls,
+        'Abandon Maze?',
+        'user',
+        () => {
+          soundEngine.playUiClick();
+          const soloCode = `SOLO${Math.floor(10 + Math.random() * 89)}`;
+          this.roomCode = soloCode;
+          this.pendingJoinToast = `Started solo match (${soloCode})`;
+          this.send({
+            type: 'CREATE_ROOM',
+            roomCode: soloCode,
+            playerName: this.playerName,
+            sessionId: this.sessionId,
+            settings: {
+              roomName: `${this.playerName}'s Island`,
+              isPublic: false,
+              totalRounds: 8,
+              buildTimeSeconds: 0,
+              goldMultiplier: 1.0,
+              botCount: 3,
+              botDifficulty: 'ARCHITECT',
+              fogOfWar: false,
+            },
+          });
+        }
+      );
     });
 
     // Two-Tap Guarded Restart Match
     const restartBtn = document.getElementById('btn-hub-restart-match');
     restartBtn?.addEventListener('click', () => {
+      if (!this.ensureConnectedForAction()) return;
       if (!this.canControlRoomRules()) {
         this.showToast('Only the room host can restart the match.');
         return;
@@ -1984,19 +2818,26 @@ class MazingContestClient {
       .forEach((group) => {
         group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
           btn.addEventListener('click', () => {
+            if (btn.disabled) return;
             soundEngine.playUiClick();
             group
               .querySelectorAll<HTMLButtonElement>('.seg-btn')
               .forEach((b) => b.classList.remove('active'));
             btn.classList.add('active');
+            this.syncRulesDirtyHighlight();
           });
         });
       });
+
+    document
+      .getElementById('cfg-room-name')
+      ?.addEventListener('input', () => this.syncRulesDirtyHighlight());
 
     // Update Current Room Rules
     document
       .getElementById('btn-apply-room-settings')
       ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
         if (!this.canControlRoomRules()) {
           this.showToast('Only the room host can update room rules.');
           return;
@@ -2007,6 +2848,9 @@ class MazingContestClient {
           type: 'UPDATE_SETTINGS',
           settings,
         });
+        document
+          .getElementById('btn-apply-room-settings')
+          ?.classList.remove('is-dirty');
         this.showToast(`Updated rules for ${this.roomCode}`, true);
         this.closeHub();
       });
@@ -2015,10 +2859,12 @@ class MazingContestClient {
     document
       .getElementById('btn-create-custom-room')
       ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
         soundEngine.playUiClick();
         const settings = this.readConfigFormSettings();
         const customCode = `ROOM${Math.floor(100 + Math.random() * 899)}`;
         this.roomCode = customCode;
+        this.pendingJoinToast = `Created room ${customCode}`;
         this.send({
           type: 'CREATE_ROOM',
           roomCode: customCode,
@@ -2026,8 +2872,6 @@ class MazingContestClient {
           sessionId: this.sessionId,
           settings,
         });
-        this.showToast(`Created room ${customCode}`, true);
-        this.closeHub();
       });
 
     // Leaderboard Mode Switcher
@@ -2046,6 +2890,28 @@ class MazingContestClient {
           this.renderLeaderboard();
         });
       });
+  }
+
+  private syncRulesDirtyHighlight() {
+    const applyBtn = document.getElementById(
+      'btn-apply-room-settings'
+    ) as HTMLButtonElement | null;
+    if (!applyBtn || !this.roomState || !this.canControlRoomRules()) {
+      applyBtn?.classList.remove('is-dirty');
+      return;
+    }
+    const form = this.readConfigFormSettings();
+    const cur = this.roomState.settings;
+    const isDirty =
+      form.roomName !== cur.roomName ||
+      form.isPublic !== cur.isPublic ||
+      form.totalRounds !== cur.totalRounds ||
+      form.buildTimeSeconds !== cur.buildTimeSeconds ||
+      Math.abs(form.goldMultiplier - cur.goldMultiplier) > 0.01 ||
+      form.botCount !== cur.botCount ||
+      form.botDifficulty !== cur.botDifficulty ||
+      form.fogOfWar !== cur.fogOfWar;
+    applyBtn.classList.toggle('is-dirty', isDirty);
   }
 
   private readConfigFormSettings(): RoomSettings {
@@ -2078,11 +2944,18 @@ class MazingContestClient {
   }
 
   private syncConfigFormFromSettings(settings: RoomSettings) {
+    const canEditRules = this.canControlRoomRules();
     const nameInput = document.getElementById(
       'cfg-room-name'
     ) as HTMLInputElement | null;
     if (nameInput && settings.roomName) {
       nameInput.value = settings.roomName;
+    }
+    if (nameInput) {
+      nameInput.disabled = !canEditRules;
+      nameInput.title = canEditRules
+        ? 'Room Name'
+        : 'Host controls current room rules';
     }
 
     const setSegVal = (groupId: string, val: string) => {
@@ -2090,6 +2963,12 @@ class MazingContestClient {
       if (!group) return;
       group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.val === val);
+        btn.disabled = !canEditRules;
+        if (!canEditRules) {
+          btn.title = 'Host controls current room rules';
+        } else if (groupId !== 'cfg-buildtime-group' || btn.dataset.val !== '0') {
+          btn.title = '';
+        }
       });
     };
 
@@ -2106,14 +2985,22 @@ class MazingContestClient {
     ) as HTMLInputElement | null;
     if (fogChk) {
       fogChk.checked = Boolean(settings.fogOfWar);
+      fogChk.disabled = !canEditRules;
     }
 
-    const canEditRules = this.canControlRoomRules();
     const applyBtn = document.getElementById(
       'btn-apply-room-settings'
     ) as HTMLButtonElement | null;
     if (applyBtn) {
       applyBtn.disabled = !canEditRules;
+      applyBtn.classList.remove('is-dirty');
+    }
+
+    const restartBtn = document.getElementById(
+      'btn-hub-restart-match'
+    ) as HTMLButtonElement | null;
+    if (restartBtn) {
+      restartBtn.disabled = !canEditRules;
     }
   }
 
@@ -2201,15 +3088,15 @@ class MazingContestClient {
         if (isCurrent) {
           this.closeHub();
         } else {
+          if (!this.ensureConnectedForAction()) return;
           this.roomCode = r.roomCode;
+          this.pendingJoinToast = `Joined ${r.roomName} (${r.roomCode})`;
           this.send({
             type: 'JOIN_ROOM',
             roomCode: r.roomCode,
             playerName: this.playerName,
             sessionId: this.sessionId,
           });
-          this.showToast(`Joined ${r.roomName} (${r.roomCode})`, true);
-          this.closeHub();
         }
       });
 
@@ -2293,7 +3180,7 @@ class MazingContestClient {
         </div>
         <div class="par-pill">
           ${icon('starFilled', 11)}
-          <span>Par ${roundCfg.parTimeSeconds.toFixed(1)}s</span>
+          <span>Par ${escapeHtml(formatParTarget(roundCfg.parTimeSeconds))}</span>
         </div>
       `;
 
@@ -2336,7 +3223,7 @@ class MazingContestClient {
             <span class="player-swatch" style="background:${escapeHtml(
               rec.playerColor
             )}"></span>
-            <span>${escapeHtml(rec.playerName)}</span>
+            <span class="lb-name">${escapeHtml(rec.playerName)}</span>
             ${youBadge}
           </div>
           <div class="lb-time-primary">
@@ -2344,7 +3231,7 @@ class MazingContestClient {
             ${parBadge}
           </div>
           <div class="lb-synergies">
-            <span class="stat-chip" title="Spire Pulses">${icon('bolt', 12)} ${
+            <span class="stat-chip" title="Spire Hits">${icon('bolt', 12)} ${
           rec.clapsTaken
         }</span>
             <span class="stat-chip" title="Overcharge Diamonds">${icon(
@@ -2439,6 +3326,15 @@ class MazingContestClient {
   // ==========================================================================
 
   private setupUIEvents() {
+    // Prevent Space from double-firing a focused HUD button after pointer click
+    document.addEventListener('click', (e) => {
+      if (e.detail <= 0) return;
+      const btn = (e.target as HTMLElement | null)?.closest(
+        '#hud-top-bar button, #hud-bottom-dock button, #hud-run-dock button, #spectator-bar button'
+      ) as HTMLElement | null;
+      btn?.blur();
+    });
+
     // Round Strategy Brief Dismiss
     document
       .getElementById('btn-dismiss-brief')
@@ -2457,9 +3353,12 @@ class MazingContestClient {
         });
       });
 
-    // Undo Button
+    // Undo / Optional Redo Buttons
     document.getElementById('btn-undo')?.addEventListener('click', () => {
       this.performUndo();
+    });
+    document.getElementById('btn-redo')?.addEventListener('click', () => {
+      this.performRedo();
     });
 
     // Bottom Progressive-Disclosure Tools Popover
@@ -2473,6 +3372,7 @@ class MazingContestClient {
       if (willOpen) {
         dockToolsPopover.classList.remove('hidden');
         dockToolsBtn.classList.add('active');
+        dockToolsBtn.setAttribute('aria-expanded', 'true');
       }
     });
 
@@ -2487,6 +3387,7 @@ class MazingContestClient {
       if (willOpen) {
         standingsDropdown.classList.remove('hidden');
         standingsBtn.classList.add('active');
+        standingsBtn.setAttribute('aria-expanded', 'true');
       }
     });
 
@@ -2500,6 +3401,8 @@ class MazingContestClient {
       this.dismissAllTransientOverlays();
       if (willOpen) {
         roundDropdown.classList.remove('hidden');
+        roundPickerBtn.classList.add('active');
+        roundPickerBtn.setAttribute('aria-expanded', 'true');
       }
     });
 
@@ -2514,6 +3417,9 @@ class MazingContestClient {
       if (willOpen) {
         lobbyDrawer.classList.remove('hidden');
         lobbyToggleBtn.classList.add('active');
+        lobbyToggleBtn.setAttribute('aria-expanded', 'true');
+        this.unreadChatCount = 0;
+        document.getElementById('lobby-unread-dot')?.classList.add('hidden');
       }
     });
 
@@ -2523,6 +3429,7 @@ class MazingContestClient {
         soundEngine.playUiClick();
         lobbyDrawer.classList.add('hidden');
         lobbyToggleBtn.classList.remove('active');
+        lobbyToggleBtn.setAttribute('aria-expanded', 'false');
       });
 
     // Global Outside-Click Dismissal for Popovers & Armed Buttons
@@ -2533,14 +3440,18 @@ class MazingContestClient {
       }
       if (!target.closest('.round-selector-wrap')) {
         roundDropdown.classList.add('hidden');
+        roundPickerBtn.classList.remove('active');
+        roundPickerBtn.setAttribute('aria-expanded', 'false');
       }
       if (!target.closest('#standings-wrap')) {
         standingsDropdown.classList.add('hidden');
         standingsBtn.classList.remove('active');
+        standingsBtn.setAttribute('aria-expanded', 'false');
       }
       if (!target.closest('#dock-tools-wrap')) {
         dockToolsPopover.classList.add('hidden');
         dockToolsBtn.classList.remove('active');
+        dockToolsBtn.setAttribute('aria-expanded', 'false');
       }
       if (
         !target.closest('#lobby-drawer') &&
@@ -2548,6 +3459,7 @@ class MazingContestClient {
       ) {
         lobbyDrawer.classList.add('hidden');
         lobbyToggleBtn.classList.remove('active');
+        lobbyToggleBtn.setAttribute('aria-expanded', 'false');
       }
     });
 
@@ -2577,14 +3489,38 @@ class MazingContestClient {
           resultsModal.classList.remove('peek-minimized');
           this.syncPeekMazesButton(false);
           this.syncModalOpenState();
+          this.scheduleHudSafeInsetsSync();
           return;
         }
-        this.dismissAllTransientOverlays();
-        document.getElementById('help-modal')?.classList.add('hidden');
-        this.renderer3d.cancelTouchGhost();
-        this.hideTouchPrecisionTray();
-        this.hideCursorPill();
-        this.closeHub();
+        if (this.isHelpOpen()) {
+          document.getElementById('help-modal')?.classList.add('hidden');
+          this.syncModalOpenState();
+          return;
+        }
+        if (this.armedTimers.size > 0) {
+          this.disarmAllButtons();
+          return;
+        }
+        const pillEl = document.getElementById('cursor-telemetry-pill');
+        if (
+          this.renderer3d.hasActiveTouchGhost() ||
+          Boolean(pillEl && pillEl.classList.contains('touch-inspect-card'))
+        ) {
+          this.renderer3d.cancelTouchGhost();
+          this.hideTouchPrecisionTray();
+          this.hideCursorPill();
+          return;
+        }
+        if (this.dismissAllTransientOverlays()) {
+          return;
+        }
+        if (this.isHubOpen()) {
+          this.closeHub();
+          return;
+        }
+        if (this.renderer3d.activeTool !== 'BLOCK') {
+          this.selectTool('BLOCK');
+        }
         return;
       }
 
@@ -2606,23 +3542,37 @@ class MazingContestClient {
 
       const key = e.key.toUpperCase();
 
-      if ((e.ctrlKey || e.metaKey) && key === 'Z') {
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        (key === 'Y' || (key === 'Z' && e.shiftKey))
+      ) {
+        e.preventDefault();
+        this.performRedo();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && key === 'Z' && !e.shiftKey) {
         e.preventDefault();
         this.performUndo();
         return;
       }
       if (e.ctrlKey || e.metaKey || e.altKey) return;
 
-      if (key === 'Z') {
+      if (key === 'Z' && !e.shiftKey) {
         e.preventDefault();
         this.performUndo();
+      } else if (key === 'Z' && e.shiftKey) {
+        e.preventDefault();
+        this.performRedo();
       } else if (key === 'Q' || key === 'B') {
         this.selectTool('BLOCK');
       } else if (key === 'X' || key === 'E') {
         this.selectTool('SELL');
       } else if (key === 'R') {
-        this.renderer3d.resetCameraView();
+        this.renderer3d.resetToMyIsland();
+        this.syncSpectatorStateDOM();
+        this.updateUndoAndToolAvailability();
         this.updateScoreboardDOM();
+        this.scheduleHudSafeInsetsSync();
       } else if (key === 'M') {
         soundEngine.toggleMuted();
         this.syncAudioMuteButtons();
@@ -2664,21 +3614,27 @@ class MazingContestClient {
       }
     });
 
-    // Playback Speed Controls (Both Top Bar & Mobile #hud-run-dock)
+    // Playback Speed Controls (Both Top Bar & Mobile #hud-run-dock; Host-Guarded)
     document
       .querySelectorAll<HTMLButtonElement>('.speed-btn')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
+          if (!this.ensureConnectedForAction()) return;
+          if (!this.canControlRoomRules()) {
+            this.showToast('Only the room host can change run speed.');
+            return;
+          }
           soundEngine.playUiClick();
           const spd = Number(btn.dataset.speed) as 1 | 2 | 4;
           this.send({ type: 'SET_SIM_SPEED', speed: spd });
         });
       });
 
-    // Clear All (2-Tap Guarded + Undoable via BATCH_REPLACE)
+    // Clear All (2-Tap Guarded + Undoable via BATCH_REPLACE; Preserves Sticky usedSampleMaze)
     const clearMazeBtn = document.getElementById('btn-clear-maze');
     clearMazeBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
       const me = this.getLocalPlayer();
       if (!me || me.towers.length === 0 || this.roomState?.phase !== 'BUILD') {
         return;
@@ -2690,11 +3646,19 @@ class MazingContestClient {
         'trash',
         () => {
           const previousTowers = me.towers.map((t) => ({ x: t.x, y: t.y }));
-          this.pushUndo({ kind: 'BATCH_REPLACE', previousTowers });
+          const previousUsedSampleMaze = Boolean(me.usedSampleMaze);
+          const seq = this.nextSeq();
+          this.redoStack = [];
+          this.pushUndo({
+            kind: 'BATCH_REPLACE',
+            previousTowers,
+            previousUsedSampleMaze,
+            seq,
+          });
+          this.pendingMutations.push({ seq, kind: 'CLEAR' });
 
           me.towers = [];
           me.gold = this.roomState!.roundConfig.startingGold;
-          me.usedSampleMaze = false;
           me.ready = false;
 
           this.renderer3d.cancelTouchGhost();
@@ -2714,7 +3678,7 @@ class MazingContestClient {
           this.updateTopBarAndResources();
           this.updateScoreboardDOM();
           this.showToast('Cleared walls. Press Undo to restore.', true);
-          this.send({ type: 'CLEAR_TOWERS' });
+          this.send({ type: 'CLEAR_TOWERS', clientSeq: seq });
         }
       );
     });
@@ -2723,6 +3687,7 @@ class MazingContestClient {
     const rerollBtn = document.getElementById('btn-reroll-map');
     rerollBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
       if (!this.canControlRoomRules()) {
         this.showToast('Only the room host can generate a new map.');
         return;
@@ -2747,6 +3712,7 @@ class MazingContestClient {
     const sampleBtn = document.getElementById('btn-demo-layout');
     sampleBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
       const me = this.getLocalPlayer();
       if (!me || this.roomState?.phase !== 'BUILD') return;
 
@@ -2758,7 +3724,16 @@ class MazingContestClient {
         'wand',
         () => {
           const previousTowers = me.towers.map((t) => ({ x: t.x, y: t.y }));
-          this.pushUndo({ kind: 'BATCH_REPLACE', previousTowers });
+          const previousUsedSampleMaze = Boolean(me.usedSampleMaze);
+          const seq = this.nextSeq();
+          this.redoStack = [];
+          this.pushUndo({
+            kind: 'BATCH_REPLACE',
+            previousTowers,
+            previousUsedSampleMaze,
+            seq,
+          });
+          this.pendingMutations.push({ seq, kind: 'SAMPLE' });
 
           soundEngine.playBuild('SAMPLE', 0);
           soundEngine.haptic('build');
@@ -2767,7 +3742,7 @@ class MazingContestClient {
           this.hideCursorPill();
           this.hideTransientPopovers();
           this.updateUndoAndToolAvailability();
-          this.send({ type: 'LOAD_PRESET_DEMO' });
+          this.send({ type: 'LOAD_PRESET_DEMO', clientSeq: seq });
         }
       );
     });
@@ -2778,20 +3753,18 @@ class MazingContestClient {
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
         this.hideTransientPopovers();
-        if (this.localPlayerId) {
-          this.renderer3d.focusOnPlayerIsland(this.localPlayerId);
-        } else {
-          this.renderer3d.resetCameraView();
-        }
+        this.renderer3d.resetToMyIsland();
         this.syncSpectatorStateDOM();
         this.updateUndoAndToolAvailability();
         this.updateScoreboardDOM();
+        this.scheduleHudSafeInsetsSync();
       });
 
     // Ready / Start Button (2-Tap Guarded on 0-Wall Solo Start)
     const readyBtn = document.getElementById('btn-ready-lock');
     readyBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
       const me = this.getLocalPlayer();
       if (!me || this.roomState?.phase !== 'BUILD') return;
 
@@ -2805,7 +3778,9 @@ class MazingContestClient {
         'play',
         () => {
           const nextReady = !me.ready;
+          const seq = this.nextSeq();
           me.ready = nextReady;
+          this.pendingMutations.push({ seq, kind: 'READY', ready: nextReady });
           soundEngine.playReady(nextReady);
           soundEngine.haptic('ready');
           this.renderer3d.cancelTouchGhost();
@@ -2814,7 +3789,7 @@ class MazingContestClient {
           this.hideTransientPopovers();
           this.updateTopBarAndResources();
           this.updateScoreboardDOM();
-          this.send({ type: 'TOGGLE_READY' });
+          this.send({ type: 'TOGGLE_READY', clientSeq: seq });
         }
       );
     });
@@ -2848,7 +3823,7 @@ class MazingContestClient {
         this.toggleOverviewOrReturnHome();
       });
 
-    // Results Modal: View Mazes Peek Toggle & Next Round
+    // Results Modal: View Mazes Peek Toggle & Next Round (Host + Guest Ready Vote)
     document
       .getElementById('btn-peek-mazes')
       ?.addEventListener('click', () => {
@@ -2858,12 +3833,15 @@ class MazingContestClient {
         const isPeeking = resultsModal.classList.toggle('peek-minimized');
         this.syncPeekMazesButton(isPeeking);
         this.syncModalOpenState();
+        this.scheduleHudSafeInsetsSync();
       });
 
     document.getElementById('btn-next-round')?.addEventListener('click', () => {
+      if (!this.ensureConnectedForAction()) return;
       soundEngine.playUiClick();
-      if (!this.canControlRoomRules()) {
-        this.showToast('Waiting for room host or auto-advance timer.');
+      const me = this.getLocalPlayer();
+      if (me && !this.canControlRoomRules() && me.nextRoundReady) {
+        this.showToast('Ready for next round. Waiting for other players.', true);
         return;
       }
       this.send({ type: 'NEXT_ROUND' });
@@ -2909,6 +3887,19 @@ class MazingContestClient {
     });
 
     // Room Drawer Controls
+    const roomCodeBadge = document.getElementById('room-code-badge');
+    roomCodeBadge?.addEventListener('click', () => {
+      soundEngine.playUiClick();
+      this.shareOrCopyInviteLink();
+    });
+    roomCodeBadge?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        soundEngine.playUiClick();
+        this.shareOrCopyInviteLink();
+      }
+    });
+
     const nameInput = document.getElementById(
       'player-name-input'
     ) as HTMLInputElement | null;
@@ -2944,6 +3935,7 @@ class MazingContestClient {
       });
 
     document.getElementById('btn-add-bot')?.addEventListener('click', () => {
+      if (!this.ensureConnectedForAction()) return;
       if (!this.canControlRoomRules()) {
         this.showToast('Only the room host can add bots.');
         return;
@@ -2953,6 +3945,7 @@ class MazingContestClient {
     });
 
     document.getElementById('btn-remove-bot')?.addEventListener('click', () => {
+      if (!this.ensureConnectedForAction()) return;
       if (!this.canControlRoomRules()) {
         this.showToast('Only the room host can remove bots.');
         return;
@@ -2965,6 +3958,10 @@ class MazingContestClient {
       'chk-fog'
     ) as HTMLInputElement | null;
     fogChk?.addEventListener('change', () => {
+      if (!this.ensureConnectedForAction()) {
+        fogChk.checked = Boolean(this.roomState?.settings?.fogOfWar);
+        return;
+      }
       if (!this.canControlRoomRules()) {
         fogChk.checked = Boolean(this.roomState?.settings?.fogOfWar);
         this.showToast('Only the room host can change rival visibility.');
@@ -2983,9 +3980,16 @@ class MazingContestClient {
     const chatInput = document.getElementById(
       'chat-input'
     ) as HTMLInputElement | null;
+    chatInput?.addEventListener('focus', () => {
+      lobbyDrawer.classList.add('chat-input-focused');
+    });
+    chatInput?.addEventListener('blur', () => {
+      lobbyDrawer.classList.remove('chat-input-focused');
+    });
     chatForm?.addEventListener('submit', (e) => {
       e.preventDefault();
       if (!chatInput) return;
+      if (!this.ensureConnectedForAction()) return;
       const text = chatInput.value.trim();
       if (text) {
         this.send({ type: 'CHAT', text });
@@ -3151,11 +4155,16 @@ class MazingContestClient {
 
     this.updateTimerDOM(false);
 
+    const canControlSpeed = this.canControlRoomRules();
     document.querySelectorAll<HTMLButtonElement>('.speed-btn').forEach((b) => {
       b.classList.toggle(
         'active',
         Number(b.dataset.speed) === this.roomState?.simSpeedMultiplier
       );
+      b.disabled = !canControlSpeed;
+      b.title = canControlSpeed
+        ? `Run Speed ${b.dataset.speed}×`
+        : 'Host controls run speed';
     });
 
     const me = this.getLocalPlayer();
@@ -3176,11 +4185,14 @@ class MazingContestClient {
 
       const evalRun = this.renderer3d.getLocalMazeEval();
       const estSecs = evalRun?.finishTimeSeconds ?? 0;
+      const parLabel = formatParTarget(effectivePar);
       const estEl = document.getElementById('est-time-value');
       if (estEl && this.roomState.phase !== 'RUN') {
-        estEl.textContent = `Est ${estSecs.toFixed(
+        estEl.innerHTML = `<span class="time-verb">Est </span>${estSecs.toFixed(
           1
-        )}s · Par ${effectivePar.toFixed(0)}s`;
+        )}s<span class="par-full"> · Par </span><span class="par-short">/</span>${escapeHtml(
+          parLabel
+        )}`;
         estEl.style.color =
           estSecs >= effectivePar
             ? 'var(--accent-sage)'
@@ -3191,7 +4203,7 @@ class MazingContestClient {
       if (timeChip && evalRun) {
         timeChip.title = `Estimated Run: ${estSecs.toFixed(
           1
-        )}s (Par ${effectivePar.toFixed(1)}s) · Spire Pulses: ${
+        )}s (Par ${parLabel}) · Spire Hits: ${
           evalRun.clapsTaken
         } · Linked Keeps: ${evalRun.linkedKeeps}/${
           round.obstacles.length
@@ -3310,12 +4322,14 @@ class MazingContestClient {
       const isMe = featured.id === this.localPlayerId;
       if (swatchEl) swatchEl.style.background = featured.color;
       if (summaryEl) {
-        summaryEl.textContent = `${formatOrdinal(featuredIdx + 1)} · ${
+        summaryEl.innerHTML = `<span class="rank-ord">${formatOrdinal(
+          featuredIdx + 1
+        )}</span><span class="rank-who"> · ${escapeHtml(
           isMe ? 'You' : featured.name
-        }`;
+        )}</span>`;
       }
       if (scoreEl && this.roomState.phase !== 'RUN') {
-        scoreEl.textContent = `${featured.totalScore}p`;
+        scoreEl.textContent = `${featured.totalScore} pts`;
         scoreEl.style.color = 'var(--text-secondary)';
       }
     }
@@ -3326,9 +4340,11 @@ class MazingContestClient {
       const isFocused =
         !this.renderer3d.arenaOverviewMode &&
         (this.renderer3d.focusedPlayerId || this.localPlayerId) === p.id;
-      row.className = `standings-row${isFocused ? ' focused' : ''}`;
-
       const isMe = p.id === this.localPlayerId;
+      row.className = `standings-row${isFocused ? ' focused' : ''}${
+        isMe ? ' is-me' : ''
+      }`;
+
       const readyHtml =
         this.roomState?.phase === 'BUILD' && p.ready
           ? `<span class="standings-ready-icon" title="Ready">${icon(
@@ -3354,7 +4370,7 @@ class MazingContestClient {
         </span>
         <span class="standings-row-right" id="sub-telemetry-${p.id}">${
         p.totalScore
-      }p</span>
+      } pts</span>
       `;
 
       row.addEventListener('click', () => {
@@ -3367,6 +4383,9 @@ class MazingContestClient {
         document
           .getElementById('btn-standings-toggle')
           ?.classList.remove('active');
+        document
+          .getElementById('btn-standings-toggle')
+          ?.setAttribute('aria-expanded', 'false');
         this.syncSpectatorStateDOM();
         this.updateUndoAndToolAvailability();
         this.updateScoreboardDOM();
@@ -3377,6 +4396,59 @@ class MazingContestClient {
     });
   }
 
+  private renderDrawerRoster() {
+    if (!this.roomState) return;
+    const roster = document.getElementById('drawer-player-roster');
+    if (roster) {
+      roster.innerHTML = this.roomState.players
+        .map((p) => {
+          const isMe = p.id === this.localPlayerId;
+          const offline = p.connected === false;
+          const roleBadge = p.isBot
+            ? '<span class="bot-badge">BOT</span>'
+            : p.isHost
+            ? '<span class="bot-badge">HOST</span>'
+            : '';
+          const youBadge = isMe ? '<span class="you-badge">You</span>' : '';
+          const readyMark =
+            this.roomState?.phase === 'BUILD' && p.ready
+              ? `<span class="standings-ready-icon" title="Ready">${icon(
+                  'check',
+                  12
+                )}</span>`
+              : '';
+          return `
+            <span class="drawer-roster-chip${offline ? ' offline' : ''}">
+              <span class="player-swatch" style="background:${escapeHtml(
+                p.color
+              )}"></span>
+              <span>${escapeHtml(p.name)}</span>
+              ${youBadge}
+              ${roleBadge}
+              ${readyMark}
+              ${offline ? '<span class="inspect-meta">Offline</span>' : ''}
+            </span>
+          `;
+        })
+        .join('');
+    }
+
+    const canEdit = this.canControlRoomRules();
+    const botCount = this.roomState.players.filter((p) => p.isBot).length;
+    const addBotBtn = document.getElementById(
+      'btn-add-bot'
+    ) as HTMLButtonElement | null;
+    if (addBotBtn) {
+      addBotBtn.disabled = !canEdit || this.roomState.players.length >= 6;
+    }
+    const remBotBtn = document.getElementById(
+      'btn-remove-bot'
+    ) as HTMLButtonElement | null;
+    if (remBotBtn) {
+      remBotBtn.disabled = !canEdit || botCount <= 0;
+    }
+  }
+
   private updateLiveRunScoreboard() {
     if (!this.roomState) return;
     const activeTargetId =
@@ -3385,6 +4457,7 @@ class MazingContestClient {
     const pillScoreEl = document.getElementById('standings-score');
     const estEl = document.getElementById('est-time-value');
     const parSecs = this.roomState.roundConfig.parTimeSeconds;
+    const parLabel = formatParTarget(parSecs);
 
     for (const [pid, sim] of this.simulators.entries()) {
       const liveSecs = sim.state.finished
@@ -3395,38 +4468,86 @@ class MazingContestClient {
         ? 'var(--accent-sage)'
         : 'var(--accent-gold)';
 
-      const subEl = document.getElementById(`sub-telemetry-${pid}`);
-      if (subEl) {
-        subEl.innerHTML = sim.state.finished
-          ? `${icon('flag', 12)} <span>${formatted}</span>`
-          : formatted;
-        subEl.style.color = toneColor;
+      const subKey = `sub:${pid}`;
+      const subSig = `${sim.state.finished ? 'F' : 'R'}|${formatted}`;
+      if (this.lastRunDomCache.get(subKey) !== subSig) {
+        this.lastRunDomCache.set(subKey, subSig);
+        const subEl = document.getElementById(`sub-telemetry-${pid}`);
+        if (subEl) {
+          subEl.innerHTML = sim.state.finished
+            ? `${icon('flag', 12)} <span>${formatted}</span>`
+            : formatted;
+          subEl.style.color = toneColor;
+        }
       }
 
       if (pid === activeTargetId) {
-        if (pillScoreEl) {
-          pillScoreEl.textContent = formatted;
-          pillScoreEl.style.color = toneColor;
-        }
-        if (estEl) {
-          estEl.textContent = `${
-            sim.state.finished ? 'Done' : 'Run'
-          } ${formatted} · Par ${parSecs.toFixed(0)}s`;
-          estEl.style.color =
-            liveSecs >= parSecs
+        const topKey = 'top:target';
+        const beatPar = liveSecs >= parSecs;
+        const topSig = `${pid}|${sim.state.finished ? 'F' : 'R'}|${formatted}|${
+          beatPar ? 1 : 0
+        }|${parLabel}`;
+        if (this.lastRunDomCache.get(topKey) !== topSig) {
+          this.lastRunDomCache.set(topKey, topSig);
+          if (pillScoreEl) {
+            pillScoreEl.textContent = formatted;
+            pillScoreEl.style.color = toneColor;
+          }
+          if (estEl) {
+            estEl.innerHTML = `<span class="time-verb">${
+              sim.state.finished ? 'Done ' : 'Run '
+            }</span>${formatted}<span class="par-full"> · Par </span><span class="par-short">/</span>${escapeHtml(
+              parLabel
+            )}`;
+            estEl.style.color = beatPar
               ? 'var(--accent-sage)'
               : 'var(--text-primary)';
+          }
         }
       }
     }
   }
 
   private updateResultsCountdownDOM() {
-    if (!this.roomState || this.roomState.phase !== 'ROUND_RESULTS') return;
+    if (!this.roomState) return;
+    if (
+      this.roomState.phase !== 'ROUND_RESULTS' &&
+      this.roomState.phase !== 'GAME_OVER'
+    ) {
+      return;
+    }
+    const nextBtn = document.getElementById('btn-next-round');
     const nextBtnLabel = document.getElementById('next-round-label');
     if (!nextBtnLabel) return;
+
+    const connectedHumans = this.roomState.players.filter(
+      (p) => !p.isBot && p.connected !== false
+    );
+    const readyHumans = connectedHumans.filter((p) => p.nextRoundReady).length;
+    const meReady = Boolean(this.getLocalPlayer()?.nextRoundReady);
+    nextBtn?.classList.toggle('locked-in', meReady);
+
+    if (this.roomState.phase === 'GAME_OVER') {
+      if (connectedHumans.length > 1) {
+        nextBtnLabel.textContent = meReady
+          ? `Ready (${readyHumans}/${connectedHumans.length})`
+          : `New Match (${readyHumans}/${connectedHumans.length})`;
+      } else {
+        nextBtnLabel.textContent = 'New Match';
+      }
+      return;
+    }
+
     const secs = Math.max(0, Math.ceil(this.roomState.phaseTimeRemaining));
-    nextBtnLabel.textContent = secs > 0 ? `Next Round (${secs}s)` : 'Next Round';
+    if (connectedHumans.length > 1) {
+      const prefix = meReady
+        ? `Ready (${readyHumans}/${connectedHumans.length})`
+        : `Next Round (${readyHumans}/${connectedHumans.length})`;
+      nextBtnLabel.textContent = secs > 0 ? `${prefix} · ${secs}s` : prefix;
+    } else {
+      nextBtnLabel.textContent =
+        secs > 0 ? `Next Round (${secs}s)` : 'Next Round';
+    }
   }
 
   private renderRoundResultsModal(state: RoomState) {
@@ -3434,14 +4555,49 @@ class MazingContestClient {
     const isGameOver = state.phase === 'GAME_OVER';
     const roundsDone = state.roundsCompleted || round.roundNumber;
     const totalRounds = state.settings?.totalRounds || ROUNDS.length;
-    const parTarget = round.parTimeSeconds || computeEffectivePar(28, state.settings?.goldMultiplier);
+    const parTarget =
+      round.parTimeSeconds ||
+      computeEffectivePar(28, state.settings?.goldMultiplier);
+    const parLabel = formatParTarget(parTarget);
 
     const titleEl = document.getElementById('results-title')!;
     const subEl = document.getElementById('results-subtitle')!;
     const progressEl = document.getElementById('results-match-progress')!;
     const podiumEl = document.getElementById('results-podium')!;
     const recordCallout = document.getElementById('results-record-callout')!;
-    const nextBtnLabel = document.getElementById('next-round-label')!;
+
+    // Inject / toggle Winner's Maze quick-focus button next to View Mazes
+    const peekBtn = document.getElementById('btn-peek-mazes');
+    let winnerPeekBtn = document.getElementById(
+      'btn-peek-winner'
+    ) as HTMLButtonElement | null;
+    if (peekBtn && !winnerPeekBtn) {
+      winnerPeekBtn = document.createElement('button');
+      winnerPeekBtn.type = 'button';
+      winnerPeekBtn.id = 'btn-peek-winner';
+      winnerPeekBtn.className = 'mini-action-btn peek-winner-btn';
+      winnerPeekBtn.title = "Focus Camera on the Leader's Maze";
+      winnerPeekBtn.innerHTML = `${icon('crown', 14)}<span>Winner's Maze</span>`;
+      winnerPeekBtn.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        const resultsModal = document.getElementById('results-modal');
+        if (resultsModal) {
+          resultsModal.classList.add('peek-minimized');
+          this.syncPeekMazesButton(true);
+          this.syncModalOpenState();
+        }
+        const winnerId = this.renderer3d.focusWinnerIsland();
+        if (winnerId) {
+          this.syncSpectatorStateDOM();
+          this.updateScoreboardDOM();
+        }
+        this.scheduleHudSafeInsetsSync();
+      });
+      peekBtn.parentElement?.insertBefore(winnerPeekBtn, peekBtn);
+    }
+    if (winnerPeekBtn) {
+      winnerPeekBtn.classList.toggle('hidden', state.players.length <= 1);
+    }
 
     progressEl.textContent = isGameOver
       ? `Final · ${totalRounds} Rounds`
@@ -3461,8 +4617,8 @@ class MazingContestClient {
 
     if (isGameOver) {
       titleEl.textContent = 'Match Complete';
-      subEl.textContent = `Final standings across ${totalRounds} rounds.`;
-      nextBtnLabel.textContent = 'New Match';
+      subEl.textContent = `Final career standings across ${totalRounds} rounds.`;
+      this.updateResultsCountdownDOM();
 
       const overallRanked = [...state.players].sort(
         (a, b) =>
@@ -3474,9 +4630,9 @@ class MazingContestClient {
       overallRanked.slice(0, 3).forEach((p, idx) => {
         const card = document.createElement('div');
         const isMe = p.id === this.localPlayerId;
-        card.className = `podium-card${idx === 0 ? ' first' : ''}${
-          isMe ? ' is-me' : ''
-        }`;
+        const placeClass =
+          idx === 0 ? ' first' : idx === 1 ? ' second' : ' third';
+        card.className = `podium-card${placeClass}${isMe ? ' is-me' : ''}`;
         const medalSvg = getMedalBadge((idx + 1) as 1 | 2 | 3, 28);
         card.innerHTML = `
           <div class="podium-medal">${medalSvg}</div>
@@ -3492,9 +4648,7 @@ class MazingContestClient {
       });
     } else {
       titleEl.textContent = `Round ${round.roundNumber} · ${round.title}`;
-      subEl.textContent = `Par Target: ${parTarget.toFixed(
-        1
-      )}s (+2 bonus points for beating Par) · Skill: ${formatBotSkillLabel(
+      subEl.textContent = `Par Target: ${parLabel} (+2 bonus pts for beating Par) · Skill: ${formatBotSkillLabel(
         state.settings?.botDifficulty
       )}`;
       this.updateResultsCountdownDOM();
@@ -3506,7 +4660,12 @@ class MazingContestClient {
 
     const tableHead = document.createElement('div');
     tableHead.className = 'results-table-head';
-    tableHead.innerHTML = `
+    tableHead.innerHTML = isGameOver
+      ? `
+      <span>Player &amp; Match Totals</span>
+      <span>Final Score &amp; Best Run</span>
+    `
+      : `
       <span>Player &amp; Maze Stats</span>
       <span>Run Time &amp; Score</span>
     `;
@@ -3514,8 +4673,7 @@ class MazingContestClient {
 
     const ranked = [...state.players].sort((a, b) =>
       isGameOver
-        ? b.totalScore - a.totalScore ||
-          (b.lastRoundTime || 0) - (a.lastRoundTime || 0)
+        ? b.totalScore - a.totalScore || b.bestMazeTime - a.bestMazeTime
         : (b.lastRoundTime || 0) - (a.lastRoundTime || 0)
     );
 
@@ -3527,36 +4685,89 @@ class MazingContestClient {
       }`;
       const rankHtml =
         idx < 3 ? getMedalBadge((idx + 1) as 1 | 2 | 3, 20) : `#${idx + 1}`;
-      const beatPar =
-        (p.lastRoundTime || 0) >= parTarget
-          ? `<span class="par-pill">${icon('starFilled', 10)}<span>Par</span></span>`
-          : '';
       const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
       const botBadge = p.isBot ? `<span class="bot-badge">BOT</span>` : '';
-      const synBadges = `<span class="stat-chip">${icon('bolt', 11)} ${
-        p.lastRoundClaps || 0
-      } · ${icon('diamondFilled', 10)} ${
-        p.lastRoundOvercharge || 0
-      } · ${p.pathDistance.toFixed(0)}m</span>`;
 
-      row.innerHTML = `
-        <div class="result-row-left">
-          <span class="result-rank-slot">${rankHtml}</span>
-          <span class="player-swatch" style="background:${escapeHtml(
-            p.color
-          )}"></span>
-          <strong>${escapeHtml(p.name)}</strong>
-          ${youBadge}
-          ${botBadge}
-          ${beatPar}
-          ${synBadges}
-        </div>
-        <div class="result-stats">
-          <strong>${(p.lastRoundTime || 0).toFixed(2)}s</strong>
-          <span style="color:var(--accent-sage)">+${p.lastRoundPoints}p</span>
-          <span style="color:var(--text-secondary)">(${p.totalScore}p)</span>
-        </div>
-      `;
+      if (isGameOver) {
+        const hist = p.roundHistory || [];
+        const totalHits = hist.reduce((s, r) => s + (r.clapsTaken || 0), 0);
+        const totalOver = hist.reduce(
+          (s, r) => s + (r.overchargedSpires || 0),
+          0
+        );
+        const roundsWon = hist.filter((r) => r.rank === 1).length;
+        const parStars =
+          p.parStarsEarned ?? hist.filter((r) => r.beatPar).length;
+        const bestRun =
+          p.bestMazeTime || Math.max(0, ...hist.map((r) => r.timeSeconds));
+        const parBadge =
+          parStars > 0
+            ? `<span class="par-pill">${icon(
+                'starFilled',
+                10
+              )}<span>${parStars} Par</span></span>`
+            : '';
+        const careerChips = `<span class="stat-chip" title="Match Totals">${icon(
+          'trophy',
+          11
+        )} ${roundsWon}W · ${icon('bolt', 11)} ${totalHits} hits · ${icon(
+          'diamondFilled',
+          10
+        )} ${totalOver}</span>`;
+
+        row.innerHTML = `
+          <div class="result-row-left">
+            <span class="result-rank-slot">${rankHtml}</span>
+            <span class="player-swatch" style="background:${escapeHtml(
+              p.color
+            )}"></span>
+            <strong>${escapeHtml(p.name)}</strong>
+            ${youBadge}
+            ${botBadge}
+            ${parBadge}
+            ${careerChips}
+          </div>
+          <div class="result-stats">
+            <strong style="color:var(--accent-sage)">${p.totalScore} pts</strong>
+            <span style="color:var(--text-secondary)">Best ${bestRun.toFixed(
+              1
+            )}s</span>
+          </div>
+        `;
+      } else {
+        const beatPar =
+          (p.lastRoundTime || 0) >= parTarget
+            ? `<span class="par-pill">${icon(
+                'starFilled',
+                10
+              )}<span>Par</span></span>`
+            : '';
+        const synBadges = `<span class="stat-chip" title="Spire Hits · Overcharge · Path">${icon(
+          'bolt',
+          11
+        )} ${p.lastRoundClaps || 0} · ${icon('diamondFilled', 10)} ${
+          p.lastRoundOvercharge || 0
+        } · ${p.pathDistance.toFixed(0)}m</span>`;
+
+        row.innerHTML = `
+          <div class="result-row-left">
+            <span class="result-rank-slot">${rankHtml}</span>
+            <span class="player-swatch" style="background:${escapeHtml(
+              p.color
+            )}"></span>
+            <strong>${escapeHtml(p.name)}</strong>
+            ${youBadge}
+            ${botBadge}
+            ${beatPar}
+            ${synBadges}
+          </div>
+          <div class="result-stats">
+            <strong>${(p.lastRoundTime || 0).toFixed(2)}s</strong>
+            <span style="color:var(--accent-sage)">+${p.lastRoundPoints} pts</span>
+            <span style="color:var(--text-secondary)">(${p.totalScore} pts)</span>
+          </div>
+        `;
+      }
       table.appendChild(row);
     });
   }
