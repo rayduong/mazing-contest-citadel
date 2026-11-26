@@ -2060,9 +2060,47 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 .modal-backdrop.peek-minimized #results-subtitle,
 .modal-backdrop.peek-minimized #results-podium,
 .modal-backdrop.peek-minimized #results-record-callout,
+.modal-backdrop.peek-minimized #results-daily-panel,
 .modal-backdrop.peek-minimized #results-table,
-.modal-backdrop.peek-minimized #btn-results-leaderboard {
+.modal-backdrop.peek-minimized #results-coaching-tip,
+.modal-backdrop.peek-minimized #results-stats-legend,
+.modal-backdrop.peek-minimized #btn-results-leaderboard,
+.modal-backdrop.peek-minimized #btn-results-share-daily {
   display: none !important;
+}
+
+.modal-backdrop.peek-minimized .results-modal-card {
+  overflow-x: hidden;
+  scrollbar-width: none;
+}
+
+.modal-backdrop.peek-minimized .results-modal-card::-webkit-scrollbar {
+  display: none;
+}
+
+/* Fade blurred top HUD pills cleanly behind the full Results modal */
+body:has(#results-modal:not(.hidden):not(.peek-minimized)) #hud-top-bar {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+}
+
+.peek-identity-pill {
+  position: fixed;
+  top: calc(var(--safe-top) + 60px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 36;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  color: var(--text-primary);
+  pointer-events: none;
+  white-space: nowrap;
 }
 
 .peek-focus-pills,
@@ -2256,8 +2294,20 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 }
 
 .result-row.is-me {
+  position: relative;
+  overflow: hidden;
   border-color: var(--border-tint-sage);
-  box-shadow: inset 3px 0 0 var(--accent-sage);
+}
+
+.result-row.is-me::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3.5px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent-sage);
 }
 
 .result-row.is-me:not(.winner) {
@@ -3156,8 +3206,20 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 }
 
 .lb-row.is-me {
+  position: relative;
+  overflow: hidden;
   border-color: var(--border-tint-sage);
-  box-shadow: inset 3px 0 0 var(--accent-sage);
+}
+
+.lb-row.is-me::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3.5px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent-sage);
 }
 
 .lb-rank {
@@ -3191,7 +3253,7 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
   font-variant-numeric: tabular-nums;
   font-size: var(--text-sm);
   font-weight: 700;
-  color: var(--accent-gold);
+  color: var(--accent-gold-deep);
   display: flex;
   align-items: center;
   gap: 6px;
@@ -3329,15 +3391,22 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
   transition: top 0.18s ease;
 }
 
-body[data-brief-visible='true'] .toast-container,
-body:has(#round-brief-banner:not(.hidden)) .toast-container {
-  top: calc(var(--safe-top) + 132px);
+/* Keep ALL in-game toasts cleanly above the bottom dock on desktop & mobile (zero banner/gate overlap) */
+body[data-in-menu='false'] .toast-container {
+  top: auto !important;
+  bottom: calc(var(--safe-bottom) + 82px);
 }
 
-body[data-phase='PLANNING'] .toast-container,
-body:has(#planning-banner:not(.hidden)) .toast-container {
-  top: auto;
-  bottom: calc(var(--safe-bottom) + 26px);
+body[data-in-menu='false'][data-phase='RUN'] .toast-container,
+body[data-in-menu='false'][data-phase='PLANNING'] .toast-container {
+  top: auto !important;
+  bottom: calc(var(--safe-bottom) + 22px);
+}
+
+body[data-in-menu='false']:has(#touch-precision-tray:not(.hidden)) .toast-container,
+body[data-in-menu='false']:has(#spectator-bar:not(.hidden)) .toast-container {
+  top: auto !important;
+  bottom: calc(var(--safe-bottom) + 144px);
 }
 
 .toast-msg {
@@ -3348,7 +3417,7 @@ body:has(#planning-banner:not(.hidden)) .toast-container {
   color: var(--accent-coral-deep);
   font-size: var(--text-xs);
   font-weight: 600;
-  box-shadow: var(--shadow-soft);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.22);
   text-align: center;
 }
 
@@ -3775,6 +3844,13 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
     padding-bottom: 10px;
   }
 
+  /* Android Chrome & iOS Safari: always collapse controls/roster when chat input is focused */
+  .lobby-drawer:has(#chat-input:focus) .room-controls,
+  .lobby-drawer:has(#chat-input:focus) .drawer-player-roster,
+  .lobby-drawer:has(#chat-input:focus) .panel-divider {
+    display: none;
+  }
+
   .chat-messages {
     flex: 1;
     height: auto;
@@ -3979,13 +4055,14 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
   }
 
   .standings-pill-btn {
-    min-width: 44px;
-    max-width: 50px;
-    padding: 0 7px;
+    min-width: 48px;
+    max-width: 64px;
+    padding: 0 8px;
   }
 
   .standings-summary {
-    max-width: 34px;
+    max-width: 42px;
+    font-size: 11px;
   }
 
   .hud-top-pill {
@@ -4044,7 +4121,9 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
   }
 
   .hud-top-pill .pill-divider {
-    display: none;
+    opacity: 0.65;
+    margin: 0 1px;
+    height: 14px;
   }
 
   #btn-round-picker {
@@ -4084,8 +4163,13 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
 
   .hud-bottom-dock .dock-ready-btn {
     min-width: 60px;
-    max-width: 72px;
+    max-width: 76px;
     padding: 0 8px;
+  }
+
+  .hud-bottom-dock .dock-ready-btn[data-armed='true'],
+  .hud-bottom-dock .dock-ready-btn.armed-confirm {
+    max-width: 104px;
   }
 
   .hud-bottom-dock .dock-ready-btn.armed-confirm > .icon-slot,
@@ -4095,17 +4179,36 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
     display: none;
   }
 
+  .touch-nudge-cluster {
+    gap: 3px;
+  }
+
   .touch-nudge-btn,
   .touch-cancel-btn {
-    width: 40px;
-    height: 40px;
-    min-width: 40px;
-    min-height: 40px;
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
   }
 
   .touch-confirm-btn {
-    min-height: 40px;
+    min-height: 44px;
+    height: 44px;
     padding: 0 10px;
+  }
+}
+
+@media (max-width: 368px) {
+  .touch-nudge-cluster {
+    gap: 2px;
+  }
+
+  .touch-nudge-btn,
+  .touch-cancel-btn {
+    width: 40px;
+    min-width: 40px;
+    height: 44px;
+    min-height: 44px;
   }
 }
 
@@ -4127,9 +4230,9 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
   .desktop-only-tool,
   .hub-pill-btn .btn-label,
   .overview-toggle .btn-label,
-  .hub-emblem,
+  .hub-header .hub-emblem,
   .hub-brand-sub,
-  .hub-name-box .icon-slot,
+  .hub-header .hub-name-box .icon-slot,
   .hub-resume-btn .resume-btn-text,
   .hub-hero-tagline {
     display: none !important;
@@ -4225,8 +4328,8 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
     order: 2;
     flex: 0 1 auto;
     min-width: 86px;
-    max-width: 114px;
-    padding: 0 10px;
+    max-width: 164px;
+    padding: 0 12px;
   }
 
   .touch-nudge-cluster {
@@ -4339,6 +4442,7 @@ body[data-in-menu='true'] #spectator-bar,
 body[data-in-menu='true'] #round-brief-banner,
 body[data-in-menu='true'] #planning-banner,
 body[data-in-menu='true'] #touch-precision-tray,
+body[data-in-menu='true'] #mobile-synergy-pill,
 body[data-in-menu='true'] #lobby-drawer {
   display: none !important;
 }
@@ -4943,8 +5047,18 @@ body[data-mode='DAILY'] #round-dropdown .popover-divider {
 .lobby-ready-toggle-btn {
   flex: 1;
   min-width: 130px;
+  min-height: 44px;
   justify-content: center;
-  height: 42px;
+  height: 44px;
+}
+
+.hub-secondary-btn.lobby-ready-toggle-btn.needs-ready {
+  background: var(--cta-gold-bg);
+  border-color: var(--cta-gold-border);
+  color: #ffffff;
+  text-shadow: 0 1px 1px rgba(69, 26, 3, 0.36);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    0 4px 12px rgba(180, 83, 9, 0.24);
 }
 
 .hub-secondary-btn.lobby-ready-toggle-btn.is-ready,
@@ -4956,23 +5070,29 @@ body[data-mode='DAILY'] #round-dropdown .popover-divider {
     0 4px 12px rgba(4, 120, 87, 0.24);
 }
 
-/* Position toasts cleanly at the bottom when a menu or lobby overlay is open */
+/* Position toasts cleanly at the top safe-area when a menu or lobby overlay is open (never covers Chat/Rules) */
 body[data-in-menu='true'] #toast-container {
-  top: auto;
-  bottom: calc(var(--safe-bottom) + 18px);
+  top: calc(var(--safe-top) + 12px);
+  bottom: auto;
 }
 
 .lobby-start-btn {
   flex: 1.3;
   min-width: 170px;
+  min-height: 44px;
   justify-content: center;
-  height: 42px;
+  height: 44px;
 }
 
 .lobby-start-btn:disabled {
-  opacity: 0.55;
+  opacity: 1;
+  filter: none;
   cursor: not-allowed;
-  filter: grayscale(0.25);
+  background: var(--surface-subtle);
+  border-color: var(--surface-border-strong);
+  color: var(--text-secondary);
+  text-shadow: none;
+  box-shadow: none;
 }
 
 .lobby-rules-summary {
@@ -4982,16 +5102,29 @@ body[data-in-menu='true'] #toast-container {
 }
 
 .lobby-rule-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   font-size: 12px;
   color: var(--text-secondary);
   background: var(--surface-elevated);
   border: 1px solid var(--surface-border);
-  border-radius: 9px;
-  padding: 6px 8px;
+  border-radius: 10px;
+  padding: 7px 9px;
+}
+
+.lobby-rule-chip .rule-k {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 .lobby-rule-chip strong {
+  font-size: 12.5px;
   color: var(--text-primary);
+  line-height: 1.25;
 }
 
 .lobby-rules-editor {
@@ -5499,8 +5632,8 @@ body[data-in-menu='true'] #toast-container {
 }
 
 .settings-toggle-btn {
-  min-width: 74px;
-  min-height: 38px;
+  min-width: 78px;
+  min-height: 44px;
   justify-content: center;
   font-weight: 700;
   flex-shrink: 0;
@@ -5521,9 +5654,14 @@ body[data-in-menu='true'] #toast-container {
 
 .volume-control-wrap input[type='range'] {
   width: 130px;
-  height: 36px;
+  height: 44px;
   accent-color: var(--accent-gold);
   cursor: pointer;
+}
+
+.volume-control-wrap input[type='range'].is-muted {
+  opacity: 0.45;
+  filter: grayscale(0.75);
 }
 
 .controls-key-list {
@@ -6155,6 +6293,952 @@ body[data-in-menu='true'] #toast-container {
     width: auto;
     max-width: min(50vw, 340px);
     align-items: flex-end;
+  }
+}
+
+/* ============================================================================
+   AUDIT SPRINT 1 — WORLD-CLASS UI/UX POLISH (DESKTOP + MOBILE)
+   ============================================================================ */
+
+/* Phase dot for ROUND_RESULTS / GAME_OVER (distinct from green BUILD) */
+.phase-dot.results {
+  background: var(--accent-gold);
+  box-shadow: 0 0 0 3px var(--surface-tint-gold);
+}
+
+/* Single authoritative survival clock during RUN phase (hide irrelevant server max-run countdown) */
+body[data-phase='RUN'] #timer-display {
+  display: none;
+}
+
+/* Visual timer urgency in final 15s / 10s of BUILD */
+.timer-display.timer-warn {
+  color: var(--accent-gold-deep);
+}
+
+.timer-display.timer-urgent {
+  color: var(--accent-coral);
+  font-weight: 800;
+}
+
+.phase-clock-cluster.timer-urgent-pulse {
+  animation: timerUrgentPulse 1s ease-in-out infinite;
+}
+
+@keyframes timerUrgentPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.045); }
+}
+
+/* Persistent Desktop & Landscape Spire / Overcharge Synergy Readout Pill */
+.synergy-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.synergy-chip .icon-slot {
+  color: var(--accent-gold);
+}
+
+.synergy-chip .synergy-sep {
+  opacity: 0.45;
+}
+
+.synergy-chip.is-overcharged {
+  color: var(--accent-gold-deep);
+}
+
+.synergy-chip.is-overcharged .icon-slot {
+  color: var(--accent-gold);
+}
+
+@media (max-width: 768px) {
+  .divider-before-synergy,
+  #hud-synergy-chip {
+    display: none !important;
+  }
+}
+
+/* Portrait Mobile Floating Synergy Micro-Pill (Visible in BUILD Ocean Margin When Banners/Menus Closed) */
+.mobile-synergy-pill {
+  display: none;
+}
+
+@media (max-width: 768px) and (orientation: portrait) {
+  body[data-in-menu='false'][data-phase='BUILD'] .mobile-synergy-pill:not(.hidden) {
+    position: fixed;
+    top: calc(var(--safe-top) + 58px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 11px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    pointer-events: none;
+    white-space: nowrap;
+  }
+
+  .mobile-synergy-pill .icon-slot {
+    color: var(--accent-gold);
+  }
+
+  .mobile-synergy-pill .synergy-sep {
+    opacity: 0.45;
+  }
+
+  .mobile-synergy-pill.is-overcharged {
+    color: var(--accent-gold-deep);
+    border-color: var(--border-tint-gold);
+    background: var(--surface-tint-gold);
+  }
+
+  body[data-spectating='true'] .mobile-synergy-pill,
+  body:has(#round-brief-banner:not(.hidden)) .mobile-synergy-pill,
+  body:has(#planning-banner:not(.hidden)) .mobile-synergy-pill,
+  body:has(#standings-dropdown:not(.hidden)) .mobile-synergy-pill,
+  body:has(#round-dropdown:not(.hidden)) .mobile-synergy-pill {
+    display: none !important;
+  }
+}
+
+/* Desktop Round Brief Banner: crisp 2-line max with right-aligned Par pill */
+.round-brief-banner {
+  width: min(620px, calc(100vw - 24px));
+}
+
+.brief-head-line {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.brief-runner-lead {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.brief-par-chip {
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-tint-gold);
+  border: 1px solid var(--border-tint-gold);
+  color: var(--accent-gold-deep);
+  font-size: 11px;
+}
+
+/* Compact Desktop Planning Banner (clears North Gate cleanly) */
+.planning-banner {
+  top: calc(var(--safe-top) + 56px);
+  padding: 7px 14px 7px 9px;
+  gap: 11px;
+}
+
+.planning-badge-ring {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+}
+
+.planning-countdown-num {
+  font-size: 22px;
+}
+
+/* Deeper segmented-control track contrast across Solo & Online forms */
+.segmented-control {
+  background: rgba(226, 217, 200, 0.82);
+}
+
+/* Home Screen: Editable Name Pill Cue + Play Modes vs Utility Hierarchy */
+.home-name-box {
+  cursor: text;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.home-name-box:hover {
+  border-color: var(--border-tint-gold);
+}
+
+.home-name-box:focus-within {
+  border-color: var(--accent-gold);
+  box-shadow: 0 0 0 3px var(--surface-tint-gold);
+}
+
+.hub-name-edit-icon {
+  color: var(--text-muted);
+  opacity: 0.72;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+.play-mode-card {
+  box-shadow: var(--surface-lip), 0 2px 0 rgba(120, 102, 78, 0.12),
+    0 4px 10px rgba(28, 45, 62, 0.06);
+}
+
+.home-utility-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.utility-card {
+  padding: 10px 12px;
+  gap: 10px;
+  background: rgba(255, 253, 249, 0.72);
+  box-shadow: 0 1px 3px rgba(28, 45, 62, 0.04);
+}
+
+.utility-card .home-option-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+}
+
+.utility-card .home-option-body strong {
+  font-size: 13.5px;
+}
+
+.utility-card .home-option-body > span:last-child {
+  font-size: 11px;
+}
+
+.online-count-badge {
+  background: rgba(224, 242, 254, 0.92);
+  border-color: var(--border-tint-sky);
+  color: var(--accent-sky);
+  font-weight: 700;
+}
+
+/* Waiting Lobby Polish: Code Copy Gap, Inset Chat Well, Mobile Invite Slot */
+.lobby-code-pill {
+  gap: 6px;
+}
+
+.lobby-chat-messages {
+  background: rgba(255, 253, 249, 0.78);
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  padding: 9px 10px;
+}
+
+.lobby-invite-slot-btn {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.lobby-invite-slot-btn:hover {
+  border-color: var(--border-tint-gold);
+  background: var(--surface-tint-gold);
+}
+
+.lobby-invite-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-gold-deep);
+  background: var(--surface-tint-gold);
+  border: 1px solid var(--border-tint-gold);
+  padding: 3px 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+/* Daily Maze & Online Centered Trophy Empty State */
+.daily-empty-state {
+  margin: auto;
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 6px;
+}
+
+.daily-empty-medallion {
+  width: 44px;
+  height: 44px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  background: var(--surface-tint-gold);
+  border: 1px solid var(--border-tint-gold);
+  color: var(--accent-gold);
+  margin-bottom: 2px;
+}
+
+.daily-empty-state strong {
+  font-size: 13.5px;
+  color: var(--text-primary);
+}
+
+.daily-empty-state > span {
+  font-size: 12px;
+  color: var(--text-secondary);
+  max-width: 260px;
+  line-height: 1.4;
+}
+
+.daily-empty-state .dock-ready-btn span {
+  color: #ffffff;
+}
+
+.empty-host-cta {
+  margin-top: 8px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0 18px;
+}
+
+@media (min-width: 769px) {
+  .empty-host-cta {
+    display: none !important;
+  }
+}
+
+.daily-table-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Daily Player Identity Strip & Inline Link Buttons */
+.daily-player-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding: 0 2px;
+}
+
+.daily-player-identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.daily-player-identity strong {
+  color: var(--text-primary);
+}
+
+.text-link-btn {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-gold-deep);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.text-link-btn:hover {
+  color: var(--accent-gold);
+}
+
+/* Daily Results Hero Stat Emphasis & Par Progress Bar */
+.daily-result-stat.hero-time-stat {
+  background: var(--surface-tint-gold);
+  border-color: var(--border-tint-gold);
+}
+
+.daily-result-stat.hero-time-stat.beat-par {
+  background: var(--surface-tint-sage);
+  border-color: var(--border-tint-sage);
+}
+
+.daily-result-stat.hero-time-stat strong {
+  font-size: 20px;
+  color: var(--accent-gold-deep);
+}
+
+.daily-result-stat.hero-time-stat.beat-par strong {
+  color: var(--accent-sage-deep);
+}
+
+.daily-par-progress-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 12px;
+  border-radius: 11px;
+  background: var(--surface-card);
+  border: 1px solid var(--surface-border);
+}
+
+.daily-par-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  flex-wrap: wrap;
+}
+
+.daily-mini-countdown {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-gold-deep);
+  font-size: 11px;
+}
+
+.daily-par-track {
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(120, 102, 78, 0.16);
+  overflow: hidden;
+}
+
+.daily-par-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #d97706 0%, #b45309 100%);
+  transition: width 0.4s ease;
+}
+
+.daily-par-fill.beat-par {
+  background: linear-gradient(90deg, #10b981 0%, #047857 100%);
+}
+
+.daily-result-lb-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* Standing bar strict single-row on desktop & mobile */
+.daily-my-standing-bar {
+  flex-wrap: nowrap;
+}
+
+.standing-left {
+  min-width: 0;
+  flex: 1;
+}
+
+.standing-right {
+  flex-shrink: 0;
+}
+
+/* Results Modal Header Actions, Icon Legend & Coaching Tip */
+.results-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.peek-winner-btn.active {
+  background: var(--surface-tint-gold);
+  border-color: var(--border-tint-gold);
+  color: var(--accent-gold-deep);
+}
+
+.stats-icon-legend {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 2px 4px;
+}
+
+.stats-icon-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.results-coaching-tip {
+  padding: 8px 11px;
+  border-radius: 10px;
+  background: var(--surface-tint-gold);
+  border: 1px solid var(--border-tint-gold);
+  color: var(--accent-gold-deep);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* How to Play Bottom Action Footer */
+.htp-action-footer {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--surface-border);
+  box-shadow: 0 -8px 16px rgba(252, 249, 242, 0.92);
+  flex-shrink: 0;
+}
+
+.htp-action-footer > button {
+  flex: 1;
+  justify-content: center;
+  min-height: 44px;
+}
+
+/* Settings: Put Touch & Mobile Controls FIRST on touch/mobile devices */
+.controls-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.controls-section-desktop,
+.controls-section-touch {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+body[data-input='touch'] .controls-section-touch {
+  order: -1;
+}
+
+body[data-input='touch'] .controls-section-touch .settings-subhead {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+body[data-input='touch'] .controls-section-desktop h3 {
+  padding-top: 10px;
+  border-top: 1px solid var(--surface-border);
+}
+
+@media (hover: none), (pointer: coarse) {
+  .controls-section-touch {
+    order: -1;
+  }
+  .controls-section-touch .settings-subhead {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
+  }
+  .controls-section-desktop h3 {
+    padding-top: 10px;
+    border-top: 1px solid var(--surface-border);
+  }
+  .menu-screen {
+    scrollbar-width: none;
+  }
+  .menu-screen::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Mobile Portrait (<= 768px): Floating Centered Sunlit Home Card over 3D Diorama + Mobile RUN Deduplication */
+@media (max-width: 768px) {
+  #home-hub-modal[data-screen='home'] {
+    align-items: center;
+    justify-content: center;
+    padding: calc(var(--safe-top) + 12px) calc(var(--safe-right) + 12px)
+      calc(var(--safe-bottom) + 12px) calc(var(--safe-left) + 12px);
+  }
+
+  #home-hub-modal[data-screen='home'] .hub-shell {
+    width: 100%;
+    max-width: 420px;
+    height: auto;
+    max-height: calc(100dvh - var(--safe-top) - var(--safe-bottom) - 24px);
+    border-radius: 22px;
+    border: 1px solid var(--surface-border-strong);
+    box-shadow: 0 18px 46px rgba(15, 23, 42, 0.24),
+      inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  }
+
+  body.keyboard-open #home-hub-modal[data-screen='home'] .hub-shell {
+    max-height: calc(var(--vvh, 100dvh) - 16px);
+  }
+
+  #screen-home {
+    padding: 16px 15px 14px;
+    gap: 10px;
+  }
+
+  #screen-home > .home-brand-hero {
+    margin-top: 0;
+  }
+
+  #screen-home > .home-footer-bar {
+    margin-bottom: 0;
+  }
+
+  /* Hide duplicate top-left Overview button during mobile RUN (Run Dock already has All Islands) */
+  body[data-phase='RUN'] #btn-camera-overview {
+    display: none !important;
+  }
+
+  /* Restore clear RUN label next to orange dot on mobile portrait top pill */
+  body[data-phase='RUN'] .phase-label {
+    display: inline !important;
+    font-size: 11px;
+  }
+
+  /* Anchor toasts at bottom safe-area on full-bleed mobile subscreens (never covers Lobby header/code) */
+  body[data-in-menu='true']:has(#home-hub-modal:not([data-screen='home'])) #toast-container {
+    top: auto;
+    bottom: calc(var(--safe-bottom) + 14px);
+  }
+
+  /* Wrap utility card subtitles cleanly as a safety net on narrow phones */
+  .utility-card .home-option-body > span:last-child {
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  /* 44px touch target for inline text links (e.g. "Switch name") */
+  .text-link-btn {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 6px;
+  }
+
+  /* Sticky Create Lobby button on mobile Online Host pane */
+  #screen-online .config-actions-row {
+    position: sticky;
+    bottom: 0;
+    background: var(--surface-bg);
+    padding: 10px 0 4px;
+    z-index: 4;
+  }
+
+  .menu-screen {
+    scrollbar-width: thin;
+  }
+}
+
+/* Mobile Portrait Compact Polish (<= 600px) */
+@media (max-width: 600px) {
+  .home-name-box {
+    min-height: 44px;
+    padding: 0 14px;
+  }
+
+  .home-name-box input {
+    height: 38px;
+    width: 140px;
+    text-align: center;
+  }
+
+  .home-footer-bar > button,
+  .home-resume-cta,
+  .home-leave-cta,
+  .screen-back-btn {
+    min-height: 44px;
+    height: 44px;
+  }
+
+  /* Compact Portrait Round Brief Banner (<= 62px, no redundant Par/trait bloat) */
+  .round-brief-banner .brief-par-chip,
+  .round-brief-banner .brief-trait {
+    display: none;
+  }
+
+  /* Daily Maze Mobile Header: Row 1 = [<- Home] + [Next maze in ...], Row 2 = Title + Date */
+  #screen-daily .subscreen-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  #screen-daily .screen-back-btn {
+    order: 1;
+  }
+
+  #screen-daily .daily-countdown-pill {
+    order: 2;
+  }
+
+  #screen-daily .subscreen-title-group {
+    order: 3;
+    flex: 1 0 100%;
+    min-width: 100%;
+  }
+
+  /* Hide desktop table headers on mobile Round Results & format rows cleanly */
+  .results-table-head {
+    display: none;
+  }
+
+  .results-header-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .results-header-actions > button {
+    justify-content: center;
+  }
+
+  .results-header-actions > button:only-child {
+    grid-column: 1 / -1;
+  }
+
+  .result-row {
+    gap: 6px;
+  }
+
+  .result-stats {
+    width: 100%;
+    justify-content: space-between;
+    padding-top: 6px;
+    border-top: 1px solid rgba(120, 102, 78, 0.12);
+  }
+
+  .modal-backdrop.peek-minimized .results-header-actions {
+    width: auto;
+    display: flex;
+    gap: 6px;
+  }
+}
+
+/* Compact-Height Mobile Portrait (<= 700px tall) — keep 44px Home Name Input while still zero-scroll */
+@media (max-width: 600px) and (max-height: 700px) {
+  #screen-home {
+    gap: 7px;
+    padding: 12px 13px;
+  }
+
+  .home-brand-top {
+    gap: 5px;
+  }
+
+  .home-name-box {
+    min-height: 44px;
+  }
+
+  .home-name-box input {
+    height: 38px;
+  }
+
+  .home-option-card {
+    padding: 7px 10px;
+  }
+
+  .utility-card {
+    padding: 7px 9px;
+  }
+}
+
+/* Mobile Landscape Ergonomics & Floating Sunlit 3-Up / 2-Up Home Card (<= 500px height) */
+@media (max-height: 500px) and (orientation: landscape) {
+  /* Restore clear RUN label next to orange dot on landscape top pill */
+  body[data-phase='RUN'] .phase-label {
+    display: inline !important;
+    font-size: 11px;
+  }
+
+  /* Anchor toasts at bottom on full-bleed landscape subscreens (never covers Lobby title/code) */
+  body[data-in-menu='true']:has(#home-hub-modal:not([data-screen='home'])) #toast-container {
+    top: auto;
+    bottom: calc(var(--safe-bottom) + 12px);
+  }
+
+  /* Dock Round Brief Banner cleanly in bottom-right ocean margin (zero North Gate overlap!) */
+  .round-brief-banner {
+    top: auto;
+    left: auto;
+    right: calc(var(--safe-right) + 10px);
+    bottom: calc(var(--safe-bottom) + 8px);
+    transform: none;
+    width: auto;
+    max-width: min(370px, calc(100vw - 360px));
+    min-height: 0;
+    padding: 6px 10px 6px 12px;
+    border-radius: 14px;
+  }
+
+  .round-brief-banner .brief-par-chip,
+  .round-brief-banner .brief-trait {
+    display: none;
+  }
+
+  .round-brief-text {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .brief-head-line {
+    width: 100%;
+    flex-shrink: 0;
+  }
+
+  .brief-hint-line {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    font-size: 11px;
+    line-height: 1.28;
+  }
+
+  /* Auto-hide landscape Round Brief when Precision Tray occupies bottom-right */
+  body:has(#touch-precision-tray:not(.hidden)) .round-brief-banner {
+    display: none !important;
+  }
+
+  /* Landscape Precision Tray: wider Confirm button & safe toast clearance */
+  #btn-touch-confirm,
+  .touch-confirm-btn {
+    max-width: 164px;
+  }
+
+  body[data-in-menu='false']:has(#touch-precision-tray:not(.hidden)) .toast-container {
+    bottom: calc(var(--safe-bottom) + 66px);
+  }
+
+  /* Landscape Home: Floating Centered Sunlit Card over Blue Ocean + >=44px Tap Targets & 16px Anti-Zoom */
+  #home-hub-modal[data-screen='home'] {
+    align-items: center;
+    justify-content: center;
+    padding: calc(var(--safe-top) + 8px) calc(var(--safe-right) + 12px)
+      calc(var(--safe-bottom) + 8px) calc(var(--safe-left) + 12px);
+  }
+
+  #home-hub-modal[data-screen='home'] .hub-shell {
+    width: min(780px, calc(100vw - 24px));
+    max-width: 780px;
+    height: auto;
+    max-height: calc(100dvh - var(--safe-top) - var(--safe-bottom) - 16px);
+    border-radius: 20px;
+    border: 1px solid var(--surface-border-strong);
+    box-shadow: 0 18px 46px rgba(15, 23, 42, 0.24),
+      inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  }
+
+  #screen-home {
+    gap: 7px;
+    padding: 12px 16px;
+  }
+
+  #screen-home > .home-brand-hero {
+    margin-top: 0;
+  }
+
+  #screen-home > .home-footer-bar {
+    margin-bottom: 0;
+  }
+
+  .home-brand-top .home-emblem-lg {
+    display: grid !important;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+  }
+
+  .home-name-box {
+    min-height: 44px;
+    padding: 0 12px;
+  }
+
+  .home-name-box .icon-slot {
+    display: inline-flex !important;
+  }
+
+  .home-name-box input {
+    width: 120px;
+    min-width: 80px;
+    height: 38px;
+    font-size: 16px !important;
+    text-align: left;
+  }
+
+  .home-active-match-bar {
+    padding: 6px 10px;
+    gap: 8px;
+  }
+
+  .home-resume-cta,
+  .home-leave-cta {
+    min-height: 44px;
+    height: 44px;
+    padding: 0 14px;
+  }
+
+  .home-menu-stack {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 7px;
+  }
+
+  .home-option-card.featured-daily {
+    grid-column: auto;
+  }
+
+  .home-utility-pair {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 7px;
+  }
+
+  .home-option-card {
+    padding: 8px 10px;
+    gap: 8px;
+  }
+
+  .home-option-card .home-option-arrow {
+    display: none;
+  }
+
+  .home-option-body > span:last-child {
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .home-footer-bar {
+    padding-top: 5px;
+  }
+
+  .home-footer-bar > button {
+    min-height: 44px;
+    height: 44px;
+  }
+
+  .modal-card {
+    padding: 12px 16px;
+    gap: 10px;
+  }
+}
+
+@media (max-width: 780px) and (max-height: 500px) and (orientation: landscape) {
+  .touch-precision-tray {
+    bottom: calc(var(--safe-bottom) + 64px);
   }
 }
 

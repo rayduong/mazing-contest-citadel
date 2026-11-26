@@ -1906,12 +1906,12 @@ export class Arena3DRenderer {
       return g;
     })(),
     clapPipOuter: (() => {
-      const g = new THREE.CircleGeometry(0.145, 16);
+      const g = new THREE.CircleGeometry(0.185, 16);
       g.rotateX(-Math.PI / 2);
       return g;
     })(),
     clapPipInner: (() => {
-      const g = new THREE.CircleGeometry(0.092, 16);
+      const g = new THREE.CircleGeometry(0.118, 16);
       g.rotateX(-Math.PI / 2);
       return g;
     })(),
@@ -3026,23 +3026,26 @@ export class Arena3DRenderer {
       ? Math.min(rawBottomPx, 16)
       : rawBottomPx;
 
-    const clearFracY = Math.max(0.52, (h - topHudPx - bottomHudPx - 14) / h);
+    const clearFracY = Math.max(0.5, (h - topHudPx - bottomHudPx - 28) / h);
     const usableY = Math.min(
-      isPortrait ? 0.8 : isShortMobileLandscape ? 0.88 : 0.85,
+      isPortrait ? 0.8 : isShortMobileLandscape ? 0.88 : 0.83,
       clearFracY
     );
 
-    // Include downward South cliff skirt (`1.42m` drop * `sin(polar) * 0.45`) so ultra-wide docks never overlap
+    // Include downward South cliff skirt & perspective near-edge Z-compensation so South Shrine clears bottom dock
     const effSpanH = isShortMobileLandscape ? Math.max(20, spanH - 1.8) : spanH;
     const projectedHalfH =
-      effSpanH * 0.5 * Math.cos(polar) + (reliefH + 0.65) * Math.sin(polar);
-    const distForHeight = projectedHalfH / (usableY * tanHalfV);
+      effSpanH * 0.5 * Math.cos(polar) + (reliefH + 0.7) * Math.sin(polar);
+    const nearZHalf = effSpanH * 0.5 * Math.sin(polar);
+    const distForHeight =
+      projectedHalfH / (usableY * tanHalfV) + nearZHalf * 0.55;
 
     const radius = Math.max(distForWidth, distForHeight);
     const hudAsymmetryPx = (topHudPx - bottomHudPx) * 0.5;
     const worldPerPxAtTarget = (2 * radius * tanHalfV) / h;
     const zBias =
-      -(hudAsymmetryPx * worldPerPxAtTarget) / Math.max(0.6, Math.cos(polar));
+      -(hudAsymmetryPx * worldPerPxAtTarget) / Math.max(0.6, Math.cos(polar)) +
+      (isPortrait || isShortMobileLandscape ? 0 : 0.35);
 
     return { radius, polar, zBias };
   }
@@ -9838,8 +9841,8 @@ export class Arena3DRenderer {
 
       for (const spireRig of island.spireRigs) {
         const targetRingAlpha = isPlanOrBuild
-          ? 0.16 + spireRig.targetHoverBoost * 0.44
-          : 0.14;
+          ? 0.3 + spireRig.targetHoverBoost * 0.38
+          : 0.16;
         const currRingAlpha = spireRig.aoeMat.uniforms.uRingAlpha.value;
         spireRig.aoeMat.uniforms.uRingAlpha.value =
           currRingAlpha +
@@ -9898,10 +9901,9 @@ export class Arena3DRenderer {
         island.runner.statusRing.visible = false;
       }
 
-      // Island Header Badge: hidden on focused island in BUILD/RUN to keep field clean; shown in Overview!
+      // Island Header Badge: shown ONLY in Overview mode (Peek Mode uses clean top-center #peek-identity-pill!)
       if (iBadge) {
-        const showIslandHeader =
-          this.arenaOverviewMode || island.playerId !== focusedPid;
+        const showIslandHeader = this.arenaOverviewMode;
         if (!showIslandHeader) {
           if (iBadge.visible) {
             iBadge.root.style.display = 'none';

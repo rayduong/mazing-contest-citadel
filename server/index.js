@@ -710,7 +710,7 @@ async function startServer() {
           senderName: '',
           senderColor: '#38bdf8',
           text: startInLobby
-            ? `Lobby ${code} created. Share the room code and click Ready when set.`
+            ? `Lobby ${code} created. Share the room code and press Ready Up when set.`
             : mode === 'DAILY'
             ? `Daily Maze #${options.dailyPuzzleNumber || 1} — 5s planning, then 120s to build your best maze.`
             : `Match started. Plan your route during the 5s countdown, then build!`,
