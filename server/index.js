@@ -5,13 +5,12 @@ import http from 'http';
 import { fileURLToPath } from 'url';
 import { WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
+import { createPersistenceStorage } from './storage.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = path.join(__dirname, 'data');
-const LEADERBOARD_FILE = path.join(DATA_DIR, 'leaderboard.json');
-const DAILY_LEADERBOARD_FILE = path.join(DATA_DIR, 'daily_leaderboard.json');
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const PLANNING_TIME_SECONDS = 5;
@@ -250,116 +249,23 @@ async function startServer() {
     await vite.close().catch(() => {});
   }
 
-  // Initialize persistent Leaderboard (non-blocking writes after startup)
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
+  // Initialize durable persistence (PostgreSQL via DATABASE_URL -> DATA_DIR disk -> local JSON fallback)
+  const storage = createPersistenceStorage({ defaultDataDir: DATA_DIR });
+  await storage.init();
 
-  let leaderboard = createSeededLeaderboard(ROUNDS);
-  try {
-    if (fs.existsSync(LEADERBOARD_FILE)) {
-      const parsed = JSON.parse(fs.readFileSync(LEADERBOARD_FILE, 'utf-8'));
-      if (parsed && parsed.roundRecords && parsed.champions) {
-        leaderboard = parsed;
-      }
-    } else {
-      fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2));
-    }
-  } catch (err) {
-    console.warn('Could not read leaderboard.json, using seeded records:', err);
-  }
-
-  let leaderboardWriteInFlight = false;
-  let leaderboardWriteQueued = false;
-
-  async function flushLeaderboardAsync() {
-    if (leaderboardWriteInFlight) {
-      leaderboardWriteQueued = true;
-      return;
-    }
-    leaderboardWriteInFlight = true;
-    try {
-      do {
-        leaderboardWriteQueued = false;
-        const json = JSON.stringify(leaderboard, null, 2);
-        const tmpPath = `${LEADERBOARD_FILE}.tmp`;
-        try {
-          await fs.promises.writeFile(tmpPath, json, 'utf-8');
-          await fs.promises.rename(tmpPath, LEADERBOARD_FILE);
-        } catch {
-          await fs.promises.writeFile(LEADERBOARD_FILE, json, 'utf-8');
-        }
-      } while (leaderboardWriteQueued);
-    } catch (err) {
-      console.warn('Failed to persist leaderboard.json:', err);
-    } finally {
-      leaderboardWriteInFlight = false;
-    }
-  }
+  let leaderboard = await storage.loadLeaderboard(
+    createSeededLeaderboard(ROUNDS)
+  );
 
   function saveLeaderboard() {
-    leaderboard.updatedAt = Date.now();
-    void flushLeaderboardAsync();
+    void storage.saveLeaderboard(leaderboard);
   }
 
-  // Initialize persistent Daily Maze Leaderboard (1 attempt/day, 120s build timer)
   /** @type {{ days: Record<string, any[]>; updatedAt: number }} */
-  let dailyStore = { days: {}, updatedAt: Date.now() };
-  try {
-    if (fs.existsSync(DAILY_LEADERBOARD_FILE)) {
-      const parsed = JSON.parse(
-        fs.readFileSync(DAILY_LEADERBOARD_FILE, 'utf-8')
-      );
-      if (parsed && parsed.days && typeof parsed.days === 'object') {
-        dailyStore = parsed;
-      }
-    } else {
-      fs.writeFileSync(
-        DAILY_LEADERBOARD_FILE,
-        JSON.stringify(dailyStore, null, 2)
-      );
-    }
-  } catch (err) {
-    console.warn('Could not read daily_leaderboard.json, starting fresh:', err);
-  }
+  let dailyStore = await storage.loadDailyStore();
 
-  let dailyWriteInFlight = false;
-  let dailyWriteQueued = false;
-
-  async function flushDailyStoreAsync() {
-    if (dailyWriteInFlight) {
-      dailyWriteQueued = true;
-      return;
-    }
-    dailyWriteInFlight = true;
-    try {
-      do {
-        dailyWriteQueued = false;
-        // Retain the 14 most recent UTC days
-        const dayKeys = Object.keys(dailyStore.days).sort();
-        while (dayKeys.length > 14) {
-          const oldest = dayKeys.shift();
-          if (oldest) delete dailyStore.days[oldest];
-        }
-        const json = JSON.stringify(dailyStore, null, 2);
-        const tmpPath = `${DAILY_LEADERBOARD_FILE}.tmp`;
-        try {
-          await fs.promises.writeFile(tmpPath, json, 'utf-8');
-          await fs.promises.rename(tmpPath, DAILY_LEADERBOARD_FILE);
-        } catch {
-          await fs.promises.writeFile(DAILY_LEADERBOARD_FILE, json, 'utf-8');
-        }
-      } while (dailyWriteQueued);
-    } catch (err) {
-      console.warn('Failed to persist daily_leaderboard.json:', err);
-    } finally {
-      dailyWriteInFlight = false;
-    }
-  }
-
-  function saveDailyStore() {
-    dailyStore.updatedAt = Date.now();
-    void flushDailyStoreAsync();
+  function saveDailyEntry(dateKey, entry) {
+    void storage.saveDailyEntry(dateKey, entry, dailyStore);
   }
 
   /** @type {Map<string, { dateKey: string; puzzleNumber: number; roundConfig: any }>} */
@@ -521,7 +427,7 @@ async function startServer() {
 
     entries.push(entry);
     entries.sort(compareDailyEntries);
-    saveDailyStore();
+    saveDailyEntry(dateKey, entry);
     return true;
   }
 
@@ -3396,10 +3302,19 @@ async function startServer() {
     });
   });
 
+  // Disable HTTP caching on dynamic JSON APIs so players always see fresh leaderboard & lobby state
+  app.use('/api', (_req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+  });
+
   // REST API Endpoints for Lobby Browser, Leaderboard, Daily Maze & Cloud Healthchecks
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
+      storage: storage.getBackendName(),
       activeRooms: rooms.size,
       connectedPlayers: clientMap.size,
       uptimeSeconds: Math.floor(process.uptime()),

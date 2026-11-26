@@ -634,9 +634,9 @@ class MazingContestClient {
         playerName: this.playerName,
       });
       const [lobbiesRes, lbRes, dailyRes] = await Promise.all([
-        fetch('/api/lobbies'),
-        fetch('/api/leaderboard'),
-        fetch(`/api/daily?${qs.toString()}`),
+        fetch('/api/lobbies', { cache: 'no-store' }),
+        fetch('/api/leaderboard', { cache: 'no-store' }),
+        fetch(`/api/daily?${qs.toString()}`, { cache: 'no-store' }),
       ]);
       if (lobbiesRes.ok) {
         const data = await lobbiesRes.json();
@@ -2974,6 +2974,7 @@ class MazingContestClient {
         dailyClientId: this.dailyClientId,
         playerName: this.playerName,
       });
+      void this.refreshDailyFromApi();
       this.renderDailyScreen();
     } else if (screen === 'leaderboard') {
       this.renderLeaderboard();
@@ -3185,6 +3186,25 @@ class MazingContestClient {
       `;
       container.appendChild(row);
     });
+  }
+
+  private async refreshDailyFromApi() {
+    try {
+      const qs = new URLSearchParams({
+        clientId: this.dailyClientId,
+        playerName: this.playerName,
+      });
+      const res = await fetch(`/api/daily?${qs.toString()}`, {
+        cache: 'no-store',
+      });
+      if (res.ok) {
+        this.dailyData = await res.json();
+        this.updateHomeDailyBadge();
+        this.renderDailyScreen();
+      }
+    } catch {
+      // ignore transient network errors
+    }
   }
 
   private renderDailyScreen() {
@@ -3922,6 +3942,7 @@ class MazingContestClient {
           dailyClientId: this.dailyClientId,
           playerName: this.playerName,
         });
+        void this.refreshDailyFromApi();
       });
 
     document
