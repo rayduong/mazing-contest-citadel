@@ -4345,7 +4345,7 @@ body[data-mode='DAILY'] #round-dropdown .popover-divider {
   border: 1.5px solid var(--border-tint-sky);
   background: rgba(252, 249, 242, 0.96);
   box-shadow: var(--shadow-soft);
-  max-width: min(92vw, 520px);
+  width: min(92vw, 480px);
   pointer-events: none;
   animation: planningPopIn 0.22s ease-out;
 }
@@ -4456,6 +4456,10 @@ body[data-mode='DAILY'] #round-dropdown .popover-divider {
 }
 
 .home-name-box {
+  min-height: 40px;
+}
+
+.home-name-box input {
   height: 36px;
 }
 
@@ -4694,11 +4698,16 @@ body[data-mode='DAILY'] #round-dropdown .popover-divider {
   width: 100%;
 }
 
-/* Online Host Pane Override (Always Expanded in Play Online Screen) */
+/* Online Host Pane Spacing */
 #screen-online .match-config-pane {
-  display: flex;
-  flex-direction: column;
   gap: 12px;
+}
+
+#screen-online .config-actions-row {
+  position: static;
+  grid-template-columns: 1fr;
+  background: transparent;
+  padding: 8px 0 2px;
 }
 
 .lobby-phase-dot.waiting {
@@ -4733,7 +4742,10 @@ body[data-mode='DAILY'] #round-dropdown .popover-divider {
 
 .lobby-code-pill {
   font-size: 13px;
-  padding: 4px 10px;
+  min-height: 36px;
+  padding: 6px 12px;
+  display: inline-flex;
+  align-items: center;
 }
 
 .lobby-wait-sub {
@@ -5448,13 +5460,17 @@ body[data-in-menu='true'] #toast-container {
 }
 
 .settings-name-input {
-  width: 150px;
+  flex: 0 0 auto;
+  width: 170px;
+  min-width: 140px;
 }
 
 .settings-toggle-btn {
   min-width: 74px;
+  min-height: 38px;
   justify-content: center;
   font-weight: 700;
+  flex-shrink: 0;
 }
 
 .settings-toggle-btn.active {
@@ -5466,11 +5482,13 @@ body[data-in-menu='true'] #toast-container {
 .volume-control-wrap {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
 .volume-control-wrap input[type='range'] {
-  width: 120px;
+  width: 130px;
+  height: 36px;
   accent-color: var(--accent-gold);
   cursor: pointer;
 }
@@ -5518,6 +5536,14 @@ body[data-in-menu='true'] #toast-container {
 
 /* Responsive Adjustments for New Multi-Screen Flows */
 @media (max-width: 860px) {
+  #screen-online .hub-play-grid[data-mobile-pane='rooms'] .match-config-pane {
+    display: none;
+  }
+
+  #screen-online .hub-play-grid[data-mobile-pane='setup'] .lobby-browser-pane {
+    display: none;
+  }
+
   .lobby-wait-grid,
   .daily-layout-grid,
   .settings-grid,
@@ -5550,6 +5576,39 @@ body[data-in-menu='true'] #toast-container {
 
   .planning-countdown-num {
     font-size: 22px;
+  }
+}
+
+@media (max-width: 600px) {
+  .settings-row:has(.settings-name-input),
+  .settings-row.volume-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .settings-name-input {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .volume-control-wrap {
+    width: 100%;
+  }
+
+  .volume-control-wrap input[type='range'] {
+    flex: 1;
+    width: auto;
+  }
+
+  /* Keep bottom Ready/Start button text unclipped on compact widths regardless of pointer type */
+  .dock-ready-btn .ready-kbd {
+    display: none !important;
+  }
+
+  .hud-bottom-dock .dock-ready-btn {
+    min-width: 72px;
+    padding: 0 12px;
   }
 }
 

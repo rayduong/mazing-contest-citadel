@@ -3553,7 +3553,7 @@ class MazingContestClient {
 
     if (readyBtn && readyLabel && me) {
       readyBtn.classList.toggle('is-ready', me.ready);
-      readyLabel.textContent = me.ready ? 'Ready ✓' : 'Ready Up';
+      readyLabel.textContent = me.ready ? 'Ready' : 'Ready Up';
     }
 
     if (startBtn && startLabel) {
