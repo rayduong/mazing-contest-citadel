@@ -220,11 +220,19 @@ body[data-input='touch'] .desktop-only-hint {
   display: none !important;
 }
 
+body[data-input='touch'] .control-kv kbd {
+  display: inline-block !important;
+}
+
 @media (hover: none), (pointer: coarse) {
   kbd,
   .desktop-only-tool,
   .desktop-only-hint {
     display: none !important;
+  }
+
+  .control-kv kbd {
+    display: inline-block !important;
   }
 }
 
@@ -521,12 +529,13 @@ input:disabled,
   transform: translateX(-50%);
   z-index: 19;
   pointer-events: auto;
-  max-width: min(580px, calc(100vw - 20px));
+  width: min(540px, calc(100vw - 24px));
   min-height: 40px;
   padding: 7px 10px 7px 14px;
   border-radius: 16px;
-  display: inline-flex;
+  display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
   font-size: var(--text-xs);
   font-weight: 600;
@@ -1512,7 +1521,7 @@ input:disabled,
   left: 50%;
   transform: translateX(-50%);
   z-index: 24;
-  width: min(352px, calc(100vw - 12px));
+  width: min(376px, calc(100vw - 12px));
   padding: 4px;
   border-radius: 999px;
   display: flex;
@@ -3322,7 +3331,13 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 
 body[data-brief-visible='true'] .toast-container,
 body:has(#round-brief-banner:not(.hidden)) .toast-container {
-  top: calc(var(--safe-top) + 118px);
+  top: calc(var(--safe-top) + 132px);
+}
+
+body[data-phase='PLANNING'] .toast-container,
+body:has(#planning-banner:not(.hidden)) .toast-container {
+  top: auto;
+  bottom: calc(var(--safe-bottom) + 26px);
 }
 
 .toast-msg {
@@ -4033,7 +4048,9 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
   }
 
   #btn-round-picker {
-    padding: 0 2px;
+    padding: 0 5px;
+    min-width: 34px;
+    gap: 0;
   }
 
   .time-chip {
@@ -4073,8 +4090,22 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
 
   .hud-bottom-dock .dock-ready-btn.armed-confirm > .icon-slot,
   .hud-bottom-dock .dock-ready-btn[data-armed='true'] > .icon-slot,
-  .touch-confirm-btn > .icon-slot:first-child {
+  .touch-confirm-btn > .icon-slot:first-child,
+  .touch-confirm-btn > svg:first-child {
     display: none;
+  }
+
+  .touch-nudge-btn,
+  .touch-cancel-btn {
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    min-height: 40px;
+  }
+
+  .touch-confirm-btn {
+    min-height: 40px;
+    padding: 0 10px;
   }
 }
 
@@ -4281,11 +4312,11 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
 
 /* Narrow & Notched Landscape Safety (<= 780px, e.g. 740x360 Notched & 667x375) */
 @media (max-width: 780px) and (max-height: 500px) and (orientation: landscape) {
-  .hub-brand > div {
+  .hub-header .hub-brand > div {
     display: none;
   }
 
-  .hub-emblem {
+  .hub-header .hub-emblem {
     display: grid !important;
     width: 36px;
     height: 36px;
@@ -4314,6 +4345,8 @@ body[data-in-menu='true'] #lobby-drawer {
 
 /* Distraction-free Daily Maze HUD (hides multiplayer-only & reroll/sample controls) */
 body[data-mode='DAILY'] #btn-camera-overview,
+body[data-mode='DAILY'] #btn-run-overview-toggle,
+body[data-mode='DAILY'] #hud-run-dock .pill-divider,
 body[data-mode='DAILY'] #standings-wrap,
 body[data-mode='DAILY'] #btn-toggle-lobby,
 body[data-mode='DAILY'] #btn-reroll-map,
@@ -5535,6 +5568,23 @@ body[data-in-menu='true'] #toast-container {
 }
 
 /* Responsive Adjustments for New Multi-Screen Flows */
+.daily-layout-grid > *,
+.lobby-wait-grid > *,
+.settings-grid > *,
+.htp-diagram-card > *,
+.daily-challenge-card,
+.daily-leaderboard-card,
+.daily-table-wrap,
+.lobby-players-pane,
+.lobby-side-pane,
+.lobby-rules-card,
+.lobby-chat-card,
+.settings-card,
+.solo-setup-card {
+  min-width: 0;
+  max-width: 100%;
+}
+
 @media (max-width: 860px) {
   #screen-online .hub-play-grid[data-mobile-pane='rooms'] .match-config-pane {
     display: none;
@@ -5555,8 +5605,30 @@ body[data-in-menu='true'] #toast-container {
     grid-template-columns: 1fr;
   }
 
+  /* Avoid nested scroll traps on mobile: let .menu-screen scroll smoothly as one feed */
+  .daily-table-wrap,
+  .htp-scroll-body,
+  .settings-grid,
+  #screen-online .hub-play-grid,
+  #screen-online .lobby-browser-pane,
+  #screen-online .match-config-pane,
+  #screen-leaderboard .lb-list {
+    overflow: visible;
+    max-height: none;
+    flex: 0 0 auto;
+  }
+
   .daily-result-hero {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .daily-result-stat {
+    padding: 8px 6px;
+  }
+
+  .daily-result-stat strong {
+    font-size: 14px;
   }
 
   .menu-screen {
@@ -5579,7 +5651,230 @@ body[data-in-menu='true'] #toast-container {
   }
 }
 
+@media (max-width: 768px) {
+  /* Full-bleed safe-area mobile shell across ALL menu screens */
+  #home-hub-modal[data-screen] .hub-shell {
+    width: 100%;
+    height: var(--vvh, 100dvh);
+    max-height: none;
+    border-radius: 0;
+    border: none;
+  }
+
+  .menu-screen {
+    padding: calc(var(--safe-top) + 12px) calc(var(--safe-right) + 14px)
+      calc(var(--safe-bottom) + 18px) calc(var(--safe-left) + 14px);
+    gap: 12px;
+    overflow-x: hidden;
+  }
+
+  /* Restore 2-line mobile Daily Leaderboard rows (prevents 442px horizontal overflow) */
+  .daily-lb-head {
+    display: none;
+  }
+
+  .daily-lb-row {
+    grid-template-columns: 36px minmax(0, 1fr) auto;
+    row-gap: 4px;
+    column-gap: 8px;
+    padding: 10px 11px;
+  }
+
+  .daily-lb-row .lb-synergies {
+    grid-column: 2 / -1;
+    font-size: var(--text-2xs);
+    color: var(--text-muted);
+  }
+
+  .daily-table-wrap {
+    overflow-x: hidden;
+  }
+
+  .daily-challenge-card,
+  .daily-leaderboard-card {
+    padding: 13px;
+    gap: 10px;
+  }
+
+  /* Daily mode hides multiplayer controls so give Round label & Est/Par full room */
+  body[data-mode='DAILY'] #est-time-value {
+    max-width: none;
+  }
+
+  body[data-mode='DAILY'] #btn-round-picker {
+    flex-shrink: 0;
+    overflow: visible;
+    padding: 0 6px;
+  }
+
+  /* Keep in-game mobile toasts cleanly above bottom dock instead of covering banners */
+  body[data-in-menu='false'] .toast-container {
+    top: auto !important;
+    bottom: calc(var(--safe-bottom) + 84px);
+  }
+
+  body[data-in-menu='false']:has(#touch-precision-tray:not(.hidden)) .toast-container {
+    top: auto !important;
+    bottom: calc(var(--safe-bottom) + 144px);
+  }
+
+  .round-brief-banner {
+    padding: 6px 8px 6px 12px;
+    gap: 8px;
+  }
+
+  .brief-hint-line {
+    font-size: 11px;
+    line-height: 1.32;
+  }
+}
+
 @media (max-width: 600px) {
+  /* Compact Home Screen density so all 5 options + footer fit cleanly on 360x740 phones */
+  .home-brand-top {
+    gap: 8px;
+  }
+
+  .home-title-lg {
+    font-size: 20px;
+  }
+
+  .home-name-box {
+    min-height: 36px;
+  }
+
+  .home-name-box input {
+    height: 32px;
+  }
+
+  .home-menu-stack {
+    gap: 7px;
+  }
+
+  .home-option-card {
+    padding: 10px 12px;
+    gap: 11px;
+    border-radius: 13px;
+  }
+
+  .home-option-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 10px;
+  }
+
+  .home-option-body strong {
+    font-size: 14px;
+  }
+
+  .home-option-body > span:last-child {
+    font-size: 11.5px;
+    line-height: 1.3;
+  }
+
+  .home-active-match-bar {
+    padding: 9px 11px;
+    gap: 8px;
+  }
+
+  .home-active-match-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 8px;
+  }
+
+  .home-resume-cta,
+  .home-leave-cta {
+    justify-content: center;
+    height: 38px;
+  }
+
+  .home-footer-bar {
+    gap: 8px;
+  }
+
+  .home-footer-bar > button {
+    flex: 1;
+    justify-content: center;
+    padding: 0 10px;
+    font-size: 12px;
+  }
+
+  /* Subscreen Header Compactness */
+  .subscreen-header {
+    gap: 10px;
+    padding-bottom: 10px;
+  }
+
+  .subscreen-title-group {
+    min-width: 0;
+  }
+
+  #screen-daily .subscreen-title-group {
+    flex: 1 1 180px;
+    min-width: 170px;
+  }
+
+  .subscreen-title-group h2 {
+    font-size: 18px;
+  }
+
+  /* Solo Play CTA full-width on phones */
+  .solo-setup-card {
+    padding: 13px;
+    gap: 12px;
+  }
+
+  .solo-start-cta {
+    width: 100%;
+    min-width: 0;
+    height: 46px;
+  }
+
+  /* Waiting Lobby compact ergonomics & zero button truncation */
+  .lobby-wait-header {
+    gap: 8px;
+    padding-bottom: 10px;
+  }
+
+  .lobby-wait-title-row h2 {
+    font-size: 18px;
+  }
+
+  .lobby-wait-header-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .lobby-wait-header-actions > button {
+    justify-content: center;
+  }
+
+  .lobby-slot-card {
+    padding: 8px 10px;
+  }
+
+  .lobby-slot-card.empty {
+    padding: 6px 10px;
+  }
+
+  .lobby-ready-buttons {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .lobby-ready-toggle-btn,
+  .lobby-start-btn {
+    min-width: 0;
+    padding: 0 10px;
+    font-size: 13px;
+  }
+
+  /* Settings inputs & volume */
   .settings-row:has(.settings-name-input),
   .settings-row.volume-row {
     flex-direction: column;
@@ -5609,6 +5904,81 @@ body[data-in-menu='true'] #toast-container {
   .hud-bottom-dock .dock-ready-btn {
     min-width: 72px;
     padding: 0 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .config-inline-split {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .config-inline-split .segmented-control {
+    width: 100%;
+  }
+}
+
+/* Mobile Landscape Full-Bleed Multi-Screen Layout */
+@media (max-height: 500px) and (orientation: landscape) {
+  #home-hub-modal[data-screen] .hub-shell {
+    width: 100%;
+    height: var(--vvh, 100dvh);
+    max-height: none;
+    border-radius: 0;
+    border: none;
+  }
+
+  .menu-screen {
+    padding: calc(var(--safe-top) + 8px) calc(var(--safe-right) + 16px)
+      calc(var(--safe-bottom) + 10px) calc(var(--safe-left) + 16px);
+    gap: 10px;
+  }
+
+  .home-brand-top .hub-brand > div {
+    display: block;
+  }
+
+  .home-title-lg {
+    font-size: 18px;
+  }
+
+  .home-menu-stack {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .home-option-card {
+    padding: 9px 11px;
+    gap: 10px;
+  }
+
+  .home-option-card.featured-daily {
+    grid-column: 1 / -1;
+  }
+
+  .home-option-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .planning-banner {
+    top: calc(var(--safe-top) + 52px);
+    padding: 6px 12px 6px 9px;
+    width: min(86vw, 440px);
+  }
+
+  /* Landscape in-game toasts stay clear of top brief banner & bottom-left dock */
+  body[data-in-menu='false'] .toast-container {
+    top: auto !important;
+    left: auto;
+    right: calc(var(--safe-right) + 14px);
+    bottom: calc(var(--safe-bottom) + 16px);
+    transform: none;
+    width: auto;
+    max-width: min(50vw, 340px);
+    align-items: flex-end;
   }
 }
 

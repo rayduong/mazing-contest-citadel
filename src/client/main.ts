@@ -733,13 +733,12 @@ class MazingContestClient {
           this.showToast(joinToast, true);
         }
 
+        this.applyRoomState(msg.state);
         if (msg.state.phase === 'LOBBY') {
           this.openMenuScreen('lobby');
         } else {
           this.closeHub();
         }
-
-        this.applyRoomState(msg.state);
         this.syncConfigFormFromSettings(msg.state.settings);
       } else if (msg.type === 'ROOM_STATE') {
         this.roomCode = msg.state.roomCode;
@@ -1151,8 +1150,8 @@ class MazingContestClient {
       return;
     }
 
-    // Leaving LOBBY into PLANNING/BUILD/RUN -> enter the 3D arena immediately
-    if (prevPhase === 'LOBBY' && this.isHubOpen()) {
+    // Entering an active match from Home/no-room or leaving LOBBY -> enter the 3D arena immediately
+    if ((!prevPhase || prevPhase === 'LOBBY') && this.isHubOpen()) {
       this.closeHub();
     }
 
@@ -2420,6 +2419,7 @@ class MazingContestClient {
     const wasHidden = tray.classList.contains('hidden');
     tray.classList.remove('hidden');
     if (wasHidden) {
+      this.dismissRoundBrief();
       this.scheduleHudSafeInsetsSync();
     }
 
@@ -2442,7 +2442,7 @@ class MazingContestClient {
       const dt = info.deltaTime;
       const dOver = info.deltaOvercharge ?? 0;
       const dtPart =
-        typeof dt === 'number' ? ` · ${dt >= 0 ? '+' : ''}${dt.toFixed(1)}s` : '';
+        typeof dt === 'number' ? ` ${dt >= 0 ? '+' : ''}${dt.toFixed(1)}s` : '';
       const overLoss =
         dOver < 0
           ? `<span class="overcharge-pips">${dOver}${icon(
@@ -2480,7 +2480,7 @@ class MazingContestClient {
       btnHtml = `${icon(
         'pillar',
         15
-      )}<span id="touch-confirm-label">Place · ${sign}${dt.toFixed(
+      )}<span id="touch-confirm-label">Place ${sign}${dt.toFixed(
         1
       )}s</span>${overBadge}`;
     } else {
@@ -3582,7 +3582,7 @@ class MazingContestClient {
         startBtn.disabled = !allHumansReady;
         startLabel.textContent = allHumansReady
           ? 'Start Round'
-          : `Waiting for Ready (${readyHumans}/${connectedHumans.length})`;
+          : `Ready (${readyHumans}/${connectedHumans.length})`;
       } else {
         startBtn.classList.add('hidden');
       }
@@ -4587,6 +4587,8 @@ class MazingContestClient {
       const willOpen = dockToolsPopover.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
+        this.renderer3d.cancelTouchGhost();
+        this.hideTouchPrecisionTray();
         dockToolsPopover.classList.remove('hidden');
         dockToolsBtn.classList.add('active');
         dockToolsBtn.setAttribute('aria-expanded', 'true');
@@ -4602,6 +4604,7 @@ class MazingContestClient {
       const willOpen = standingsDropdown.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
+        this.dismissRoundBrief();
         standingsDropdown.classList.remove('hidden');
         standingsBtn.classList.add('active');
         standingsBtn.setAttribute('aria-expanded', 'true');
@@ -4632,6 +4635,7 @@ class MazingContestClient {
       const willOpen = lobbyDrawer.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
+        this.dismissRoundBrief();
         lobbyDrawer.classList.remove('hidden');
         lobbyToggleBtn.classList.add('active');
         lobbyToggleBtn.setAttribute('aria-expanded', 'true');
