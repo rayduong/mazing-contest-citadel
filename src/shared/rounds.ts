@@ -809,3 +809,75 @@ export function generateRandomRoundLayout(
 
   return round;
 }
+
+export const DAILY_BUILD_TIME_SECONDS = 120;
+const DAILY_EPOCH_UTC_MS = Date.UTC(2026, 10, 1); // 2026-11-01 UTC -> Daily #1
+
+export function getDailyDateKeyUtc(nowMs: number = Date.now()): string {
+  const d = new Date(nowMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+export function getDailyPuzzleNumber(dateKey: string): number {
+  const [yStr, mStr, dStr] = dateKey.split('-');
+  const y = Number(yStr) || 2026;
+  const m = (Number(mStr) || 11) - 1;
+  const d = Number(dStr) || 1;
+  const dayStartMs = Date.UTC(y, m, d);
+  const diffDays = Math.floor((dayStartMs - DAILY_EPOCH_UTC_MS) / 86_400_000);
+  return Math.max(1, diffDays + 1);
+}
+
+export function getNextDailyResetUtcMs(nowMs: number = Date.now()): number {
+  const d = new Date(nowMs);
+  return Date.UTC(
+    d.getUTCFullYear(),
+    d.getUTCMonth(),
+    d.getUTCDate() + 1,
+    0,
+    0,
+    0,
+    0
+  );
+}
+
+export function hashStringToSeed(input: string): number {
+  let hash = 2166136261 >>> 0;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash === 0 ? 1 : hash;
+}
+
+/**
+ * Generates today's global deterministic Daily Maze so every player worldwide
+ * competes on the exact same map layout, runner, wall supply, and 120s build timer.
+ */
+export function generateDailyRoundConfig(dateKey?: string): {
+  dateKey: string;
+  puzzleNumber: number;
+  roundConfig: RoundConfig;
+} {
+  const resolvedKey = dateKey || getDailyDateKeyUtc();
+  const puzzleNumber = getDailyPuzzleNumber(resolvedKey);
+  const seed = hashStringToSeed(`mazing-daily-v1:${resolvedKey}`);
+  // Curated pool of rich mid-to-late templates (R2..R8) for engaging daily puzzles
+  const pool = ROUNDS.slice(1);
+  const templateIndex = (puzzleNumber - 1 + (seed % pool.length)) % pool.length;
+  const baseTemplate = pool[templateIndex] || ROUNDS[2];
+
+  const generated = generateRandomRoundLayout(baseTemplate, seed);
+  generated.roundNumber = 1;
+  generated.buildTimeSeconds = DAILY_BUILD_TIME_SECONDS;
+  generated.title = `Daily #${puzzleNumber} · ${baseTemplate.title}`;
+
+  return {
+    dateKey: resolvedKey,
+    puzzleNumber,
+    roundConfig: generated,
+  };
+}

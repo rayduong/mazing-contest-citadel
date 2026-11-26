@@ -33,7 +33,13 @@
     />
     <link rel="stylesheet" href="/src/client/style.css" />
   </head>
-  <body data-phase="BUILD" data-input="mouse" data-spectating="false">
+  <body
+    data-phase="LOBBY"
+    data-input="mouse"
+    data-spectating="false"
+    data-in-menu="true"
+    data-mode="ONLINE"
+  >
     <!-- 3D WebGL Diorama Viewport -->
     <div id="viewport-container"></div>
     <!-- 3D Projected World Labels -->
@@ -50,6 +56,27 @@
       aria-live="polite"
     >
       Reconnecting…
+    </div>
+
+    <!-- Non-Blocking 5-Second Route Planning Countdown Banner -->
+    <div
+      id="planning-banner"
+      class="planning-banner surface-panel hidden"
+      role="status"
+      aria-live="assertive"
+    >
+      <div class="planning-badge-ring">
+        <span id="planning-countdown-num" class="planning-countdown-num">5</span>
+      </div>
+      <div class="planning-copy">
+        <div class="planning-kicker">PLAN YOUR ROUTE</div>
+        <div id="planning-round-line" class="planning-round-line">
+          Round 1 · Meadow Gate · Building unlocks in 5s
+        </div>
+        <div id="planning-hint-line" class="planning-hint-line">
+          Check the Spires, Red Keeps, and path before placing your first wall.
+        </div>
+      </div>
     </div>
 
     <!-- Non-Blocking Round Strategy Brief Banner -->
@@ -696,6 +723,7 @@
           id="results-record-callout"
           class="results-record-callout hidden"
         ></div>
+        <div id="results-daily-panel" class="results-daily-panel hidden"></div>
         <div id="results-table" class="results-table"></div>
 
         <div class="modal-actions results-actions">
@@ -711,6 +739,26 @@
             ></span>
             <span>Leaderboard</span>
           </button>
+          <button
+            type="button"
+            id="btn-results-share-daily"
+            class="hub-secondary-btn hidden"
+          >
+            <span
+              class="icon-slot"
+              data-icon="share"
+              data-icon-size="15"
+            ></span>
+            <span>Share Result</span>
+          </button>
+          <button
+            type="button"
+            id="btn-results-home"
+            class="dock-ready-btn hidden"
+          >
+            <span class="icon-slot" data-icon="hub" data-icon-size="15"></span>
+            <span>Back to Home</span>
+          </button>
           <button type="button" id="btn-next-round" class="dock-ready-btn">
             <span id="next-round-label">Next Round</span>
             <span
@@ -723,103 +771,240 @@
       </div>
     </div>
 
-    <!-- MAZING CONTEST HOME HUB (Calm Sunlit 940px 1-Row Header Overlay) -->
+    <!-- MAZING CONTEST MULTI-SCREEN MENU & LOBBY OVERLAY -->
     <div
       id="home-hub-modal"
       class="hub-backdrop"
+      data-screen="home"
       role="dialog"
       aria-modal="true"
       aria-label="Mazing Contest Main Menu"
     >
       <div class="hub-shell surface-panel">
-        <!-- Single-Row Header Bar -->
-        <header class="hub-header">
-          <div class="hub-brand">
-            <div class="hub-emblem">
-              <span class="icon-slot" data-icon="hub" data-icon-size="22"></span>
-            </div>
-            <div>
-              <h1 class="hub-title">Mazing Contest</h1>
-              <p class="hub-subtitle hub-brand-sub">
-                Sunlit Maze Strategy
-              </p>
+        <!-- ============================================================
+             SCREEN 1: SIMPLIFIED HOME SCREEN (5 CLEAN OPTIONS)
+             ============================================================ -->
+        <section id="screen-home" class="menu-screen">
+          <div class="home-brand-hero">
+            <div class="home-brand-top">
+              <div class="hub-brand">
+                <div class="hub-emblem home-emblem-lg">
+                  <span
+                    class="icon-slot"
+                    data-icon="hub"
+                    data-icon-size="26"
+                  ></span>
+                </div>
+                <div>
+                  <h1 class="hub-title home-title-lg">Mazing Contest</h1>
+                  <p class="hub-subtitle">
+                    Build walls. Slow the runner. Outlast everyone.
+                  </p>
+                </div>
+              </div>
+
+              <div class="hub-name-box home-name-box" title="Your Display Name">
+                <span
+                  class="icon-slot hub-name-icon"
+                  data-icon="user"
+                  data-icon-size="14"
+                ></span>
+                <input
+                  id="hub-player-name-input"
+                  type="text"
+                  maxlength="18"
+                  placeholder="Your Name"
+                  aria-label="Your Name"
+                  autocomplete="nickname"
+                  autocorrect="off"
+                  spellcheck="false"
+                  enterkeyhint="done"
+                />
+              </div>
             </div>
           </div>
 
-          <nav class="hub-nav-tabs" role="tablist" aria-label="Main Navigation">
+          <!-- Contextual Active Match Bar (Only visible when opened mid-match) -->
+          <div id="home-active-match-bar" class="home-active-match-bar hidden">
+            <div class="home-active-match-info">
+              <span class="status-dot"></span>
+              <span id="home-active-match-text">Match in progress</span>
+            </div>
+            <div class="home-active-match-actions">
+              <button
+                type="button"
+                id="btn-home-resume"
+                class="dock-ready-btn home-resume-cta"
+              >
+                <span
+                  class="icon-slot"
+                  data-icon="play"
+                  data-icon-size="14"
+                ></span>
+                <span>Resume</span>
+              </button>
+              <button
+                type="button"
+                id="btn-home-leave"
+                class="hub-secondary-btn home-leave-cta"
+                title="Leave current room"
+              >
+                <span
+                  class="icon-slot"
+                  data-icon="logout"
+                  data-icon-size="14"
+                ></span>
+                <span>Leave</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- 5 Clean Primary Menu Options -->
+          <nav class="home-menu-stack" aria-label="Main Menu Options">
             <button
               type="button"
-              role="tab"
-              aria-selected="true"
-              class="hub-tab-btn active"
-              data-hub-tab="play"
+              id="btn-menu-solo"
+              class="home-option-card"
+              data-nav="solo-setup"
             >
+              <span class="home-option-icon tone-sage">
+                <span
+                  class="icon-slot"
+                  data-icon="user"
+                  data-icon-size="20"
+                ></span>
+              </span>
+              <span class="home-option-body">
+                <strong>Solo Play</strong>
+                <span>Pick your settings and build against AI bots</span>
+              </span>
               <span
-                class="icon-slot"
-                data-icon="swords"
-                data-icon-size="15"
+                class="icon-slot home-option-arrow"
+                data-icon="arrowRight"
+                data-icon-size="16"
               ></span>
-              <span>Play</span>
             </button>
+
             <button
               type="button"
-              role="tab"
-              aria-selected="false"
-              class="hub-tab-btn"
-              data-hub-tab="leaderboard"
+              id="btn-menu-online"
+              class="home-option-card"
+              data-nav="online"
+            >
+              <span class="home-option-icon tone-sky">
+                <span
+                  class="icon-slot"
+                  data-icon="globe"
+                  data-icon-size="20"
+                ></span>
+              </span>
+              <span class="home-option-body">
+                <strong>Play Online</strong>
+                <span>Host a lobby with friends or join open rooms</span>
+              </span>
+              <span
+                class="icon-slot home-option-arrow"
+                data-icon="arrowRight"
+                data-icon-size="16"
+              ></span>
+            </button>
+
+            <button
+              type="button"
+              id="btn-menu-daily"
+              class="home-option-card featured-daily"
+              data-nav="daily"
+            >
+              <span class="home-option-icon tone-gold">
+                <span
+                  class="icon-slot"
+                  data-icon="calendar"
+                  data-icon-size="20"
+                ></span>
+              </span>
+              <span class="home-option-body">
+                <span class="home-option-title-row">
+                  <strong>Daily Maze</strong>
+                  <span id="home-daily-badge" class="meta-pill daily-pill-badge">
+                    Daily Challenge
+                  </span>
+                </span>
+                <span>One global maze · 120s build · 1 try per day</span>
+              </span>
+              <span
+                class="icon-slot home-option-arrow"
+                data-icon="arrowRight"
+                data-icon-size="16"
+              ></span>
+            </button>
+
+            <button
+              type="button"
+              id="btn-menu-how-to-play"
+              class="home-option-card"
+              data-nav="how-to-play"
+            >
+              <span class="home-option-icon tone-neutral">
+                <span
+                  class="icon-slot"
+                  data-icon="book"
+                  data-icon-size="20"
+                ></span>
+              </span>
+              <span class="home-option-body">
+                <strong>How to Play</strong>
+                <span>Beginner-friendly guide with simple examples</span>
+              </span>
+              <span
+                class="icon-slot home-option-arrow"
+                data-icon="arrowRight"
+                data-icon-size="16"
+              ></span>
+            </button>
+
+            <button
+              type="button"
+              id="btn-menu-settings"
+              class="home-option-card"
+              data-nav="settings"
+            >
+              <span class="home-option-icon tone-neutral">
+                <span
+                  class="icon-slot"
+                  data-icon="sliders"
+                  data-icon-size="20"
+                ></span>
+              </span>
+              <span class="home-option-body">
+                <strong>Settings &amp; Controls</strong>
+                <span>Audio, volume, preferences, and keybindings</span>
+              </span>
+              <span
+                class="icon-slot home-option-arrow"
+                data-icon="arrowRight"
+                data-icon-size="16"
+              ></span>
+            </button>
+          </nav>
+
+          <footer class="home-footer-bar">
+            <button
+              type="button"
+              id="btn-menu-leaderboard"
+              class="mini-action-btn"
+              data-nav="leaderboard"
             >
               <span
                 class="icon-slot"
                 data-icon="trophy"
-                data-icon-size="15"
-              ></span>
-              <span>Leaderboard</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected="false"
-              class="hub-tab-btn"
-              data-hub-tab="codex"
-            >
-              <span
-                class="icon-slot"
-                data-icon="book"
-                data-icon-size="15"
-              ></span>
-              <span>How to Play</span>
-            </button>
-          </nav>
-
-          <div class="hub-profile-cluster">
-            <div class="hub-name-box" title="Your Name">
-              <span
-                class="icon-slot hub-name-icon"
-                data-icon="user"
                 data-icon-size="14"
               ></span>
-              <input
-                id="hub-player-name-input"
-                type="text"
-                maxlength="18"
-                placeholder="Your Name"
-                aria-label="Your Name"
-                autocomplete="nickname"
-                autocorrect="off"
-                spellcheck="false"
-                enterkeyhint="done"
-              />
-            </div>
-            <span
-              id="hub-active-room-badge"
-              class="room-code-badge hub-header-room-badge"
-            >
-              ARENA1
-            </span>
+              <span>All-Time Leaderboard</span>
+            </button>
             <button
               type="button"
               id="btn-hub-mute"
-              class="icon-circle-btn hub-mute-btn"
+              class="mini-action-btn"
               title="Toggle Audio (M)"
               aria-label="Toggle Audio"
             >
@@ -827,71 +1012,186 @@
                 id="hub-mute-icon-slot"
                 class="icon-slot"
                 data-icon="volumeOn"
-                data-icon-size="17"
+                data-icon-size="15"
               ></span>
+              <span id="hub-mute-label">Sound On</span>
             </button>
+          </footer>
+        </section>
+
+        <!-- ============================================================
+             SCREEN 2: SOLO PLAY SETUP
+             ============================================================ -->
+        <section id="screen-solo-setup" class="menu-screen hidden">
+          <header class="subscreen-header">
             <button
               type="button"
-              id="btn-close-hub"
-              class="hub-secondary-btn hub-resume-btn"
-              title="Enter Island (Esc)"
-              aria-label="Enter Island"
+              class="mini-action-btn screen-back-btn"
+              data-nav="home"
             >
               <span
                 class="icon-slot"
-                data-icon="play"
-                data-icon-size="13"
+                data-icon="arrowLeft"
+                data-icon-size="14"
               ></span>
-              <span class="resume-btn-text">Enter Island</span>
+              <span>Home</span>
             </button>
-          </div>
-        </header>
+            <div class="subscreen-title-group">
+              <h2>Solo Play</h2>
+              <p>Choose your match rules and jump straight into Round 1.</p>
+            </div>
+          </header>
 
-        <!-- TAB 1: PLAY (Hero Play Strip + Open Rooms & Collapsible Room Rules) -->
-        <section id="hub-tab-play" class="hub-tab-body">
-          <!-- Hero Play Strip (Fast 1-Click Entry, Scoped Inside Play Tab Only) -->
-          <div class="hub-hero-strip">
-            <div class="hub-hero-copy">
-              <p class="hub-hero-tagline">
-                Build stone mazes. Slow the runner. Outlast rivals.
-              </p>
-              <div id="hub-hero-status" class="hub-hero-status">
-                <span class="status-dot"></span>
-                <span>Room <strong>ARENA1</strong> · Round 1/8 · Ready when you are</span>
+          <div class="solo-setup-card">
+            <div class="config-matrix">
+              <div class="config-row">
+                <label class="config-label">Rounds</label>
+                <div class="segmented-control" id="solo-rounds-group">
+                  <button type="button" class="seg-btn" data-val="3">
+                    3 Rounds
+                  </button>
+                  <button type="button" class="seg-btn" data-val="5">
+                    5 Rounds
+                  </button>
+                  <button type="button" class="seg-btn active" data-val="8">
+                    8 Rounds
+                  </button>
+                </div>
+              </div>
+
+              <div class="config-row">
+                <label class="config-label">Build Timer</label>
+                <div class="segmented-control" id="solo-buildtime-group">
+                  <button
+                    type="button"
+                    class="seg-btn active"
+                    data-val="0"
+                    title="Round default (90s to 120s)"
+                  >
+                    Default
+                  </button>
+                  <button type="button" class="seg-btn" data-val="45">
+                    45s
+                  </button>
+                  <button type="button" class="seg-btn" data-val="60">
+                    60s
+                  </button>
+                  <button type="button" class="seg-btn" data-val="120">
+                    120s
+                  </button>
+                  <button type="button" class="seg-btn" data-val="999">
+                    ∞
+                  </button>
+                </div>
+              </div>
+
+              <div class="config-row">
+                <label class="config-label">Wall Supply</label>
+                <div class="segmented-control" id="solo-gold-group">
+                  <button type="button" class="seg-btn" data-val="0.8">
+                    80%
+                  </button>
+                  <button type="button" class="seg-btn active" data-val="1">
+                    Normal
+                  </button>
+                  <button type="button" class="seg-btn" data-val="1.25">
+                    125%
+                  </button>
+                </div>
+              </div>
+
+              <div class="config-row">
+                <label class="config-label">AI Bots</label>
+                <div class="segmented-control" id="solo-botcount-group">
+                  <button type="button" class="seg-btn" data-val="0">0</button>
+                  <button type="button" class="seg-btn" data-val="1">1</button>
+                  <button type="button" class="seg-btn" data-val="2">2</button>
+                  <button type="button" class="seg-btn active" data-val="3">
+                    3
+                  </button>
+                  <button type="button" class="seg-btn" data-val="4">4</button>
+                  <button type="button" class="seg-btn" data-val="5">5</button>
+                </div>
+              </div>
+
+              <div class="config-row" id="solo-row-bot-skill">
+                <label class="config-label">Bot Skill</label>
+                <div class="segmented-control" id="solo-botdiff-group">
+                  <button type="button" class="seg-btn" data-val="NOVICE">
+                    Easy
+                  </button>
+                  <button
+                    type="button"
+                    class="seg-btn active"
+                    data-val="ARCHITECT"
+                  >
+                    Normal
+                  </button>
+                  <button type="button" class="seg-btn" data-val="GRANDMASTER">
+                    Hard
+                  </button>
+                </div>
+              </div>
+
+              <div class="config-row">
+                <label class="config-label">Rival Mazes</label>
+                <div class="segmented-control" id="solo-fog-group">
+                  <button type="button" class="seg-btn active" data-val="false">
+                    Visible
+                  </button>
+                  <button type="button" class="seg-btn" data-val="true">
+                    Hidden
+                  </button>
+                </div>
               </div>
             </div>
 
-            <div class="hub-hero-actions">
+            <div class="solo-setup-footer">
+              <p class="setup-note">
+                Every round begins with a <strong>5-second planning timer</strong> so you can check the map before building.
+              </p>
               <button
                 type="button"
-                id="btn-quick-solo"
-                class="hub-secondary-btn hero-solo-btn"
-                title="Start a fresh solo match against bots"
-              >
-                <span
-                  class="icon-slot"
-                  data-icon="user"
-                  data-icon-size="15"
-                ></span>
-                <span>Solo vs Bots</span>
-              </button>
-              <button
-                type="button"
-                id="btn-hero-play"
-                class="dock-ready-btn hero-play-btn"
-                title="Enter your sunlit island now"
+                id="btn-start-solo-match"
+                class="dock-ready-btn solo-start-cta"
               >
                 <span
                   class="icon-slot"
                   data-icon="play"
-                  data-icon-size="14"
+                  data-icon-size="15"
                 ></span>
-                <span>Play Now</span>
+                <span>Start Solo Match</span>
               </button>
             </div>
           </div>
+        </section>
 
-          <!-- Mobile Sub-Tab Switcher (Progressive Disclosure on <= 860px) -->
+        <!-- ============================================================
+             SCREEN 3: PLAY ONLINE (JOIN OPEN ROOMS OR HOST A LOBBY)
+             ============================================================ -->
+        <section id="screen-online" class="menu-screen hidden">
+          <header class="subscreen-header">
+            <button
+              type="button"
+              class="mini-action-btn screen-back-btn"
+              data-nav="home"
+            >
+              <span
+                class="icon-slot"
+                data-icon="arrowLeft"
+                data-icon-size="14"
+              ></span>
+              <span>Home</span>
+            </button>
+            <div class="subscreen-title-group">
+              <h2>Play Online</h2>
+              <p>
+                Join an existing room or configure rules to open a multiplayer lobby.
+              </p>
+            </div>
+          </header>
+
+          <!-- Mobile Sub-Tab Switcher -->
           <div class="hub-play-subtabs" id="hub-play-subtabs">
             <button
               type="button"
@@ -903,8 +1203,8 @@
                 data-icon="globe"
                 data-icon-size="14"
               ></span>
-              <span>Open Rooms</span>
-              <span id="mobile-lobby-count" class="subtab-count">1</span>
+              <span>Join Room</span>
+              <span id="mobile-lobby-count" class="subtab-count">0</span>
             </button>
             <button
               type="button"
@@ -913,41 +1213,31 @@
             >
               <span
                 class="icon-slot"
-                data-icon="sliders"
+                data-icon="plus"
                 data-icon-size="14"
               ></span>
-              <span>Room Rules</span>
+              <span>Host Lobby</span>
             </button>
           </div>
 
-          <div class="hub-play-grid" id="hub-play-grid" data-mobile-pane="rooms">
-            <!-- Left Pane: Open Rooms & Room Code Join -->
+          <div
+            class="hub-play-grid"
+            id="hub-play-grid"
+            data-mobile-pane="rooms"
+          >
+            <!-- Left Pane: Join by Code & Live Public Lobbies -->
             <div class="lobby-browser-pane" data-pane-id="rooms">
               <div class="pane-header">
                 <div class="pane-title-wrap">
-                  <h3>Open Rooms</h3>
-                  <span id="public-lobby-count" class="meta-pill">1 Open</span>
+                  <h3>Open Lobbies</h3>
+                  <span id="public-lobby-count" class="meta-pill">0 Open</span>
                 </div>
                 <div class="pane-header-actions">
                   <button
                     type="button"
-                    id="btn-hub-copy-invite"
-                    class="mini-action-btn"
-                    title="Copy or Share Room Invite Link"
-                  >
-                    <span
-                      class="icon-slot"
-                      data-icon="link"
-                      data-icon-size="14"
-                    ></span>
-                    <span>Invite Link</span>
-                  </button>
-                  <button
-                    type="button"
                     id="btn-refresh-lobbies"
                     class="mini-action-btn"
-                    title="Refresh Open Rooms"
-                    aria-label="Refresh Open Rooms"
+                    title="Refresh Open Lobbies"
                   >
                     <span
                       class="icon-slot"
@@ -964,7 +1254,7 @@
                   id="join-code-input"
                   type="text"
                   maxlength="8"
-                  placeholder="Enter room code"
+                  placeholder="Enter room code (e.g. RM4821)"
                   aria-label="Room Code"
                   autocapitalize="characters"
                   autocomplete="off"
@@ -984,89 +1274,376 @@
               <div id="lobby-browser-list" class="lobby-browser-list"></div>
             </div>
 
-            <!-- Right Pane: Room Rules (Calmly Collapsed on Cold Boot, 1-Click Expand) -->
+            <!-- Right Pane: Host a New Online Lobby -->
             <div class="match-config-pane" data-pane-id="setup">
-              <input
-                type="checkbox"
-                id="chk-expand-rules"
-                class="sr-only-check rules-expand-check"
-              />
-
               <div class="pane-header">
                 <div class="pane-title-wrap">
-                  <h3>Room Rules</h3>
+                  <h3>Host New Lobby</h3>
                 </div>
-                <div class="pane-header-actions">
-                  <label
-                    for="chk-expand-rules"
-                    class="mini-action-btn rules-collapse-toggle"
-                    title="Toggle custom rule options"
+              </div>
+
+              <div class="config-matrix">
+                <div class="config-row">
+                  <label class="config-label" for="cfg-room-name">
+                    Room Name
+                  </label>
+                  <div class="config-inline-split">
+                    <input
+                      id="cfg-room-name"
+                      class="cfg-text-input"
+                      type="text"
+                      maxlength="26"
+                      placeholder="My Mazing Lobby"
+                      autocomplete="off"
+                      autocorrect="off"
+                      spellcheck="false"
+                      enterkeyhint="done"
+                    />
+                    <div
+                      class="segmented-control"
+                      id="cfg-public-group"
+                      data-setting="isPublic"
+                    >
+                      <button
+                        type="button"
+                        class="seg-btn active"
+                        data-val="true"
+                      >
+                        Public
+                      </button>
+                      <button type="button" class="seg-btn" data-val="false">
+                        Private
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="config-row">
+                  <label class="config-label">Rounds</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-rounds-group"
+                    data-setting="totalRounds"
+                  >
+                    <button type="button" class="seg-btn" data-val="3">
+                      3 Rounds
+                    </button>
+                    <button type="button" class="seg-btn" data-val="5">
+                      5 Rounds
+                    </button>
+                    <button type="button" class="seg-btn active" data-val="8">
+                      8 Rounds
+                    </button>
+                  </div>
+                </div>
+
+                <div class="config-row">
+                  <label class="config-label">Build Timer</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-buildtime-group"
+                    data-setting="buildTimeSeconds"
+                  >
+                    <button
+                      type="button"
+                      class="seg-btn active"
+                      data-val="0"
+                      title="Round default (90s to 120s)"
+                    >
+                      Default
+                    </button>
+                    <button type="button" class="seg-btn" data-val="45">
+                      45s
+                    </button>
+                    <button type="button" class="seg-btn" data-val="60">
+                      60s
+                    </button>
+                    <button type="button" class="seg-btn" data-val="120">
+                      120s
+                    </button>
+                    <button type="button" class="seg-btn" data-val="999">
+                      ∞
+                    </button>
+                  </div>
+                </div>
+
+                <div class="config-row">
+                  <label class="config-label">Wall Supply</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-gold-group"
+                    data-setting="goldMultiplier"
+                  >
+                    <button type="button" class="seg-btn" data-val="0.8">
+                      80%
+                    </button>
+                    <button type="button" class="seg-btn active" data-val="1">
+                      Normal
+                    </button>
+                    <button type="button" class="seg-btn" data-val="1.25">
+                      125%
+                    </button>
+                  </div>
+                </div>
+
+                <div class="config-row">
+                  <label class="config-label">Bots</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-botcount-group"
+                    data-setting="botCount"
+                  >
+                    <button type="button" class="seg-btn active" data-val="0">
+                      0
+                    </button>
+                    <button type="button" class="seg-btn" data-val="1">
+                      1
+                    </button>
+                    <button type="button" class="seg-btn" data-val="2">
+                      2
+                    </button>
+                    <button type="button" class="seg-btn" data-val="3">
+                      3
+                    </button>
+                    <button type="button" class="seg-btn" data-val="4">
+                      4
+                    </button>
+                    <button type="button" class="seg-btn" data-val="5">
+                      5
+                    </button>
+                  </div>
+                </div>
+
+                <div class="config-row hidden" id="row-bot-skill">
+                  <label class="config-label">Bot Skill</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-botdiff-group"
+                    data-setting="botDifficulty"
+                  >
+                    <button type="button" class="seg-btn" data-val="NOVICE">
+                      Easy
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn active"
+                      data-val="ARCHITECT"
+                    >
+                      Normal
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      data-val="GRANDMASTER"
+                    >
+                      Hard
+                    </button>
+                  </div>
+                </div>
+
+                <div class="config-row">
+                  <label class="config-label">Rival Mazes</label>
+                  <div
+                    class="segmented-control"
+                    id="cfg-fog-group"
+                    data-setting="fogOfWar"
+                  >
+                    <button
+                      type="button"
+                      class="seg-btn active"
+                      data-val="false"
+                    >
+                      Visible
+                    </button>
+                    <button type="button" class="seg-btn" data-val="true">
+                      Hidden
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="config-actions-row">
+                <button
+                  type="button"
+                  id="btn-create-custom-room"
+                  class="dock-ready-btn full-width-cta"
+                >
+                  <span
+                    class="icon-slot"
+                    data-icon="plus"
+                    data-icon-size="15"
+                  ></span>
+                  <span>Create Lobby</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============================================================
+             SCREEN 4: MULTIPLAYER LOBBY WAITING ROOM
+             ============================================================ -->
+        <section id="screen-lobby" class="menu-screen hidden">
+          <header class="lobby-wait-header">
+            <div class="lobby-wait-title-col">
+              <div class="lobby-wait-title-row">
+                <h2 id="lobby-room-name">Multiplayer Lobby</h2>
+                <button
+                  type="button"
+                  id="lobby-room-code"
+                  class="room-code-badge clickable-code lobby-code-pill"
+                  title="Click to copy invite link"
+                >
+                  RM0000
+                </button>
+                <span id="lobby-visibility-badge" class="meta-pill">
+                  Public
+                </span>
+              </div>
+              <p class="lobby-wait-sub">
+                Share the room code with friends. Every player must click
+                <strong>Ready Up</strong> before the host can start the round.
+              </p>
+            </div>
+
+            <div class="lobby-wait-header-actions">
+              <button
+                type="button"
+                id="btn-lobby-copy-invite"
+                class="mini-action-btn"
+              >
+                <span
+                  class="icon-slot"
+                  data-icon="link"
+                  data-icon-size="14"
+                ></span>
+                <span>Invite Link</span>
+              </button>
+              <button
+                type="button"
+                id="btn-leave-lobby"
+                class="mini-action-btn danger-ghost-btn"
+              >
+                <span
+                  class="icon-slot"
+                  data-icon="logout"
+                  data-icon-size="14"
+                ></span>
+                <span>Leave Lobby</span>
+              </button>
+            </div>
+          </header>
+
+          <div class="lobby-wait-grid">
+            <!-- Left: Players & Ready / Start Controls -->
+            <div class="lobby-players-pane">
+              <div class="pane-header">
+                <div class="pane-title-wrap">
+                  <h3>Players</h3>
+                  <span id="lobby-player-count" class="meta-pill">1 / 6</span>
+                </div>
+                <div class="pane-header-actions" id="lobby-host-bot-actions">
+                  <button
+                    type="button"
+                    id="btn-lobby-add-bot"
+                    class="mini-action-btn"
+                    title="Add an AI Bot"
+                  >
+                    <span
+                      class="icon-slot"
+                      data-icon="plus"
+                      data-icon-size="13"
+                    ></span>
+                    <span>Add Bot</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="btn-lobby-remove-bot"
+                    class="mini-action-btn"
+                    title="Remove an AI Bot"
+                  >
+                    <span
+                      class="icon-slot"
+                      data-icon="minus"
+                      data-icon-size="13"
+                    ></span>
+                    <span>Remove Bot</span>
+                  </button>
+                </div>
+              </div>
+
+              <div id="lobby-slots-grid" class="lobby-slots-grid"></div>
+
+              <div class="lobby-ready-footer">
+                <div id="lobby-start-hint" class="lobby-start-hint">
+                  Click Ready Up to signal you are set.
+                </div>
+                <div class="lobby-ready-buttons">
+                  <button
+                    type="button"
+                    id="btn-lobby-ready"
+                    class="hub-secondary-btn lobby-ready-toggle-btn"
+                  >
+                    <span
+                      class="icon-slot"
+                      data-icon="check"
+                      data-icon-size="16"
+                    ></span>
+                    <span id="lobby-ready-label">Ready Up</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="btn-lobby-start"
+                    class="dock-ready-btn lobby-start-btn"
+                    disabled
+                  >
+                    <span
+                      class="icon-slot"
+                      data-icon="play"
+                      data-icon-size="15"
+                    ></span>
+                    <span id="lobby-start-label">Start Round</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right: Rules Summary + Lobby Chat -->
+            <div class="lobby-side-pane">
+              <div class="lobby-rules-card">
+                <div class="pane-header">
+                  <div class="pane-title-wrap">
+                    <h3>Match Rules</h3>
+                  </div>
+                  <button
+                    type="button"
+                    id="btn-lobby-edit-rules"
+                    class="mini-action-btn"
                   >
                     <span
                       class="icon-slot"
                       data-icon="sliders"
                       data-icon-size="13"
                     ></span>
-                    <span class="expand-label-closed">Customize Rules</span>
-                    <span class="expand-label-open">Hide Rules</span>
-                  </label>
-                  <button
-                    type="button"
-                    id="btn-hub-restart-match"
-                    class="mini-action-btn"
-                    title="Restart Current Match from Round 1"
-                  >
-                    <span
-                      class="icon-slot"
-                      data-icon="refresh"
-                      data-icon-size="13"
-                    ></span>
-                    <span>Restart Match</span>
+                    <span>Edit</span>
                   </button>
                 </div>
-              </div>
 
-              <!-- Calm Cold-Boot Summary Card (Shown on Desktop Until Expanded) -->
-              <div class="rules-collapsed-card">
-                <p class="rules-collapsed-summary">
-                  <strong>Standard Contest Rules</strong> · 8 rounds, round-scaled build timer (90s–120s), normal wall supply, and AI mason opponents.
-                </p>
-                <label
-                  for="chk-expand-rules"
-                  class="hub-secondary-btn rules-open-cta"
+                <div
+                  id="lobby-rules-summary"
+                  class="lobby-rules-summary"
+                ></div>
+
+                <div
+                  id="lobby-rules-editor"
+                  class="lobby-rules-editor hidden"
                 >
-                  <span
-                    class="icon-slot"
-                    data-icon="sliders"
-                    data-icon-size="14"
-                  ></span>
-                  <span>Customize Rules or Host New Room</span>
-                </label>
-              </div>
-
-              <div class="rules-collapsible-body">
-                <div class="config-matrix">
-                  <!-- Row 1: Room Name & Visibility -->
-                  <div class="config-row">
-                    <label class="config-label" for="cfg-room-name">
-                      Room Name
-                    </label>
-                    <div class="config-inline-split">
-                      <input
-                        id="cfg-room-name"
-                        class="cfg-text-input"
-                        type="text"
-                        maxlength="26"
-                        placeholder="Meadow Gate #1"
-                        autocomplete="off"
-                        autocorrect="off"
-                        spellcheck="false"
-                        enterkeyhint="done"
-                      />
+                  <div class="config-matrix compact-matrix">
+                    <div class="config-row">
+                      <label class="config-label">Visibility</label>
                       <div
                         class="segmented-control"
-                        id="cfg-public-group"
-                        data-setting="isPublic"
+                        id="lobby-cfg-public-group"
                       >
                         <button
                           type="button"
@@ -1080,183 +1657,734 @@
                         </button>
                       </div>
                     </div>
-                  </div>
-
-                  <!-- Row 2: Rounds -->
-                  <div class="config-row">
-                    <label class="config-label">Rounds</label>
-                    <div
-                      class="segmented-control"
-                      id="cfg-rounds-group"
-                      data-setting="totalRounds"
-                    >
-                      <button type="button" class="seg-btn" data-val="3">
-                        3 Rounds
-                      </button>
-                      <button type="button" class="seg-btn" data-val="5">
-                        5 Rounds
-                      </button>
-                      <button type="button" class="seg-btn active" data-val="8">
-                        8 Rounds
-                      </button>
-                    </div>
-                  </div>
-
-                  <!-- Row 3: Build Timer (Default First!) -->
-                  <div class="config-row">
-                    <label class="config-label">Build Timer</label>
-                    <div
-                      class="segmented-control"
-                      id="cfg-buildtime-group"
-                      data-setting="buildTimeSeconds"
-                    >
-                      <button
-                        type="button"
-                        class="seg-btn active"
-                        data-val="0"
-                        title="Round default (90s to 120s)"
+                    <div class="config-row">
+                      <label class="config-label">Rounds</label>
+                      <div
+                        class="segmented-control"
+                        id="lobby-cfg-rounds-group"
                       >
-                        Default
-                      </button>
-                      <button type="button" class="seg-btn" data-val="45">
-                        45s
-                      </button>
-                      <button type="button" class="seg-btn" data-val="60">
-                        60s
-                      </button>
-                      <button type="button" class="seg-btn" data-val="120">
-                        120s
-                      </button>
-                      <button type="button" class="seg-btn" data-val="999">
-                        ∞
-                      </button>
+                        <button type="button" class="seg-btn" data-val="3">
+                          3
+                        </button>
+                        <button type="button" class="seg-btn" data-val="5">
+                          5
+                        </button>
+                        <button
+                          type="button"
+                          class="seg-btn active"
+                          data-val="8"
+                        >
+                          8
+                        </button>
+                      </div>
                     </div>
-                  </div>
-
-                  <!-- Row 4: Wall Supply -->
-                  <div class="config-row">
-                    <label class="config-label">Wall Supply</label>
-                    <div
-                      class="segmented-control"
-                      id="cfg-gold-group"
-                      data-setting="goldMultiplier"
-                    >
-                      <button type="button" class="seg-btn" data-val="0.8">
-                        80%
-                      </button>
-                      <button type="button" class="seg-btn active" data-val="1">
-                        Normal
-                      </button>
-                      <button type="button" class="seg-btn" data-val="1.25">
-                        125%
-                      </button>
-                    </div>
-                  </div>
-
-                  <!-- Row 5: Bots (Complete 0..5 Range!) -->
-                  <div class="config-row">
-                    <label class="config-label">Bots</label>
-                    <div
-                      class="segmented-control"
-                      id="cfg-botcount-group"
-                      data-setting="botCount"
-                    >
-                      <button type="button" class="seg-btn" data-val="0">
-                        0
-                      </button>
-                      <button type="button" class="seg-btn" data-val="1">
-                        1
-                      </button>
-                      <button type="button" class="seg-btn" data-val="2">
-                        2
-                      </button>
-                      <button type="button" class="seg-btn active" data-val="3">
-                        3
-                      </button>
-                      <button type="button" class="seg-btn" data-val="4">
-                        4
-                      </button>
-                      <button type="button" class="seg-btn" data-val="5">
-                        5
-                      </button>
-                    </div>
-                  </div>
-
-                  <!-- Row 6: Bot Skill -->
-                  <div class="config-row" id="row-bot-skill">
-                    <label class="config-label">Bot Skill</label>
-                    <div
-                      class="segmented-control"
-                      id="cfg-botdiff-group"
-                      data-setting="botDifficulty"
-                    >
-                      <button type="button" class="seg-btn" data-val="NOVICE">
-                        Easy
-                      </button>
-                      <button
-                        type="button"
-                        class="seg-btn active"
-                        data-val="ARCHITECT"
+                    <div class="config-row">
+                      <label class="config-label">Timer</label>
+                      <div
+                        class="segmented-control"
+                        id="lobby-cfg-buildtime-group"
                       >
-                        Normal
-                      </button>
-                      <button
-                        type="button"
-                        class="seg-btn"
-                        data-val="GRANDMASTER"
+                        <button
+                          type="button"
+                          class="seg-btn active"
+                          data-val="0"
+                        >
+                          Def
+                        </button>
+                        <button type="button" class="seg-btn" data-val="45">
+                          45s
+                        </button>
+                        <button type="button" class="seg-btn" data-val="60">
+                          60s
+                        </button>
+                        <button type="button" class="seg-btn" data-val="120">
+                          120s
+                        </button>
+                        <button type="button" class="seg-btn" data-val="999">
+                          ∞
+                        </button>
+                      </div>
+                    </div>
+                    <div class="config-row">
+                      <label class="config-label">Supply</label>
+                      <div
+                        class="segmented-control"
+                        id="lobby-cfg-gold-group"
                       >
-                        Hard
-                      </button>
+                        <button type="button" class="seg-btn" data-val="0.8">
+                          80%
+                        </button>
+                        <button
+                          type="button"
+                          class="seg-btn active"
+                          data-val="1"
+                        >
+                          100%
+                        </button>
+                        <button type="button" class="seg-btn" data-val="1.25">
+                          125%
+                        </button>
+                      </div>
+                    </div>
+                    <div class="config-row">
+                      <label class="config-label">Bot Skill</label>
+                      <div
+                        class="segmented-control"
+                        id="lobby-cfg-botdiff-group"
+                      >
+                        <button type="button" class="seg-btn" data-val="NOVICE">
+                          Easy
+                        </button>
+                        <button
+                          type="button"
+                          class="seg-btn active"
+                          data-val="ARCHITECT"
+                        >
+                          Normal
+                        </button>
+                        <button
+                          type="button"
+                          class="seg-btn"
+                          data-val="GRANDMASTER"
+                        >
+                          Hard
+                        </button>
+                      </div>
+                    </div>
+                    <div class="config-row">
+                      <label class="config-label">Rival Mazes</label>
+                      <div class="segmented-control" id="lobby-cfg-fog-group">
+                        <button
+                          type="button"
+                          class="seg-btn active"
+                          data-val="false"
+                        >
+                          Visible
+                        </button>
+                        <button type="button" class="seg-btn" data-val="true">
+                          Hidden
+                        </button>
+                      </div>
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    id="btn-lobby-save-rules"
+                    class="dock-ready-btn full-width-cta"
+                  >
+                    Save Rules
+                  </button>
+                </div>
+              </div>
 
-                  <!-- Row 7: Rival Mazes -->
-                  <div class="config-row">
-                    <label class="config-label">Rival Mazes</label>
-                    <div
-                      class="segmented-control"
-                      id="cfg-fog-group"
-                      data-setting="fogOfWar"
-                    >
-                      <button
-                        type="button"
-                        class="seg-btn active"
-                        data-val="false"
-                      >
-                        Visible
-                      </button>
-                      <button type="button" class="seg-btn" data-val="true">
-                        Hidden
-                      </button>
-                    </div>
+              <div class="lobby-chat-card">
+                <div class="pane-header">
+                  <div class="pane-title-wrap">
+                    <h3>Lobby Chat</h3>
                   </div>
                 </div>
+                <div
+                  id="lobby-chat-messages"
+                  class="chat-messages lobby-chat-messages"
+                ></div>
+                <form id="lobby-chat-form" class="chat-form">
+                  <input
+                    id="lobby-chat-input"
+                    type="text"
+                    placeholder="Say hello to the lobby..."
+                    maxlength="160"
+                    autocomplete="off"
+                    enterkeyhint="send"
+                  />
+                  <button
+                    type="submit"
+                    title="Send Message"
+                    aria-label="Send Message"
+                  >
+                    <span
+                      class="icon-slot"
+                      data-icon="send"
+                      data-icon-size="15"
+                    ></span>
+                  </button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </section>
 
-                <div class="config-actions-row">
-                  <button
-                    type="button"
-                    id="btn-apply-room-settings"
-                    class="hub-secondary-btn"
-                    title="Update Rules in Current Room"
-                  >
-                    Update Room
-                  </button>
-                  <button
-                    type="button"
-                    id="btn-create-custom-room"
-                    class="dock-ready-btn"
-                    title="Create a New Room with These Rules"
-                  >
-                    New Room
-                  </button>
+        <!-- ============================================================
+             SCREEN 5: DAILY MAZE (1 MAZE/DAY · 120s · 1 ATTEMPT · TOP 10 + YOU)
+             ============================================================ -->
+        <section id="screen-daily" class="menu-screen hidden">
+          <header class="subscreen-header">
+            <button
+              type="button"
+              class="mini-action-btn screen-back-btn"
+              data-nav="home"
+            >
+              <span
+                class="icon-slot"
+                data-icon="arrowLeft"
+                data-icon-size="14"
+              ></span>
+              <span>Home</span>
+            </button>
+            <div class="subscreen-title-group">
+              <div class="daily-title-row">
+                <h2 id="daily-screen-title">Daily Maze</h2>
+                <span id="daily-screen-date" class="meta-pill">Today</span>
+              </div>
+              <p>
+                Everyone plays the exact same maze. One try per day. 120 seconds to build.
+              </p>
+            </div>
+            <div id="daily-reset-countdown" class="daily-countdown-pill">
+              Next maze in --:--:--
+            </div>
+          </header>
+
+          <div class="daily-layout-grid">
+            <!-- Today's Puzzle & Action Card -->
+            <div class="daily-challenge-card">
+              <div class="daily-card-kicker">TODAY'S PUZZLE</div>
+              <h3 id="daily-puzzle-name" class="daily-puzzle-name">
+                Loading today's maze…
+              </h3>
+              <div id="daily-puzzle-specs" class="daily-specs-pills"></div>
+              <p id="daily-puzzle-hint" class="daily-puzzle-hint"></p>
+
+              <div class="daily-rules-callout">
+                <span
+                  class="icon-slot"
+                  data-icon="clock"
+                  data-icon-size="15"
+                ></span>
+                <span>
+                  <strong>5s</strong> route planning → <strong>120s</strong> build timer → <strong>1 official attempt</strong> per day.
+                </span>
+              </div>
+
+              <div id="daily-cta-area" class="daily-cta-area">
+                <button
+                  type="button"
+                  id="btn-start-daily"
+                  class="dock-ready-btn daily-play-cta"
+                >
+                  <span
+                    class="icon-slot"
+                    data-icon="play"
+                    data-icon-size="15"
+                  ></span>
+                  <span>Play Today's Maze</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Top 10 + Where You Sit -->
+            <div class="daily-leaderboard-card">
+              <div class="pane-header">
+                <div class="pane-title-wrap">
+                  <h3>Today's Top 10</h3>
+                  <span id="daily-participants-badge" class="meta-pill">
+                    0 Players
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  id="btn-refresh-daily"
+                  class="mini-action-btn"
+                  title="Refresh Daily Standings"
+                >
+                  <span
+                    class="icon-slot"
+                    data-icon="refresh"
+                    data-icon-size="14"
+                  ></span>
+                  <span>Refresh</span>
+                </button>
+              </div>
+
+              <div
+                id="daily-leaderboard-table"
+                class="leaderboard-table-wrap daily-table-wrap"
+              ></div>
+
+              <div
+                id="daily-my-standing-bar"
+                class="daily-my-standing-bar"
+              ></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============================================================
+             SCREEN 6: EXPANDED BEGINNER-FRIENDLY HOW TO PLAY
+             ============================================================ -->
+        <section id="screen-how-to-play" class="menu-screen hidden">
+          <header class="subscreen-header">
+            <button
+              type="button"
+              class="mini-action-btn screen-back-btn"
+              data-nav="home"
+            >
+              <span
+                class="icon-slot"
+                data-icon="arrowLeft"
+                data-icon-size="14"
+              ></span>
+              <span>Home</span>
+            </button>
+            <div class="subscreen-title-group">
+              <h2>How to Play</h2>
+              <p>
+                New to mazing games? Here is the whole game in plain English.
+              </p>
+            </div>
+          </header>
+
+          <!-- Single-Source Guide Content (Also Cloned Into In-Game ? Help Modal) -->
+          <div id="codex-guide-content" class="guide-content-wrap htp-scroll-body">
+            <!-- 1. The Big Idea -->
+            <div class="htp-hero-callout">
+              <div class="htp-hero-badge">THE BIG IDEA</div>
+              <h3>Don't kill the runner — just waste their time!</h3>
+              <p>
+                A little runner starts at the <strong>TOP gate</strong> and wants to walk to the <strong>BOTTOM gate</strong> as fast as they can. You place <strong>Stone Walls</strong> on the grass to force them to take the <strong>longest, slowest walk possible</strong>. Whoever keeps their runner trapped inside their maze for the <strong>most seconds</strong> wins the round!
+              </p>
+            </div>
+
+            <!-- 2. Step-by-Step Round Flow -->
+            <div class="htp-section">
+              <h4 class="htp-section-title">How Every Round Works</h4>
+              <div class="htp-steps-grid">
+                <div class="htp-step-card">
+                  <span class="htp-step-num">1</span>
+                  <div>
+                    <strong>Plan for 5 Seconds</strong>
+                    <p>
+                      Each round starts with a <strong>5-second look-around timer</strong>. You can't place walls yet — use this time to spot where the glowing Spires and Red Keeps are!
+                    </p>
+                  </div>
+                </div>
+                <div class="htp-step-card">
+                  <span class="htp-step-num">2</span>
+                  <div>
+                    <strong>Build Your Maze</strong>
+                    <p>
+                      Click or tap any open grass to place <strong>Stone Walls</strong>. Watch the white path line stretch! Made a mistake? Removing a wall gives it right back for free.
+                    </p>
+                  </div>
+                </div>
+                <div class="htp-step-card">
+                  <span class="htp-step-num">3</span>
+                  <div>
+                    <strong>Golden Rule: Leave a Path!</strong>
+                    <p>
+                      You can <strong>never</strong> completely seal off the exit. There must always be at least a 1-tile open walkway from the Top Gate to the Bottom Gate.
+                    </p>
+                  </div>
+                </div>
+                <div class="htp-step-card">
+                  <span class="htp-step-num">4</span>
+                  <div>
+                    <strong>Lock In &amp; Watch Them Run</strong>
+                    <p>
+                      Hit <strong>Ready / Start</strong> (or wait for the timer). Everyone's runner starts at once. Longest survival time takes 1st place!
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 3. Pro Trick #1: Zig-Zags (Visual Diagram) -->
+            <div class="htp-section">
+              <h4 class="htp-section-title">
+                Secret #1: Build Back-and-Forth Zig-Zags!
+              </h4>
+              <div class="htp-diagram-card">
+                <div class="htp-diagram-copy">
+                  <p>
+                    Think of an <strong>airport security line</strong> or theme park queue. Instead of building random blocks, make walls that stretch across the island with a small gap on alternating sides. The runner has to walk all the way left, turn around, walk all the way right, and repeat!
+                  </p>
+                  <p class="htp-tip-pill">
+                    Tip: Keep an eye on the <strong>Est time</strong> at the top of the screen — it updates live after every wall you place!
+                  </p>
+                </div>
+                <div class="htp-svg-pair" aria-hidden="true">
+                  <figure class="htp-mini-diagram bad">
+                    <svg viewBox="0 0 120 96" fill="none">
+                      <rect x="4" y="4" width="112" height="88" rx="8" fill="#d9efd0" stroke="#78664e" stroke-opacity="0.3" />
+                      <rect x="52" y="6" width="16" height="8" rx="2" fill="#0284c7" />
+                      <rect x="52" y="82" width="16" height="8" rx="2" fill="#047857" />
+                      <rect x="48" y="38" width="24" height="14" rx="3" fill="#64748b" />
+                      <path d="M60 14 V32 L38 38 V58 L60 66 V82" stroke="#be123c" stroke-width="3" stroke-dasharray="4 3" stroke-linecap="round" />
+                    </svg>
+                    <figcaption>Short Path (~8s)</figcaption>
+                  </figure>
+                  <figure class="htp-mini-diagram good">
+                    <svg viewBox="0 0 120 96" fill="none">
+                      <rect x="4" y="4" width="112" height="88" rx="8" fill="#d9efd0" stroke="#047857" stroke-opacity="0.45" />
+                      <rect x="52" y="6" width="16" height="8" rx="2" fill="#0284c7" />
+                      <rect x="52" y="82" width="16" height="8" rx="2" fill="#047857" />
+                      <rect x="10" y="24" width="84" height="10" rx="2.5" fill="#475569" />
+                      <rect x="26" y="46" width="84" height="10" rx="2.5" fill="#475569" />
+                      <rect x="10" y="68" width="84" height="10" rx="2.5" fill="#475569" />
+                      <path d="M60 14 H104 V40 H16 V62 H104 V82 H60" stroke="#047857" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                    <figcaption>Zig-Zag Maze (25s+!)</figcaption>
+                  </figure>
+                </div>
+              </div>
+            </div>
+
+            <!-- 4. What's Already on the Map? -->
+            <div class="htp-section">
+              <h4 class="htp-section-title">
+                What Are Those Objects Already on the Grass?
+              </h4>
+              <p class="htp-section-lead">
+                You don't build these — they start on the map! Your job is to bend your maze <strong>around</strong> them.
+              </p>
+
+              <div class="codex-grid htp-objects-grid">
+                <div class="codex-item">
+                  <div class="codex-card-head">
+                    <span class="codex-icon" data-icon="bolt" data-icon-size="18"></span>
+                    <h4>Storm Spire (Yellow)</h4>
+                  </div>
+                  <p>
+                    Zaps the runner every 3 seconds and cuts their walking speed in <strong>HALF</strong>. Wrap your maze around it so it zaps them 2 or 3 times!
+                  </p>
+                </div>
+
+                <div class="codex-item">
+                  <div class="codex-card-head">
+                    <span class="codex-icon" data-icon="frost" data-icon-size="18"></span>
+                    <h4>Frost Obelisk (Blue)</h4>
+                  </div>
+                  <p>
+                    Always slows the runner while they're inside its blue circle, <strong>plus</strong> fires freezing bursts. Best when you spiral tightly around it!
+                  </p>
+                </div>
+
+                <div class="codex-item">
+                  <div class="codex-card-head">
+                    <span class="codex-icon" data-icon="chrono" data-icon-size="18"></span>
+                    <h4>Chrono Spire (Purple)</h4>
+                  </div>
+                  <p>
+                    Big slow hit <strong>AND</strong> instantly speeds up the cooldown of <strong>every other Spire</strong> on your island so they fire again sooner!
+                  </p>
+                </div>
+
+                <div class="codex-item">
+                  <div class="codex-card-head">
+                    <span class="codex-icon" data-icon="target" data-icon-size="18"></span>
+                    <h4>Gold Waystone (Checkpoint)</h4>
+                  </div>
+                  <p>
+                    A mandatory pit-stop! On rounds with a Gold Waystone, the runner <strong>must touch it first</strong> before heading to the Bottom Gate.
+                  </p>
+                </div>
+              </div>
+
+              <!-- Secret #2: Red Keeps = Batteries Visual -->
+              <div class="htp-diagram-card htp-keep-card">
+                <div class="htp-diagram-copy">
+                  <div class="codex-card-head">
+                    <span class="codex-icon" data-icon="keep" data-icon-size="19"></span>
+                    <h4>Secret #2: Red Keeps Are Power Batteries!</h4>
+                  </div>
+                  <p>
+                    See the red stone buildings (<strong>Crimson Keeps</strong>)? They act like <strong>batteries</strong>! If you connect a continuous chain of your Stone Walls touching a Red Keep and bringing it <strong>within 1 tile of a Spire</strong>, that Spire lights up with <strong>Overcharge</strong> — giving it bigger range and faster slow pulses!
+                  </p>
+                  <p>
+                    Link up to <strong>3 Red Keeps</strong> into the same wall network for maximum power (shown as glowing diamonds ◆◆◆ on the Spire).
+                  </p>
+                </div>
+                <div class="htp-svg-single" aria-hidden="true">
+                  <figure class="htp-mini-diagram keep-diag">
+                    <svg viewBox="0 0 210 74" fill="none">
+                      <rect x="2" y="2" width="206" height="70" rx="8" fill="#f7f1e3" stroke="#b45309" stroke-opacity="0.3" />
+                      <!-- Red Keep -->
+                      <rect x="14" y="20" width="30" height="30" rx="5" fill="#be123c" />
+                      <text x="29" y="61" text-anchor="middle" font-size="9" font-weight="700" fill="#9f1239">Red Keep</text>
+                      <!-- Connected Stone Walls -->
+                      <rect x="46" y="24" width="22" height="22" rx="3" fill="#64748b" />
+                      <rect x="70" y="24" width="22" height="22" rx="3" fill="#64748b" />
+                      <rect x="94" y="24" width="22" height="22" rx="3" fill="#64748b" />
+                      <path d="M44 35 H118" stroke="#fbbf24" stroke-width="3" stroke-linecap="round" />
+                      <text x="81" y="61" text-anchor="middle" font-size="9" font-weight="600" fill="#475569">Your Walls</text>
+                      <!-- 1-tile gap spark -->
+                      <path d="M120 35 H148" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="3 3" />
+                      <text x="134" y="23" text-anchor="middle" font-size="8.5" font-weight="700" fill="#b45309">≤1 tile</text>
+                      <!-- Powered Spire -->
+                      <circle cx="172" cy="35" r="21" fill="#fef3c7" stroke="#f59e0b" stroke-width="2" />
+                      <polygon points="172,21 163,36 171,36 170,49 181,34 173,34" fill="#d97706" />
+                      <text x="172" y="66" text-anchor="middle" font-size="9" font-weight="700" fill="#b45309">POWERED UP!</text>
+                    </svg>
+                  </figure>
+                </div>
+              </div>
+            </div>
+
+            <!-- 5. Meet the 4 Runners -->
+            <div class="htp-section">
+              <h4 class="htp-section-title">Meet the 4 Types of Runners</h4>
+              <div class="htp-runners-grid">
+                <div class="htp-runner-chip">
+                  <span class="icon-slot" data-icon="scout" data-icon-size="16"></span>
+                  <div>
+                    <strong>Citadel Scout</strong>
+                    <span>Normal speed, no special tricks. Easy to learn on!</span>
+                  </div>
+                </div>
+                <div class="htp-runner-chip">
+                  <span class="icon-slot" data-icon="outrider" data-icon-size="16"></span>
+                  <div>
+                    <strong>Royal Outrider</strong>
+                    <span>Runs fast on open grass, <em>but</em> slows last 25% longer. Keep them near Spires!</span>
+                  </div>
+                </div>
+                <div class="htp-runner-chip">
+                  <span class="icon-slot" data-icon="juggernaut" data-icon-size="16"></span>
+                  <div>
+                    <strong>Iron Juggernaut</strong>
+                    <span>Shrugs off part of normal slows — link a <strong>Red Keep</strong> to break through their armor!</span>
+                  </div>
+                </div>
+                <div class="htp-runner-chip">
+                  <span class="icon-slot" data-icon="herald" data-icon-size="16"></span>
+                  <div>
+                    <strong>Wind Herald</strong>
+                    <span>Gets a speed burst if they go 3.2s without hitting a Spire. Don't leave huge empty gaps!</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 6. Scoring, Par & Modes -->
+            <div class="htp-section">
+              <h4 class="htp-section-title">Points, Par Bonus &amp; Modes</h4>
+              <div class="htp-scoring-grid">
+                <div class="codex-item">
+                  <div class="codex-card-head">
+                    <span class="codex-icon" data-icon="starFilled" data-icon-size="18"></span>
+                    <h4>Points &amp; Par Target</h4>
+                  </div>
+                  <p>
+                    Each round awards <strong>10 / 7 / 5 / 3 / 2 / 1 pts</strong> by rank. Beat the round's <strong>Par time</strong> (like 28s+) to earn a Star and <strong>+2 bonus pts</strong>!
+                  </p>
+                </div>
+                <div class="codex-item">
+                  <div class="codex-card-head">
+                    <span class="codex-icon" data-icon="calendar" data-icon-size="18"></span>
+                    <h4>Daily Maze &amp; Online Lobbies</h4>
+                  </div>
+                  <p>
+                    Try the <strong>Daily Maze</strong> for one shared global puzzle every day (120s build, 1 attempt/day), or open a <strong>Play Online</strong> lobby where everyone clicks Ready Up before the host starts!
+                  </p>
                 </div>
               </div>
             </div>
           </div>
         </section>
 
-        <!-- TAB 2: LEADERBOARD -->
-        <section id="hub-tab-leaderboard" class="hub-tab-body hidden">
+        <!-- ============================================================
+             SCREEN 7: SETTINGS & CONTROLS
+             ============================================================ -->
+        <section id="screen-settings" class="menu-screen hidden">
+          <header class="subscreen-header">
+            <button
+              type="button"
+              class="mini-action-btn screen-back-btn"
+              data-nav="home"
+            >
+              <span
+                class="icon-slot"
+                data-icon="arrowLeft"
+                data-icon-size="14"
+              ></span>
+              <span>Home</span>
+            </button>
+            <div class="subscreen-title-group">
+              <h2>Settings &amp; Controls</h2>
+              <p>Customize audio, gameplay tips, and review all controls.</p>
+            </div>
+          </header>
+
+          <div class="settings-grid">
+            <!-- Left: Profile, Audio & Preferences -->
+            <div class="settings-card">
+              <h3>Profile &amp; Preferences</h3>
+
+              <div class="settings-row">
+                <div class="settings-row-copy">
+                  <label for="settings-player-name"><strong>Display Name</strong></label>
+                  <span>Shown in lobbies and on the Daily Maze leaderboard</span>
+                </div>
+                <input
+                  id="settings-player-name"
+                  class="cfg-text-input settings-name-input"
+                  type="text"
+                  maxlength="18"
+                  placeholder="Your Name"
+                  autocomplete="nickname"
+                  autocorrect="off"
+                  spellcheck="false"
+                />
+              </div>
+
+              <div class="settings-row">
+                <div class="settings-row-copy">
+                  <strong>Sound Effects</strong>
+                  <span>Wall clicks, countdown ticks, and Spire pulses</span>
+                </div>
+                <button
+                  type="button"
+                  id="settings-sound-toggle"
+                  class="mini-action-btn settings-toggle-btn active"
+                >
+                  On
+                </button>
+              </div>
+
+              <div class="settings-row volume-row">
+                <div class="settings-row-copy">
+                  <label for="settings-volume-slider"><strong>Master Volume</strong></label>
+                  <span id="settings-volume-value">85%</span>
+                </div>
+                <div class="volume-control-wrap">
+                  <input
+                    id="settings-volume-slider"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="5"
+                    value="85"
+                    aria-label="Master Volume"
+                  />
+                  <button
+                    type="button"
+                    id="btn-settings-test-sound"
+                    class="mini-action-btn"
+                  >
+                    Test
+                  </button>
+                </div>
+              </div>
+
+              <div class="settings-row">
+                <div class="settings-row-copy">
+                  <strong>Haptic Feedback (Mobile)</strong>
+                  <span>Subtle vibration when placing or removing walls</span>
+                </div>
+                <button
+                  type="button"
+                  id="settings-haptics-toggle"
+                  class="mini-action-btn settings-toggle-btn active"
+                >
+                  On
+                </button>
+              </div>
+
+              <div class="settings-row">
+                <div class="settings-row-copy">
+                  <strong>Round Strategy Tips</strong>
+                  <span>Show a short hint banner at the start of each round</span>
+                </div>
+                <button
+                  type="button"
+                  id="settings-tips-toggle"
+                  class="mini-action-btn settings-toggle-btn active"
+                >
+                  On
+                </button>
+              </div>
+            </div>
+
+            <!-- Right: Desktop & Mobile Controls Reference -->
+            <div class="settings-card">
+              <h3>Desktop Controls</h3>
+              <div class="controls-key-list">
+                <div class="control-kv">
+                  <span>Place Stone Wall</span>
+                  <kbd>Left Click</kbd>
+                </div>
+                <div class="control-kv">
+                  <span>Paint a Line of Walls</span>
+                  <span><kbd>Shift</kbd> + Drag</span>
+                </div>
+                <div class="control-kv">
+                  <span>Remove Wall (Free Refund)</span>
+                  <span><kbd>Right Click</kbd> / <kbd>X</kbd></span>
+                </div>
+                <div class="control-kv">
+                  <span>Build / Remove Tools</span>
+                  <span><kbd>Q</kbd> / <kbd>X</kbd></span>
+                </div>
+                <div class="control-kv">
+                  <span>Undo / Redo</span>
+                  <span><kbd>Z</kbd> / <kbd>Ctrl+Y</kbd></span>
+                </div>
+                <div class="control-kv">
+                  <span>Pan &amp; Zoom Camera</span>
+                  <span><kbd>WASD</kbd> / Drag / Scroll</span>
+                </div>
+                <div class="control-kv">
+                  <span>Reset Camera View</span>
+                  <kbd>R</kbd>
+                </div>
+                <div class="control-kv">
+                  <span>Lock In / Ready Up</span>
+                  <kbd>Space</kbd>
+                </div>
+                <div class="control-kv">
+                  <span>View All / Rival Islands</span>
+                  <span><kbd>Tab</kbd> / <kbd>1–6</kbd></span>
+                </div>
+                <div class="control-kv">
+                  <span>Mute Audio / Quick Help</span>
+                  <span><kbd>M</kbd> / <kbd>?</kbd></span>
+                </div>
+              </div>
+
+              <h3 class="settings-subhead">Touch &amp; Mobile Controls</h3>
+              <ul class="touch-controls-list">
+                <li><strong>Tap grass or hold-drag</strong> to aim your 2×2 wall preview.</li>
+                <li>Use the <strong>Arrow Nudge Pad</strong> for exact 1-tile precision, then tap <strong>Place</strong>.</li>
+                <li><strong>Tap an existing wall</strong> to select and remove it (+1 wall refunded).</li>
+                <li><strong>Tap any Spire, Red Keep, or Waystone</strong> to see its range and details.</li>
+                <li><strong>Pinch</strong> with two fingers to zoom, or use the <strong>Pan</strong> tool to glide around.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============================================================
+             SCREEN 8: ALL-TIME LEADERBOARD (ROUND RECORDS & TOP PLAYERS)
+             ============================================================ -->
+        <section id="screen-leaderboard" class="menu-screen hidden">
+          <header class="subscreen-header">
+            <button
+              type="button"
+              class="mini-action-btn screen-back-btn"
+              data-nav="home"
+            >
+              <span
+                class="icon-slot"
+                data-icon="arrowLeft"
+                data-icon-size="14"
+              ></span>
+              <span>Home</span>
+            </button>
+            <div class="subscreen-title-group">
+              <h2>All-Time Leaderboard</h2>
+              <p>Best round survival records and career point leaders.</p>
+            </div>
+          </header>
+
           <div class="leaderboard-header-bar">
             <div class="segmented-control" id="leaderboard-mode-group">
               <button
@@ -1281,64 +2409,6 @@
           <div id="leaderboard-round-meta" class="leaderboard-round-meta"></div>
 
           <div id="leaderboard-table-wrap" class="leaderboard-table-wrap"></div>
-        </section>
-
-        <!-- TAB 3: HOW TO PLAY (Single-Source Guide) -->
-        <section id="hub-tab-codex" class="hub-tab-body hidden">
-          <div id="codex-guide-content" class="guide-content-wrap">
-            <div class="codex-grid hub-codex-grid">
-              <div class="codex-item">
-                <div class="codex-card-head">
-                  <span class="codex-icon" data-icon="pillar" data-icon-size="19"></span>
-                  <h4>1. Build Stone Walls</h4>
-                </div>
-                <p>
-                  Place <strong>2×2 Stone Walls</strong> on any open grass tile. Nearby walls connect automatically to wind the runner from the <strong>North Gate</strong> to the <strong>South Shrine</strong> and through any gilded <strong>Waystone</strong>. Removing a wall refunds +1 wall immediately.
-                </p>
-              </div>
-
-              <div class="codex-item">
-                <div class="codex-card-head">
-                  <span class="codex-icon" data-icon="bolt" data-icon-size="19"></span>
-                  <h4>2. Route Past Spires</h4>
-                </div>
-                <p>
-                  Fold switchbacks and spirals around map spires for repeated hits. <strong>Storm Spires</strong> slow by 50% (2.4s), <strong>Frost Obelisks</strong> chill by 22% inside their ring plus 45% bursts (2.2s), and <strong>Chrono Spires</strong> slow by 55% (2.0s) while cutting 1.2s off other spires.
-                </p>
-              </div>
-
-              <div class="codex-item">
-                <div class="codex-card-head">
-                  <span class="codex-icon" data-icon="keep" data-icon-size="19"></span>
-                  <h4>3. Link Keeps for Overcharge</h4>
-                </div>
-                <p>
-                  Connect red <strong>Crimson Keeps</strong> through your walls to within <strong>1 corridor tile</strong> of a spire for up to three <strong><span class="icon-slot" data-icon="diamondFilled" data-icon-size="11"></span> Overcharge</strong> tiers, boosting spire range, pulse speed, and piercing Juggernaut armor.
-                </p>
-              </div>
-
-              <div class="codex-item">
-                <div class="codex-card-head">
-                  <span class="icon-slot codex-icon" data-icon="starFilled" data-icon-size="19"></span>
-                  <h4>4. Outlast Rivals &amp; Beat Par</h4>
-                </div>
-                <p>
-                  Longest survival time wins each round (<strong>10 / 7 / 5 / 3 / 2 / 1 pts</strong> by rank). Keep the runner in your maze past the <strong><span class="icon-slot" data-icon="starFilled" data-icon-size="11"></span> Par target</strong> (such as <strong>28s+</strong>) for <strong>+2 bonus pts</strong>. Mazes built with <strong>Sample Maze · Practice</strong> run unranked.
-                </p>
-              </div>
-            </div>
-
-            <div class="controls-summary-card">
-              <div class="controls-row touch-only-hint">
-                <strong>Touch Controls:</strong>
-                <span>Tap grass or hold-drag to aim · Re-tap ghost or tap <strong>Place</strong> (+2-tile chain) · Tap a wall to <strong>Remove (+1)</strong> · Tap any Spire, Keep, Waystone, or Runner to inspect · Pinch to zoom</span>
-              </div>
-              <div class="controls-row desktop-only-hint">
-                <strong>Desktop Controls:</strong>
-                <span>Left-click build (<kbd>Shift</kbd>+Drag line-paint) · Right-click remove · Scroll zoom · Drag / <kbd>WASD</kbd> pan · <kbd>Q</kbd> Build · <kbd>X</kbd> Remove · <kbd>Z</kbd> Undo · <kbd>Ctrl+Y</kbd> / <kbd>Ctrl+Shift+Z</kbd> Redo · <kbd>R</kbd> Reset View · <kbd>Space</kbd> Ready · <kbd>Tab</kbd> / <kbd>1–6</kbd> Islands</span>
-              </div>
-            </div>
-          </div>
         </section>
       </div>
     </div>

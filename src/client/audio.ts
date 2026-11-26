@@ -10,6 +10,8 @@ export type HapticKind =
   | 'error';
 
 const MUTE_STORAGE_KEY = 'mc2026_muted';
+const VOLUME_STORAGE_KEY = 'mc2026_volume';
+const HAPTICS_STORAGE_KEY = 'mc2026_haptics';
 
 const HAPTIC_PATTERNS: Record<HapticKind, number | number[]> = {
   snap: 5,
@@ -63,6 +65,8 @@ export class SoundEngine {
   private masonryNoiseBuffer: AudioBuffer | null = null;
 
   private _muted = false;
+  private _volume = 0.85;
+  private _hapticsEnabled = true;
   private unlocked = false;
   private unlockListenersBound = false;
   private lastCueTimeMs = new Map<string, number>();
@@ -74,6 +78,8 @@ export class SoundEngine {
 
   constructor() {
     this._muted = this.readStoredMuted();
+    this._volume = this.readStoredVolume();
+    this._hapticsEnabled = this.readStoredHaptics();
     this.installGestureUnlockListeners();
     this.installLifecycleRecoveryListeners();
   }
@@ -93,10 +99,53 @@ export class SoundEngine {
       // Ignore storage access errors in restricted webviews
     }
 
+    this.applyMasterGain();
+  }
+
+  public get volume(): number {
+    return this._volume;
+  }
+
+  public set volume(val: number) {
+    const clamped = Math.max(0, Math.min(1, Number(val)));
+    this._volume = Number.isFinite(clamped) ? clamped : 0.85;
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(VOLUME_STORAGE_KEY, String(this._volume));
+      }
+    } catch {
+      // Ignore
+    }
+    this.applyMasterGain();
+  }
+
+  public get hapticsEnabled(): boolean {
+    return this._hapticsEnabled;
+  }
+
+  public set hapticsEnabled(val: boolean) {
+    this._hapticsEnabled = Boolean(val);
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(
+          HAPTICS_STORAGE_KEY,
+          this._hapticsEnabled ? '1' : '0'
+        );
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  private applyMasterGain(): void {
     if (this.masterGain && this.ctx) {
       const now = this.ctx.currentTime;
+      const target =
+        this._muted || this._volume <= 0.001
+          ? 0.0001
+          : 0.86 * this._volume;
       this.masterGain.gain.cancelScheduledValues(now);
-      this.masterGain.gain.setTargetAtTime(next ? 0.0001 : 0.86, now, 0.015);
+      this.masterGain.gain.setTargetAtTime(target, now, 0.015);
     }
   }
 
@@ -117,6 +166,35 @@ export class SoundEngine {
       // Ignore storage access errors
     }
     return false;
+  }
+
+  private readStoredVolume(): number {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const raw = localStorage.getItem(VOLUME_STORAGE_KEY);
+        if (raw !== null) {
+          const parsed = Number(raw);
+          if (Number.isFinite(parsed)) {
+            return Math.max(0, Math.min(1, parsed));
+          }
+        }
+      }
+    } catch {
+      // Ignore
+    }
+    return 0.85;
+  }
+
+  private readStoredHaptics(): boolean {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const raw = localStorage.getItem(HAPTICS_STORAGE_KEY);
+        if (raw !== null) return raw !== '0';
+      }
+    } catch {
+      // Ignore
+    }
+    return true;
   }
 
   private isContextRunning(ctx: AudioContext): boolean {
@@ -242,7 +320,8 @@ export class SoundEngine {
         compressor.release.value = 0.14;
 
         const gain = ctx.createGain();
-        gain.gain.value = this._muted ? 0.0001 : 0.86;
+        gain.gain.value =
+          this._muted || this._volume <= 0.001 ? 0.0001 : 0.86 * this._volume;
 
         filter.connect(compressor);
         compressor.connect(gain);
@@ -921,7 +1000,27 @@ export class SoundEngine {
     });
   }
 
+  public playBuildUnlock(): void {
+    const ctx = this.ensureContext();
+    if (!ctx || !this.canTrigger('build_unlock', 180)) return;
+
+    const now = ctx.currentTime + 0.002;
+    const freqs = [392.0, 523.25, 659.25];
+    freqs.forEach((f, idx) => {
+      this.scheduleVoice(ctx, {
+        type: 'triangle',
+        freqStart: f,
+        startTime: now + idx * 0.055,
+        duration: 0.28,
+        peakGain: 0.09,
+        attack: 0.005,
+        filterFreq: 2400,
+      });
+    });
+  }
+
   public haptic(kind: HapticKind): void {
+    if (!this._hapticsEnabled) return;
     if (
       typeof navigator === 'undefined' ||
       typeof navigator.vibrate !== 'function'

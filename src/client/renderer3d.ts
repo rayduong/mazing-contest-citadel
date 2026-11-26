@@ -9521,7 +9521,9 @@ export class Arena3DRenderer {
     const now = performance.now();
     const motionScale = this.prefersReducedMotion ? 0.0 : 1.0;
     const uTimeVal = now * (this.prefersReducedMotion ? 0.0002 : 0.001);
+    const isPlanningPhase = this.currentRoomState?.phase === 'PLANNING';
     const isBuildPhase = this.currentRoomState?.phase === 'BUILD';
+    const isPlanOrBuild = isPlanningPhase || isBuildPhase;
     const isRunPhase = this.currentRoomState?.phase === 'RUN';
 
     // Bidirectional 60Hz-safe DPR governor (`!document.hidden && dt < 0.065`; recover at `avgMs < 17.4` over 3 windows!)
@@ -9761,7 +9763,13 @@ export class Arena3DRenderer {
 
       island.floorUniforms.uTime.value = uTimeVal;
       const isFogged = island.fogVeilMesh.visible;
-      const goalBuildAlpha = isBuildPhase && !isFogged ? 1.0 : 0.0;
+      const goalBuildAlpha = !isFogged
+        ? isBuildPhase
+          ? 1.0
+          : isPlanningPhase
+          ? 0.55
+          : 0.0
+        : 0.0;
       const currBuildAlpha = island.floorUniforms.uBuildAlpha.value;
       island.floorUniforms.uBuildAlpha.value =
         currBuildAlpha +
@@ -9772,7 +9780,7 @@ export class Arena3DRenderer {
 
       if (island.pathMesh && !isFogged) {
         island.pathMat.uniforms.uTime.value = uTimeVal;
-        const targetPathOpacity = isBuildPhase
+        const targetPathOpacity = isPlanOrBuild
           ? island.playerId === this.localPlayerId &&
             this.previewPathMesh !== null
             ? 0.14
@@ -9783,7 +9791,7 @@ export class Arena3DRenderer {
           currOp + (targetPathOpacity - currOp) * Math.min(1, safeDt * 10.0);
       }
 
-      island.clapMarkerGroup.visible = Boolean(isBuildPhase && !isFogged);
+      island.clapMarkerGroup.visible = Boolean(isPlanOrBuild && !isFogged);
 
       // Instanced Stone Wall spring pop (`0` matrix writes/frame when steady!)
       for (let wIdx = 0; wIdx < island.wallOrder.length; wIdx++) {
@@ -9829,7 +9837,7 @@ export class Arena3DRenderer {
       }
 
       for (const spireRig of island.spireRigs) {
-        const targetRingAlpha = isBuildPhase
+        const targetRingAlpha = isPlanOrBuild
           ? 0.16 + spireRig.targetHoverBoost * 0.44
           : 0.14;
         const currRingAlpha = spireRig.aoeMat.uniforms.uRingAlpha.value;
@@ -9884,7 +9892,7 @@ export class Arena3DRenderer {
         }
       }
 
-      if (isBuildPhase) {
+      if (isPlanOrBuild) {
         island.runner.pelvis.position.y =
           0.45 + Math.sin(uTimeVal * 2.6) * 0.035 * motionScale;
         island.runner.statusRing.visible = false;

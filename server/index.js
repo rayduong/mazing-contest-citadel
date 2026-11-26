@@ -11,8 +11,10 @@ const __dirname = path.dirname(__filename);
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = path.join(__dirname, 'data');
 const LEADERBOARD_FILE = path.join(DATA_DIR, 'leaderboard.json');
+const DAILY_LEADERBOARD_FILE = path.join(DATA_DIR, 'daily_leaderboard.json');
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const PLANNING_TIME_SECONDS = 5;
 const RECONNECT_GRACE_MS = 45_000;
 const UNREADY_BLIP_HOLD_MS = 5_000;
 const HOST_MIGRATE_DELAY_MS = 5_000;
@@ -56,6 +58,8 @@ const RESERVED_NAMES_LOWER = new Set([
 
 const HEAVY_CPU_ACTIONS = new Set([
   'CREATE_ROOM',
+  'START_SOLO',
+  'START_DAILY',
   'REROLL_MAP',
   'LOAD_PRESET_DEMO',
   'JUMP_TO_ROUND',
@@ -215,7 +219,14 @@ async function startServer() {
 
   // Load shared TypeScript game modules via Vite SSR loader
   const roundsMod = await vite.ssrLoadModule('/src/shared/rounds.ts');
-  const { ROUNDS, generateRandomRoundLayout } = roundsMod;
+  const {
+    ROUNDS,
+    generateRandomRoundLayout,
+    generateDailyRoundConfig,
+    getDailyDateKeyUtc,
+    getNextDailyResetUtcMs,
+    DAILY_BUILD_TIME_SECONDS,
+  } = roundsMod;
   const computeEffectivePar =
     typeof roundsMod.computeEffectivePar === 'function'
       ? roundsMod.computeEffectivePar
@@ -291,6 +302,229 @@ async function startServer() {
     void flushLeaderboardAsync();
   }
 
+  // Initialize persistent Daily Maze Leaderboard (1 attempt/day, 120s build timer)
+  /** @type {{ days: Record<string, any[]>; updatedAt: number }} */
+  let dailyStore = { days: {}, updatedAt: Date.now() };
+  try {
+    if (fs.existsSync(DAILY_LEADERBOARD_FILE)) {
+      const parsed = JSON.parse(
+        fs.readFileSync(DAILY_LEADERBOARD_FILE, 'utf-8')
+      );
+      if (parsed && parsed.days && typeof parsed.days === 'object') {
+        dailyStore = parsed;
+      }
+    } else {
+      fs.writeFileSync(
+        DAILY_LEADERBOARD_FILE,
+        JSON.stringify(dailyStore, null, 2)
+      );
+    }
+  } catch (err) {
+    console.warn('Could not read daily_leaderboard.json, starting fresh:', err);
+  }
+
+  let dailyWriteInFlight = false;
+  let dailyWriteQueued = false;
+
+  async function flushDailyStoreAsync() {
+    if (dailyWriteInFlight) {
+      dailyWriteQueued = true;
+      return;
+    }
+    dailyWriteInFlight = true;
+    try {
+      do {
+        dailyWriteQueued = false;
+        // Retain the 14 most recent UTC days
+        const dayKeys = Object.keys(dailyStore.days).sort();
+        while (dayKeys.length > 14) {
+          const oldest = dayKeys.shift();
+          if (oldest) delete dailyStore.days[oldest];
+        }
+        const json = JSON.stringify(dailyStore, null, 2);
+        const tmpPath = `${DAILY_LEADERBOARD_FILE}.tmp`;
+        try {
+          await fs.promises.writeFile(tmpPath, json, 'utf-8');
+          await fs.promises.rename(tmpPath, DAILY_LEADERBOARD_FILE);
+        } catch {
+          await fs.promises.writeFile(DAILY_LEADERBOARD_FILE, json, 'utf-8');
+        }
+      } while (dailyWriteQueued);
+    } catch (err) {
+      console.warn('Failed to persist daily_leaderboard.json:', err);
+    } finally {
+      dailyWriteInFlight = false;
+    }
+  }
+
+  function saveDailyStore() {
+    dailyStore.updatedAt = Date.now();
+    void flushDailyStoreAsync();
+  }
+
+  /** @type {Map<string, { dateKey: string; puzzleNumber: number; roundConfig: any }>} */
+  const dailyConfigCache = new Map();
+
+  function getCachedDailyConfig(dateKey) {
+    const key = dateKey || getDailyDateKeyUtc();
+    if (!dailyConfigCache.has(key)) {
+      if (dailyConfigCache.size > 4) dailyConfigCache.clear();
+      dailyConfigCache.set(key, generateDailyRoundConfig(key));
+    }
+    return dailyConfigCache.get(key);
+  }
+
+  function cloneRoundConfig(rc) {
+    return JSON.parse(JSON.stringify(rc));
+  }
+
+  function sanitizeDailyClientId(rawId) {
+    if (typeof rawId === 'string') {
+      const clean = rawId
+        .trim()
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 56);
+      if (clean.length >= 6) return clean;
+    }
+    return '';
+  }
+
+  function compareDailyEntries(a, b) {
+    const timeDiff =
+      Number((b.survivalTimeSeconds || 0).toFixed(2)) -
+      Number((a.survivalTimeSeconds || 0).toFixed(2));
+    if (timeDiff !== 0) return timeDiff;
+    const overDiff = (b.overchargedSpires || 0) - (a.overchargedSpires || 0);
+    if (overDiff !== 0) return overDiff;
+    const clapsDiff = (b.clapsTaken || 0) - (a.clapsTaken || 0);
+    if (clapsDiff !== 0) return clapsDiff;
+    const wallsDiff = (a.wallsUsed || 0) - (b.wallsUsed || 0);
+    if (wallsDiff !== 0) return wallsDiff;
+    return (a.timestamp || 0) - (b.timestamp || 0);
+  }
+
+  function getDailyEntriesForDay(dateKey) {
+    if (!Array.isArray(dailyStore.days[dateKey])) {
+      dailyStore.days[dateKey] = [];
+    }
+    return dailyStore.days[dateKey];
+  }
+
+  function hasCompletedDaily(dateKey, dailyClientId) {
+    const cid = sanitizeDailyClientId(dailyClientId);
+    if (!cid) return false;
+    const entries = getDailyEntriesForDay(dateKey);
+    return entries.some((e) => e.clientId === cid);
+  }
+
+  function buildDailyPayload(dailyClientId, playerName) {
+    const dateKey = getDailyDateKeyUtc();
+    const { puzzleNumber, roundConfig } = getCachedDailyConfig(dateKey);
+    const entries = getDailyEntriesForDay(dateKey);
+    entries.sort(compareDailyEntries);
+
+    const ranked = entries.map((e, idx) => ({
+      ...e,
+      rank: idx + 1,
+    }));
+
+    const cid = sanitizeDailyClientId(dailyClientId);
+    const nameLower = String(playerName || '').trim().toLowerCase();
+    let myIdx = cid ? ranked.findIndex((e) => e.clientId === cid) : -1;
+    if (myIdx === -1 && nameLower) {
+      myIdx = ranked.findIndex(
+        (e) => String(e.playerName || '').trim().toLowerCase() === nameLower
+      );
+    }
+
+    const totalParticipants = ranked.length;
+    const myStanding =
+      myIdx !== -1
+        ? {
+            rank: myIdx + 1,
+            totalParticipants,
+            percentile: Math.max(
+              1,
+              Math.round(((myIdx + 1) / Math.max(1, totalParticipants)) * 100)
+            ),
+            entry: ranked[myIdx],
+          }
+        : null;
+
+    return {
+      dateKey,
+      puzzleNumber,
+      resetsAtUtcMs: getNextDailyResetUtcMs(),
+      puzzle: {
+        dateKey,
+        puzzleNumber,
+        title: roundConfig.title,
+        subtitle: roundConfig.subtitle,
+        hint: roundConfig.hint,
+        runnerType: roundConfig.runnerType || 'SCOUT',
+        parTimeSeconds: roundConfig.parTimeSeconds,
+        buildTimeSeconds: DAILY_BUILD_TIME_SECONDS || 120,
+        wallCount: Math.floor(
+          roundConfig.startingGold / TOWER_SPECS.BLOCK.goldCost
+        ),
+        spireCount: roundConfig.preplacedSpires.length,
+        keepCount: roundConfig.obstacles.length,
+        hasWaystone: (roundConfig.checkpoints?.length || 0) > 0,
+      },
+      top10: ranked.slice(0, 10),
+      totalParticipants,
+      completedToday: cid ? entries.some((e) => e.clientId === cid) : false,
+      myStanding,
+      updatedAt: dailyStore.updatedAt,
+    };
+  }
+
+  function recordDailyResult(dateKey, player, room) {
+    if (!player || player.isBot) return false;
+    const cid = sanitizeDailyClientId(player._dailyClientId || player._sessionId);
+    if (!cid) return false;
+
+    const entries = getDailyEntriesForDay(dateKey);
+    // Strict 1 official attempt per day
+    if (entries.some((e) => e.clientId === cid)) {
+      return false;
+    }
+
+    const evalRes = evaluateMazeRunTime(room.roundConfig, player.towers || []);
+    const runTime = Number(
+      (
+        (player._evaluatedFinishTime ?? evalRes.finishTimeSeconds) ||
+        0
+      ).toFixed(2)
+    );
+    const parTime = room.roundConfig.parTimeSeconds;
+    const entry = {
+      id: `daily_${dateKey}_${Date.now().toString(36)}_${Math.random()
+        .toString(36)
+        .slice(2, 6)}`,
+      clientId: cid,
+      playerName: sanitizePlayerName(player.name),
+      playerColor: player.color || PLAYER_COLORS[0],
+      survivalTimeSeconds: runTime,
+      parTimeSeconds: parTime,
+      beatPar: runTime >= parTime,
+      clapsTaken: player._evalClaps ?? evalRes.clapsTaken ?? 0,
+      overchargedSpires:
+        player._evalOvercharge ?? evalRes.overchargedSpires ?? 0,
+      linkedKeeps: player._evalKeeps ?? evalRes.linkedKeeps ?? 0,
+      pathDistance: Number(
+        (player.pathDistance || evalRes.distance || 0).toFixed(1)
+      ),
+      wallsUsed: Array.isArray(player.towers) ? player.towers.length : 0,
+      timestamp: Date.now(),
+    };
+
+    entries.push(entry);
+    entries.sort(compareDailyEntries);
+    saveDailyStore();
+    return true;
+  }
+
   const wss = new WebSocketServer({
     server,
     path: '/ws',
@@ -301,6 +535,8 @@ async function startServer() {
   const rooms = new Map();
   /** @type {Map<any, { roomCode: string; playerId: string; sessionId: string; superseded?: boolean }>} */
   const clientMap = new Map();
+  /** @type {Map<any, { dailyClientId?: string; playerName?: string }>} */
+  const socketMeta = new Map();
   /** @type {Map<string, number>} */
   const ipSocketCounts = new Map();
 
@@ -316,18 +552,10 @@ async function startServer() {
   }
 
   function updateRoomBuildPauseState(room) {
-    const connectedHumans = getConnectedHumans(room);
-    const shouldPause =
-      room.phase === 'BUILD' &&
-      room.currentRoundIndex === 0 &&
-      (room.roundsCompleted || 0) === 0 &&
-      !room._roundTouched &&
-      connectedHumans.length === 1 &&
-      connectedHumans[0]._arenaActive === false;
-
+    // Explicit Start flows (Solo setup, Online Lobby Ready-Up, Daily Play) replace the old cold-boot pause
     const prev = Boolean(room._buildTimerPaused);
-    room._buildTimerPaused = shouldPause;
-    return prev !== shouldPause;
+    room._buildTimerPaused = false;
+    return prev !== false;
   }
 
   function markArenaTouched(room, player) {
@@ -473,13 +701,15 @@ async function startServer() {
       presetCursor++;
       bot.gold = room.roundConfig.startingGold;
       bot.pathDistance = baseDist;
-      if (room.phase === 'BUILD') {
+      if (room.phase === 'BUILD' || room.phase === 'PLANNING') {
         bot.ready = false;
         bot._pendingBotTowers = generateMazeLayout(
           room.roundConfig,
           bot.botDifficulty,
           bot.botStyle
         );
+      } else if (room.phase === 'LOBBY') {
+        bot.ready = true;
       }
       room.players.push(bot);
       bots.push(bot);
@@ -490,7 +720,7 @@ async function startServer() {
       const diffChanged = b.botDifficulty !== room.settings.botDifficulty;
       if (diffChanged || forceRegenAllBots) {
         b.botDifficulty = room.settings.botDifficulty;
-        if (room.phase === 'BUILD') {
+        if (room.phase === 'BUILD' || room.phase === 'PLANNING') {
           b.towers = [];
           b.gold = room.roundConfig.startingGold;
           b.pathDistance = baseDist;
@@ -500,41 +730,50 @@ async function startServer() {
             b.botDifficulty,
             b.botStyle
           );
+        } else if (room.phase === 'LOBBY') {
+          b.ready = true;
+          b._pendingBotTowers = [];
         }
       }
     }
   }
 
-  function getOrCreateRoom(
-    roomCode,
-    customSettings,
-    allowOverwriteExisting = false
-  ) {
+  function createRoom(roomCode, customSettings, options = {}) {
+    const mode =
+      options.mode === 'DAILY' || options.mode === 'SOLO'
+        ? options.mode
+        : 'ONLINE';
+    const startInLobby = Boolean(options.startInLobby);
     const code =
-      String(roomCode || 'ARENA1')
+      String(roomCode || 'ROOM100')
         .toUpperCase()
         .replace(/[^A-Z0-9-]/g, '')
-        .slice(0, 8) || 'ARENA1';
+        .slice(0, 8) || 'ROOM100';
 
-    if (rooms.has(code)) {
-      const existing = rooms.get(code);
-      const hasHumans = getAllHumans(existing).length > 0;
-      if (
-        customSettings &&
-        Object.keys(customSettings).length > 0 &&
-        (allowOverwriteExisting || !hasHumans)
-      ) {
-        existing.settings = normalizeRoomSettings(
-          { ...existing.settings, ...customSettings },
-          code
-        );
-        syncRoomBots(existing);
-      }
-      return existing;
-    }
+    const settings = normalizeRoomSettings(
+      {
+        ...(customSettings || {}),
+        ...(mode === 'DAILY'
+          ? {
+              isPublic: false,
+              totalRounds: 1,
+              buildTimeSeconds: DAILY_BUILD_TIME_SECONDS || 120,
+              goldMultiplier: 1.0,
+              botCount: 0,
+              fogOfWar: false,
+            }
+          : mode === 'SOLO'
+          ? { isPublic: false }
+          : {}),
+      },
+      code
+    );
 
-    const settings = normalizeRoomSettings(customSettings || {}, code);
-    const round0 = generateRandomRoundLayout(ROUNDS[0]);
+    const round0 =
+      mode === 'DAILY' && options.dailyRoundConfig
+        ? cloneRoundConfig(options.dailyRoundConfig)
+        : generateRandomRoundLayout(ROUNDS[0]);
+
     const usedColors = new Set([PLAYER_COLORS[0]]);
     const usedNames = new Set();
     const initialBots = [];
@@ -546,12 +785,16 @@ async function startServer() {
 
     const room = {
       roomCode: code,
-      phase: 'BUILD',
+      mode,
+      dailyDateKey: options.dailyDateKey,
+      dailyPuzzleNumber: options.dailyPuzzleNumber,
+      _dailyClientId: options.dailyClientId,
+      phase: startInLobby ? 'LOBBY' : 'PLANNING',
       settings,
       currentRoundIndex: 0,
       roundsCompleted: 0,
       roundConfig: round0,
-      phaseTimeRemaining: round0.buildTimeSeconds,
+      phaseTimeRemaining: startInLobby ? 0 : PLANNING_TIME_SECONDS,
       simSpeedMultiplier: 1,
       players: [...initialBots],
       newRecordHolders: [],
@@ -560,7 +803,11 @@ async function startServer() {
           id: `msg_${Date.now()}`,
           senderName: '',
           senderColor: '#38bdf8',
-          text: `Room ${code} open. Place 2×2 stone walls and link Crimson Keeps to power up Spires.`,
+          text: startInLobby
+            ? `Lobby ${code} created. Share the room code and click Ready when set.`
+            : mode === 'DAILY'
+            ? `Daily Maze #${options.dailyPuzzleNumber || 1} — 5s planning, then 120s to build your best maze.`
+            : `Match started. Plan your route during the 5s countdown, then build!`,
           timestamp: Date.now(),
           isSystem: true,
         },
@@ -569,8 +816,8 @@ async function startServer() {
       _runElapsed: 0,
       _postFinishRealRemaining: 0,
       _botStepAccum: 0,
-      _lastBroadcastSec: -1,
-      _roundTouched: false,
+      _lastBroadcastSec: startInLobby ? 0 : PLANNING_TIME_SECONDS,
+      _roundTouched: !startInLobby,
       _buildTimerPaused: false,
       _keepFogUntilRoundEnd: false,
       _unreadyDisconnectHoldUntil: 0,
@@ -578,7 +825,9 @@ async function startServer() {
     };
 
     rooms.set(code, room);
-    prepareRoundForRoom(room, 0, false);
+    if (!startInLobby) {
+      prepareRoundForRoom(room, 0, false);
+    }
     return room;
   }
 
@@ -602,40 +851,13 @@ async function startServer() {
     }
   }
 
-  function resetDefaultArenaRoom(room) {
-    room.roundsCompleted = 0;
-    room.simSpeedMultiplier = 1;
-    room.newRecordHolders = [];
-    room._roundTouched = false;
-    room._buildTimerPaused = false;
-    room._keepFogUntilRoundEnd = false;
-    room._unreadyDisconnectHoldUntil = 0;
-    room._rerollsThisRound = 0;
-    room.settings = normalizeRoomSettings({}, room.roomCode);
-    room.players = [];
-    syncRoomBots(room);
-    room.chat = [
-      {
-        id: `msg_${Date.now()}`,
-        senderName: '',
-        senderColor: '#38bdf8',
-        text: `Room ${room.roomCode} open. Place 2×2 stone walls and link Crimson Keeps to power up Spires.`,
-        timestamp: Date.now(),
-        isSystem: true,
-      },
-    ];
-    prepareRoundForRoom(room, 0, true);
-  }
-
   function getPublicLobbySummaries() {
-    if (!rooms.has('ARENA1')) {
-      getOrCreateRoom('ARENA1');
-    }
     const list = [];
     for (const room of rooms.values()) {
-      if (!room.settings.isPublic) continue;
+      if (room.mode !== 'ONLINE' || !room.settings.isPublic) continue;
       const connectedHumans = getConnectedHumans(room);
       const allHumans = getAllHumans(room);
+      if (allHumans.length === 0) continue;
       const bots = room.players.filter((p) => p.isBot);
       const host =
         connectedHumans.find((p) => p.isHost) ||
@@ -646,7 +868,7 @@ async function startServer() {
       list.push({
         roomCode: room.roomCode,
         roomName: room.settings.roomName || `Room ${room.roomCode}`,
-        hostName: host && !host.isBot ? host.name : 'Open Lobby',
+        hostName: host && !host.isBot ? host.name : 'Host',
         phase: room.phase,
         currentRound: room.roundConfig.roundNumber,
         totalRounds: room.settings.totalRounds,
@@ -657,7 +879,13 @@ async function startServer() {
         settings: room.settings,
       });
     }
-    return list.sort((a, b) => b.humanCount - a.humanCount);
+    return list.sort((a, b) => {
+      // Waiting lobbies appear first, then by human count
+      const aLobby = a.phase === 'LOBBY' ? 1 : 0;
+      const bLobby = b.phase === 'LOBBY' ? 1 : 0;
+      if (bLobby !== aLobby) return bLobby - aLobby;
+      return b.humanCount - a.humanCount;
+    });
   }
 
   function broadcastLobbyListNow() {
@@ -669,10 +897,14 @@ async function startServer() {
     if (payload === lastLobbyBroadcastPayload) return;
     lastLobbyBroadcastPayload = payload;
 
-    for (const [ws, info] of clientMap.entries()) {
-      if (ws.readyState !== 1 || info.superseded) continue;
-      const r = rooms.get(info.roomCode);
-      if (r && r.phase === 'RUN') continue;
+    for (const ws of wss.clients) {
+      if (ws.readyState !== 1) continue;
+      const info = clientMap.get(ws);
+      if (info?.superseded) continue;
+      if (info) {
+        const r = rooms.get(info.roomCode);
+        if (r && r.phase === 'RUN') continue;
+      }
       ws.send(payload);
     }
   }
@@ -687,21 +919,41 @@ async function startServer() {
       type: 'LEADERBOARD_DATA',
       leaderboard,
     });
-    for (const ws of clientMap.keys()) {
+    for (const ws of wss.clients) {
       if (ws.readyState === 1) {
         ws.send(payload);
       }
     }
   }
 
+  function broadcastDailyLeaderboardToAll() {
+    for (const ws of wss.clients) {
+      if (ws.readyState !== 1) continue;
+      const info = clientMap.get(ws);
+      if (info?.superseded) continue;
+      const meta = socketMeta.get(ws) || {};
+      ws.send(
+        JSON.stringify({
+          type: 'DAILY_LEADERBOARD_DATA',
+          daily: buildDailyPayload(meta.dailyClientId, meta.playerName),
+        })
+      );
+    }
+  }
+
   function sanitizeRoomStateForClient(room, viewerPlayerId) {
     const hideOpponents =
-      room.phase === 'BUILD' &&
+      (room.phase === 'BUILD' || room.phase === 'PLANNING') &&
       (Boolean(room.settings.fogOfWar) || Boolean(room._keepFogUntilRoundEnd));
     const viewerPlayer = room.players.find((p) => p.id === viewerPlayerId);
 
     return {
       roomCode: room.roomCode,
+      mode: room.mode || 'ONLINE',
+      ...(room.dailyDateKey ? { dailyDateKey: room.dailyDateKey } : {}),
+      ...(room.dailyPuzzleNumber
+        ? { dailyPuzzleNumber: room.dailyPuzzleNumber }
+        : {}),
       phase: room.phase,
       settings: room.settings,
       currentRoundIndex: room.currentRoundIndex,
@@ -855,28 +1107,44 @@ async function startServer() {
     emitBroadcast = true,
     options = {}
   ) {
-    const clampedIdx = Math.max(
-      0,
-      Math.min(ROUNDS.length - 1, Number(roundIndex) || 0)
-    );
-    const baseRound = ROUNDS[clampedIdx];
-    const round = generateRandomRoundLayout(baseRound);
+    const isDaily = room.mode === 'DAILY';
+    const clampedIdx = isDaily
+      ? 0
+      : Math.max(0, Math.min(ROUNDS.length - 1, Number(roundIndex) || 0));
 
-    const goldMult = Number(room.settings.goldMultiplier) || 1.0;
-    round.startingGold = Math.max(
-      25,
-      Math.round((baseRound.startingGold * goldMult) / 5) * 5
-    );
-    round.parTimeSeconds = computeEffectivePar(
-      baseRound.parTimeSeconds,
-      goldMult
-    );
-    round.buildTimeSeconds = computeRoundBuildSeconds(baseRound, room.settings);
+    let round;
+    if (isDaily) {
+      const dailyInfo = getCachedDailyConfig(
+        room.dailyDateKey || getDailyDateKeyUtc()
+      );
+      room.dailyDateKey = dailyInfo.dateKey;
+      room.dailyPuzzleNumber = dailyInfo.puzzleNumber;
+      round = cloneRoundConfig(dailyInfo.roundConfig);
+      round.buildTimeSeconds = DAILY_BUILD_TIME_SECONDS || 120;
+    } else {
+      const baseRound = ROUNDS[clampedIdx];
+      round = generateRandomRoundLayout(baseRound);
+
+      const goldMult = Number(room.settings.goldMultiplier) || 1.0;
+      round.startingGold = Math.max(
+        25,
+        Math.round((baseRound.startingGold * goldMult) / 5) * 5
+      );
+      round.parTimeSeconds = computeEffectivePar(
+        baseRound.parTimeSeconds,
+        goldMult
+      );
+      round.buildTimeSeconds = computeRoundBuildSeconds(
+        baseRound,
+        room.settings
+      );
+    }
 
     room.currentRoundIndex = clampedIdx;
     room.roundConfig = round;
-    room.phase = 'BUILD';
-    room.phaseTimeRemaining = round.buildTimeSeconds;
+    // Every new round begins with a 5-second PLANNING countdown before building unlocks
+    room.phase = 'PLANNING';
+    room.phaseTimeRemaining = PLANNING_TIME_SECONDS;
     room.simSpeedMultiplier = [1, 2, 4].includes(room.simSpeedMultiplier)
       ? room.simSpeedMultiplier
       : 1;
@@ -890,11 +1158,8 @@ async function startServer() {
     if (!options.preserveRerollCount) {
       room._rerollsThisRound = 0;
     }
-    room._lastBroadcastSec = Math.ceil(round.buildTimeSeconds);
-
-    if (clampedIdx > 0 || (room.roundsCompleted || 0) > 0) {
-      room._roundTouched = true;
-    }
+    room._lastBroadcastSec = PLANNING_TIME_SECONDS;
+    room._roundTouched = true;
 
     const basePath = computeFullMazePath(round, []);
     const baseDist = Number(basePath.totalDistance.toFixed(1));
@@ -926,7 +1191,9 @@ async function startServer() {
       );
       addSystemChat(
         room,
-        `Round ${round.roundNumber}: ${round.title} · ${wallsCount} walls · Par ${formatParLabel(round.parTimeSeconds)}`
+        isDaily
+          ? `${round.title} · ${wallsCount} walls · 120s build · Par ${formatParLabel(round.parTimeSeconds)}`
+          : `Round ${round.roundNumber}: ${round.title} · ${wallsCount} walls · Par ${formatParLabel(round.parTimeSeconds)}`
       );
       broadcastRoomState(room, true);
     }
@@ -1197,6 +1464,21 @@ async function startServer() {
       });
     });
 
+    if (room.mode === 'DAILY') {
+      const human = ranked.find((p) => !p.isBot);
+      const dateKey = room.dailyDateKey || getDailyDateKeyUtc();
+      if (human) {
+        recordDailyResult(dateKey, human, room);
+      }
+      room.newRecordHolders = [];
+      room.phase = 'GAME_OVER';
+      room.phaseTimeRemaining = 0;
+      room._lastBroadcastSec = 0;
+      broadcastRoomState(room, false);
+      broadcastDailyLeaderboardToAll();
+      return;
+    }
+
     const newRecordHolders = recordRoundToLeaderboard(room, ranked);
     room.newRecordHolders = newRecordHolders;
 
@@ -1315,13 +1597,8 @@ async function startServer() {
       return;
     }
 
-    if (room.roomCode === 'ARENA1') {
-      resetDefaultArenaRoom(room);
-      scheduleLobbyListBroadcast();
-    } else {
-      rooms.delete(room.roomCode);
-      scheduleLobbyListBroadcast();
-    }
+    rooms.delete(room.roomCode);
+    scheduleLobbyListBroadcast();
   }
 
   function clearHostTransferTimerOnly(player) {
@@ -1409,6 +1686,18 @@ async function startServer() {
     player._disconnectTimer = setTimeout(() => {
       player._disconnectTimer = null;
       if (player.connected === false) {
+        if (
+          room.mode === 'DAILY' &&
+          room.phase !== 'GAME_OVER' &&
+          room.phase !== 'LOBBY'
+        ) {
+          recordDailyResult(
+            room.dailyDateKey || getDailyDateKeyUtc(),
+            player,
+            room
+          );
+          broadcastDailyLeaderboardToAll();
+        }
         removePlayerImmediately(room, player, true);
       }
     }, RECONNECT_GRACE_MS);
@@ -1720,7 +2009,7 @@ async function startServer() {
     return `RM${Date.now().toString(36).toUpperCase().slice(-6)}`;
   }
 
-  // Master 250ms monotonic server loop for BUILD, RUN, and ROUND_RESULTS
+  // Master 250ms monotonic server loop for PLANNING, BUILD, RUN, and ROUND_RESULTS
   let lastLoopTickMs = Date.now();
   setInterval(() => {
     const nowMs = Date.now();
@@ -1731,10 +2020,29 @@ async function startServer() {
     lastLoopTickMs = nowMs;
 
     for (const room of rooms.values()) {
+      if (room.phase === 'LOBBY' || room.phase === 'GAME_OVER') continue;
       const connectedHumans = getConnectedHumans(room);
       if (connectedHumans.length === 0) continue;
 
-      if (room.phase === 'BUILD') {
+      if (room.phase === 'PLANNING') {
+        room.phaseTimeRemaining = Math.max(0, room.phaseTimeRemaining - realDt);
+        const ceilSec = Math.ceil(room.phaseTimeRemaining);
+        if (ceilSec !== room._lastBroadcastSec) {
+          room._lastBroadcastSec = ceilSec;
+          broadcastToRoom(room, {
+            type: 'TIMER_TICK',
+            phaseTimeRemaining: ceilSec,
+            phase: 'PLANNING',
+          });
+        }
+        if (room.phaseTimeRemaining <= 0) {
+          room.phase = 'BUILD';
+          room.phaseTimeRemaining = room.roundConfig.buildTimeSeconds;
+          room._lastBroadcastSec = Math.ceil(room.phaseTimeRemaining);
+          room._botStepAccum = 0;
+          broadcastRoomState(room, true);
+        }
+      } else if (room.phase === 'BUILD') {
         updateRoomBuildPauseState(room);
         if (room._buildTimerPaused) {
           continue;
@@ -1887,6 +2195,25 @@ async function startServer() {
 
     let currentRoom = null;
     let currentPlayer = null;
+    socketMeta.set(ws, {});
+
+    // Send live lobby & leaderboard snapshots immediately even before joining a room
+    try {
+      ws.send(
+        JSON.stringify({
+          type: 'LOBBY_LIST',
+          rooms: getPublicLobbySummaries(),
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'LEADERBOARD_DATA',
+          leaderboard,
+        })
+      );
+    } catch {
+      // ignore
+    }
 
     // Per-socket token bucket + heavy CPU action cooldown + chat flood guard
     let msgTokens = 50;
@@ -1940,26 +2267,88 @@ async function startServer() {
         lastHeavyActionByType.set(msg.type, nowMs);
       }
 
+      if (msg.type === 'REQUEST_DAILY') {
+        const cid = sanitizeDailyClientId(msg.dailyClientId);
+        const meta = socketMeta.get(ws) || {};
+        if (cid) meta.dailyClientId = cid;
+        if (typeof msg.playerName === 'string' && msg.playerName.trim()) {
+          meta.playerName = sanitizePlayerName(msg.playerName);
+        }
+        socketMeta.set(ws, meta);
+        ws.send(
+          JSON.stringify({
+            type: 'DAILY_LEADERBOARD_DATA',
+            daily: buildDailyPayload(meta.dailyClientId, meta.playerName),
+          })
+        );
+        return;
+      }
+
+      if (msg.type === 'LEAVE_ROOM') {
+        if (currentRoom && currentPlayer) {
+          // Leaving an active Daily Maze before finishing locks in today's single attempt with the current maze
+          if (
+            currentRoom.mode === 'DAILY' &&
+            currentRoom.phase !== 'GAME_OVER' &&
+            currentRoom.phase !== 'LOBBY'
+          ) {
+            recordDailyResult(
+              currentRoom.dailyDateKey || getDailyDateKeyUtc(),
+              currentPlayer,
+              currentRoom
+            );
+            broadcastDailyLeaderboardToAll();
+          }
+          detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
+          currentRoom = null;
+          currentPlayer = null;
+        }
+        ws.send(JSON.stringify({ type: 'LEFT_ROOM' }));
+        ws.send(
+          JSON.stringify({
+            type: 'LOBBY_LIST',
+            rooms: getPublicLobbySummaries(),
+          })
+        );
+        return;
+      }
+
       if (msg.type === 'JOIN_ROOM') {
-        const targetCode =
-          String(msg.roomCode || 'ARENA1')
-            .toUpperCase()
-            .replace(/[^A-Z0-9-]/g, '')
-            .slice(0, 8) || 'ARENA1';
+        const targetCode = String(msg.roomCode || '')
+          .toUpperCase()
+          .replace(/[^A-Z0-9-]/g, '')
+          .slice(0, 8);
         const sessionId = sanitizeSessionId(msg.sessionId);
 
-        // Pre-detach capacity check prevents deleting the player from their current room when target is 6/6 full!
-        if (rooms.has(targetCode)) {
-          const existingTarget = rooms.get(targetCode);
-          if (!canRoomAcceptJoin(existingTarget, sessionId)) {
-            ws.send(
-              JSON.stringify({
-                type: 'ERROR_TOAST',
-                message: 'Room is full (max 6 players).',
-              })
-            );
-            return;
-          }
+        if (!targetCode || !rooms.has(targetCode)) {
+          ws.send(
+            JSON.stringify({
+              type: 'ERROR_TOAST',
+              message: `Room "${targetCode || '?'}" not found. Check the code or host a new room.`,
+            })
+          );
+          return;
+        }
+
+        const existingTarget = rooms.get(targetCode);
+        if (existingTarget.mode !== 'ONLINE') {
+          ws.send(
+            JSON.stringify({
+              type: 'ERROR_TOAST',
+              message: 'That room is private and cannot be joined.',
+            })
+          );
+          return;
+        }
+
+        if (!canRoomAcceptJoin(existingTarget, sessionId)) {
+          ws.send(
+            JSON.stringify({
+              type: 'ERROR_TOAST',
+              message: 'Room is full (max 6 players).',
+            })
+          );
+          return;
         }
 
         if (
@@ -1972,15 +2361,14 @@ async function startServer() {
           currentPlayer = null;
         }
 
-        const room = getOrCreateRoom(targetCode, msg.createSettings, false);
         const joined = joinOrReconnectPlayer(
           ws,
-          room,
+          existingTarget,
           msg.playerName,
           sessionId
         );
         if (joined) {
-          currentRoom = room;
+          currentRoom = existingTarget;
           currentPlayer = joined;
         }
         return;
@@ -1994,7 +2382,11 @@ async function startServer() {
         }
 
         const targetCode = generateUniqueRoomCode(msg.roomCode);
-        const room = getOrCreateRoom(targetCode, msg.settings || {}, true);
+        // Online rooms always start in LOBBY phase so players can join & ready up before the host starts!
+        const room = createRoom(targetCode, msg.settings || {}, {
+          mode: 'ONLINE',
+          startInLobby: true,
+        });
         const joined = joinOrReconnectPlayer(
           ws,
           room,
@@ -2002,6 +2394,130 @@ async function startServer() {
           msg.sessionId
         );
         if (joined) {
+          currentRoom = room;
+          currentPlayer = joined;
+        }
+        return;
+      }
+
+      if (msg.type === 'START_SOLO') {
+        if (currentRoom && currentPlayer) {
+          detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
+          currentRoom = null;
+          currentPlayer = null;
+        }
+
+        const targetCode = generateUniqueRoomCode(
+          `SOLO${Math.floor(10 + Math.random() * 89)}`
+        );
+        const room = createRoom(targetCode, msg.settings || {}, {
+          mode: 'SOLO',
+          startInLobby: false,
+        });
+        const joined = joinOrReconnectPlayer(
+          ws,
+          room,
+          msg.playerName,
+          msg.sessionId
+        );
+        if (joined) {
+          currentRoom = room;
+          currentPlayer = joined;
+        }
+        return;
+      }
+
+      if (msg.type === 'START_DAILY') {
+        const dailyClientId = sanitizeDailyClientId(
+          msg.dailyClientId || msg.sessionId
+        );
+        const dateKey = getDailyDateKeyUtc();
+        const meta = socketMeta.get(ws) || {};
+        if (dailyClientId) meta.dailyClientId = dailyClientId;
+        if (typeof msg.playerName === 'string' && msg.playerName.trim()) {
+          meta.playerName = sanitizePlayerName(msg.playerName);
+        }
+        socketMeta.set(ws, meta);
+
+        // Enforce 1 attempt per day
+        if (hasCompletedDaily(dateKey, dailyClientId)) {
+          ws.send(
+            JSON.stringify({
+              type: 'DAILY_LEADERBOARD_DATA',
+              daily: buildDailyPayload(dailyClientId, msg.playerName),
+            })
+          );
+          ws.send(
+            JSON.stringify({
+              type: 'ERROR_TOAST',
+              message:
+                "You've already completed today's Daily Maze! Come back tomorrow.",
+            })
+          );
+          return;
+        }
+
+        // Reconnect into an existing active Daily Maze room for this player if still running
+        let activeDailyRoom = null;
+        for (const r of rooms.values()) {
+          if (
+            r.mode === 'DAILY' &&
+            r.dailyDateKey === dateKey &&
+            r._dailyClientId &&
+            r._dailyClientId === dailyClientId &&
+            r.phase !== 'GAME_OVER'
+          ) {
+            activeDailyRoom = r;
+            break;
+          }
+        }
+
+        if (
+          currentRoom &&
+          currentPlayer &&
+          (!activeDailyRoom || currentRoom.roomCode !== activeDailyRoom.roomCode)
+        ) {
+          detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
+          currentRoom = null;
+          currentPlayer = null;
+        }
+
+        let room = activeDailyRoom;
+        if (!room) {
+          const dailyInfo = getCachedDailyConfig(dateKey);
+          const targetCode = generateUniqueRoomCode(
+            `DAY${Math.floor(100 + Math.random() * 899)}`
+          );
+          room = createRoom(
+            targetCode,
+            {
+              roomName: `Daily Maze #${dailyInfo.puzzleNumber}`,
+              isPublic: false,
+              totalRounds: 1,
+              buildTimeSeconds: DAILY_BUILD_TIME_SECONDS || 120,
+              goldMultiplier: 1.0,
+              botCount: 0,
+              fogOfWar: false,
+            },
+            {
+              mode: 'DAILY',
+              startInLobby: false,
+              dailyDateKey: dailyInfo.dateKey,
+              dailyPuzzleNumber: dailyInfo.puzzleNumber,
+              dailyRoundConfig: dailyInfo.roundConfig,
+              dailyClientId,
+            }
+          );
+        }
+
+        const joined = joinOrReconnectPlayer(
+          ws,
+          room,
+          msg.playerName,
+          msg.sessionId
+        );
+        if (joined) {
+          joined._dailyClientId = dailyClientId;
           currentRoom = room;
           currentPlayer = joined;
         }
@@ -2259,6 +2775,17 @@ async function startServer() {
           ackClientSeq(currentPlayer, msg.clientSeq);
           markArenaTouched(currentRoom, currentPlayer);
 
+          if (currentRoom.mode === 'DAILY') {
+            sendBuildRejection(
+              ws,
+              currentRoom,
+              currentPlayer,
+              'Sample mazes are disabled in the Daily Maze.',
+              msg.clientSeq
+            );
+            return;
+          }
+
           if (currentRoom.phase !== 'BUILD') {
             sendBuildRejection(
               ws,
@@ -2328,6 +2855,15 @@ async function startServer() {
         }
 
         case 'REROLL_MAP': {
+          if (currentRoom.mode === 'DAILY') {
+            ws.send(
+              JSON.stringify({
+                type: 'ERROR_TOAST',
+                message: 'Everyone competes on the exact same Daily Maze.',
+              })
+            );
+            return;
+          }
           if (currentRoom.phase !== 'BUILD') return;
           if (
             !requireHostIfMultiHuman(
@@ -2367,6 +2903,12 @@ async function startServer() {
           ackClientSeq(currentPlayer, msg.clientSeq);
           markArenaTouched(currentRoom, currentPlayer);
 
+          if (currentRoom.phase === 'LOBBY') {
+            currentPlayer.ready = !currentPlayer.ready;
+            broadcastRoomState(currentRoom, true);
+            return;
+          }
+
           if (currentRoom.phase !== 'BUILD') {
             sendRoomStateToPlayer(currentRoom, currentPlayer.id);
             return;
@@ -2392,7 +2934,32 @@ async function startServer() {
           ) {
             return;
           }
+          if (currentRoom.phase === 'LOBBY') {
+            const connectedHumans = getConnectedHumans(currentRoom);
+            if (
+              connectedHumans.length === 0 ||
+              !connectedHumans.every((p) => p.ready)
+            ) {
+              ws.send(
+                JSON.stringify({
+                  type: 'ERROR_TOAST',
+                  message:
+                    'Every player in the lobby must ready up before starting.',
+                })
+              );
+              return;
+            }
+            resetMatchStandingFields(currentRoom);
+            markArenaTouched(currentRoom, currentPlayer);
+            addSystemChat(
+              currentRoom,
+              `${currentPlayer.name} started the match! 5-second planning timer begins.`
+            );
+            prepareRoundForRoom(currentRoom, 0, true);
+            return;
+          }
           if (Number.isInteger(msg.roundIndex)) {
+            if (currentRoom.mode === 'DAILY') return;
             if (currentRoom.phase === 'RUN') {
               ws.send(
                 JSON.stringify({
@@ -2415,6 +2982,7 @@ async function startServer() {
         }
 
         case 'NEXT_ROUND': {
+          if (currentRoom.mode === 'DAILY') return;
           if (
             currentRoom.phase !== 'ROUND_RESULTS' &&
             currentRoom.phase !== 'GAME_OVER'
@@ -2438,6 +3006,7 @@ async function startServer() {
         }
 
         case 'RESTART_MATCH': {
+          if (currentRoom.mode === 'DAILY') return;
           const connectedHumans = getConnectedHumans(currentRoom);
 
           // In GAME_OVER, non-hosts can cast a nextRoundReady vote to start a new match
@@ -2477,6 +3046,7 @@ async function startServer() {
         }
 
         case 'JUMP_TO_ROUND': {
+          if (currentRoom.mode === 'DAILY') return;
           if (
             !requireHostIfMultiHuman(
               ws,
@@ -2540,6 +3110,7 @@ async function startServer() {
         }
 
         case 'UPDATE_SETTINGS': {
+          if (currentRoom.mode === 'DAILY') return;
           if (
             !requireHostIfMultiHuman(
               ws,
@@ -2666,6 +3237,7 @@ async function startServer() {
         }
 
         case 'ADD_BOT': {
+          if (currentRoom.mode === 'DAILY') return;
           if (
             !requireHostIfMultiHuman(
               ws,
@@ -2707,7 +3279,10 @@ async function startServer() {
             usedNames
           );
           bot.gold = currentRoom.roundConfig.startingGold;
-          if (currentRoom.phase === 'BUILD') {
+          if (
+            currentRoom.phase === 'BUILD' ||
+            currentRoom.phase === 'PLANNING'
+          ) {
             bot.ready = false;
             bot._pendingBotTowers = generateMazeLayout(
               currentRoom.roundConfig,
@@ -2733,6 +3308,7 @@ async function startServer() {
         }
 
         case 'REMOVE_BOT': {
+          if (currentRoom.mode === 'DAILY') return;
           if (
             !requireHostIfMultiHuman(
               ws,
@@ -2812,6 +3388,7 @@ async function startServer() {
         ipSocketCounts.set(clientIp, remForIp);
       }
 
+      socketMeta.delete(ws);
       const info = clientMap.get(ws);
       clientMap.delete(ws);
       if (!info || info.superseded) return;
@@ -2819,7 +3396,7 @@ async function startServer() {
     });
   });
 
-  // REST API Endpoints for Lobby Browser, Leaderboard & Cloud Healthchecks
+  // REST API Endpoints for Lobby Browser, Leaderboard, Daily Maze & Cloud Healthchecks
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
@@ -2839,6 +3416,14 @@ async function startServer() {
 
   app.get('/api/leaderboard', (_req, res) => {
     res.json(leaderboard);
+  });
+
+  app.get('/api/daily', (req, res) => {
+    const clientId =
+      typeof req.query?.clientId === 'string' ? req.query.clientId : '';
+    const playerName =
+      typeof req.query?.playerName === 'string' ? req.query.playerName : '';
+    res.json(buildDailyPayload(clientId, playerName));
   });
 
   // Serve compiled static bundle in production if dist/index.html exists

@@ -2,11 +2,16 @@ import {
   computeCitadelCircuitry,
   validateTowerPlacement,
 } from '../shared/pathfinding.js';
-import { computeEffectivePar, ROUNDS } from '../shared/rounds.js';
+import {
+  computeEffectivePar,
+  generateRandomRoundLayout,
+  ROUNDS,
+} from '../shared/rounds.js';
 import { MazeRunnerSimulator, SIM_DT } from '../shared/simulation.js';
 import {
   ActiveBuildTool,
   ClientToServerMessage,
+  DailyMazePayload,
   getEffectiveSpireStats,
   GridPoint,
   LeaderboardPayload,
@@ -73,8 +78,67 @@ interface ArmedButtonEntry {
   armedAt: number;
 }
 
+type MenuScreen =
+  | 'home'
+  | 'solo-setup'
+  | 'online'
+  | 'lobby'
+  | 'daily'
+  | 'how-to-play'
+  | 'settings'
+  | 'leaderboard';
+
 const NAME_STORAGE_KEY = 'mc2026_player_name';
 const TAB_SESSION_STORAGE_KEY = 'mc2026_tab_session_id';
+const DAILY_CLIENT_ID_STORAGE_KEY = 'mc2026_daily_client_id';
+const TIPS_STORAGE_KEY = 'mc2026_show_tips';
+
+function readOrCreateDailyClientId(): string {
+  const generated = `daily_${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 12)}`;
+  try {
+    const existing = localStorage.getItem(DAILY_CLIENT_ID_STORAGE_KEY);
+    if (existing && existing.trim().length >= 8) {
+      return existing.trim();
+    }
+    localStorage.setItem(DAILY_CLIENT_ID_STORAGE_KEY, generated);
+    return generated;
+  } catch {
+    return generated;
+  }
+}
+
+function readShowRoundTips(): boolean {
+  try {
+    const raw = localStorage.getItem(TIPS_STORAGE_KEY);
+    return raw === null ? true : raw !== '0';
+  } catch {
+    return true;
+  }
+}
+
+function formatCountdownHms(msRemaining: number): string {
+  const totalSec = Math.max(0, Math.floor(msRemaining / 1000));
+  const hh = String(Math.floor(totalSec / 3600)).padStart(2, '0');
+  const mm = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+  const ss = String(totalSec % 60).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+function formatDailyDateLabel(dateKey: string): string {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  if (!y || !m || !d) return dateKey;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return (
+    dt.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: 'UTC',
+    }) + ' · UTC'
+  );
+}
 
 function escapeHtml(raw: string): string {
   return raw
@@ -146,15 +210,22 @@ class MazingContestClient {
   private ws: WebSocket | null = null;
   private localPlayerId: string | null = null;
   private sessionId: string;
+  private dailyClientId: string;
   private roomState: RoomState | null = null;
-  private roomCode: string;
+  private roomCode: string | null = null;
+  private urlInviteRoomCode: string | null = null;
   private playerName: string;
+  private showRoundTips: boolean;
 
   private lobbies: LobbyRoomSummary[] = [];
   private leaderboard: LeaderboardPayload | null = null;
-  private activeHubTab: 'play' | 'leaderboard' | 'codex' = 'play';
+  private dailyData: DailyMazePayload | null = null;
+  private activeMenuScreen: MenuScreen = 'home';
   private leaderboardMode: 'rounds' | 'champions' = 'rounds';
   private selectedLeaderboardRound = 1;
+  private dailyCountdownInterval: number | null = null;
+  private lastPlanningTickSec = -1;
+  private lobbyRulesEditorOpen = false;
 
   private simulators = new Map<string, MazeRunnerSimulator>();
   private simAccumulator = 0;
@@ -208,31 +279,26 @@ class MazingContestClient {
     this.renderer3d = new Arena3DRenderer(viewport, labels);
 
     this.sessionId = readOrCreateSessionId();
+    this.dailyClientId = readOrCreateDailyClientId();
     this.playerName = readOrCreatePlayerName();
+    this.showRoundTips = readShowRoundTips();
 
     const urlParams = new URLSearchParams(window.location.search);
-    const urlRoom = urlParams.get('room');
-    this.roomCode = (urlRoom || 'ARENA1')
+    const urlRoom = (urlParams.get('room') || '')
       .toUpperCase()
       .replace(/[^A-Z0-9-]/g, '')
-      .slice(0, 8) || 'ARENA1';
+      .slice(0, 8);
+    this.urlInviteRoomCode = urlRoom || null;
+    this.roomCode = null;
 
-    const nameInput = document.getElementById(
-      'player-name-input'
-    ) as HTMLInputElement | null;
-    if (nameInput) nameInput.value = this.playerName;
+    this.syncAllNameInputs();
 
-    const hubNameInput = document.getElementById(
-      'hub-player-name-input'
-    ) as HTMLInputElement | null;
-    if (hubNameInput) hubNameInput.value = this.playerName;
-
-    // Direct ?room= invite links enter the sunlit 3D island immediately
-    if (urlRoom) {
-      document.getElementById('home-hub-modal')?.classList.add('hidden');
-    }
+    // Show sunlit decorative island behind the simplified Home Screen with ZERO server room created
+    this.renderMenuBackdropIsland();
+    this.openMenuScreen('home');
 
     this.syncAudioMuteButtons();
+    this.syncSettingsScreenControls();
     this.setupVisualViewportAndInsets();
     this.setupRendererCallbacks();
     this.setupUIEvents();
@@ -243,6 +309,7 @@ class MazingContestClient {
     this.scheduleHudSafeInsetsSync();
     this.connectWebSocket();
     this.fetchInitialHubData();
+    this.startDailyCountdownTicker();
 
     let lastTime = performance.now();
     const animate = (now: number) => {
@@ -562,9 +629,14 @@ class MazingContestClient {
 
   private async fetchInitialHubData() {
     try {
-      const [lobbiesRes, lbRes] = await Promise.all([
+      const qs = new URLSearchParams({
+        clientId: this.dailyClientId,
+        playerName: this.playerName,
+      });
+      const [lobbiesRes, lbRes, dailyRes] = await Promise.all([
         fetch('/api/lobbies'),
         fetch('/api/leaderboard'),
+        fetch(`/api/daily?${qs.toString()}`),
       ]);
       if (lobbiesRes.ok) {
         const data = await lobbiesRes.json();
@@ -577,8 +649,13 @@ class MazingContestClient {
         this.leaderboard = await lbRes.json();
         this.renderLeaderboard();
       }
+      if (dailyRes.ok) {
+        this.dailyData = await dailyRes.json();
+        this.updateHomeDailyBadge();
+        this.renderDailyScreen();
+      }
     } catch {
-      // WebSocket also supplies LOBBY_LIST & LEADERBOARD_DATA
+      // WebSocket also supplies LOBBY_LIST, LEADERBOARD_DATA & DAILY_LEADERBOARD_DATA
     }
   }
 
@@ -590,12 +667,39 @@ class MazingContestClient {
 
     this.ws.addEventListener('open', () => {
       this.updateWsStatusPill(null);
+      this.send({ type: 'REQUEST_LOBBIES' });
       this.send({
-        type: 'JOIN_ROOM',
-        roomCode: this.roomCode,
+        type: 'REQUEST_DAILY',
+        dailyClientId: this.dailyClientId,
         playerName: this.playerName,
-        sessionId: this.sessionId,
       });
+
+      // Only join a room if reconnecting to an active room or explicitly invited via ?room=CODE
+      if (this.roomCode && this.roomState?.mode === 'DAILY') {
+        this.send({
+          type: 'START_DAILY',
+          playerName: this.playerName,
+          sessionId: this.sessionId,
+          dailyClientId: this.dailyClientId,
+        });
+      } else if (this.roomCode) {
+        this.send({
+          type: 'JOIN_ROOM',
+          roomCode: this.roomCode,
+          playerName: this.playerName,
+          sessionId: this.sessionId,
+        });
+      } else if (this.urlInviteRoomCode) {
+        const inviteCode = this.urlInviteRoomCode;
+        this.urlInviteRoomCode = null;
+        this.pendingJoinToast = `Joined room ${inviteCode}`;
+        this.send({
+          type: 'JOIN_ROOM',
+          roomCode: inviteCode,
+          playerName: this.playerName,
+          sessionId: this.sessionId,
+        });
+      }
     });
 
     this.ws.addEventListener('message', (ev) => {
@@ -619,26 +723,32 @@ class MazingContestClient {
           }
         }
         this.roomCode = msg.state.roomCode;
-        this.syncUrlRoomCode(this.roomCode);
+        this.syncUrlRoomCode(
+          msg.state.mode === 'ONLINE' ? this.roomCode : null
+        );
 
         const joinToast = this.pendingJoinToast;
         this.pendingJoinToast = null;
         if (joinToast) {
           this.showToast(joinToast, true);
-          this.closeHub();
+        }
+
+        if (msg.state.phase === 'LOBBY') {
+          this.openMenuScreen('lobby');
         } else {
-          this.send({
-            type: 'CLIENT_ARENA_ACTIVE',
-            active: !this.isHubOpen(),
-          });
+          this.closeHub();
         }
 
         this.applyRoomState(msg.state);
         this.syncConfigFormFromSettings(msg.state.settings);
       } else if (msg.type === 'ROOM_STATE') {
         this.roomCode = msg.state.roomCode;
-        this.syncUrlRoomCode(this.roomCode);
+        this.syncUrlRoomCode(
+          msg.state.mode === 'ONLINE' ? this.roomCode : null
+        );
         this.applyRoomState(msg.state);
+      } else if (msg.type === 'LEFT_ROOM') {
+        this.handleLeftRoomCleanup();
       } else if (msg.type === 'TIMER_TICK') {
         if (this.roomState) {
           this.roomState.phaseTimeRemaining = msg.phaseTimeRemaining;
@@ -650,8 +760,11 @@ class MazingContestClient {
             this.reconcileRunDrift(msg.runElapsed);
           }
           this.updateTimerDOM(true);
+          if (this.roomState.phase === 'PLANNING') {
+            this.updatePlanningBannerDOM(true);
+          }
           if (this.isHubOpen()) {
-            this.updateHubHeroStatus();
+            this.updateHomeActiveMatchBar();
           }
           if (this.roomState.phase === 'ROUND_RESULTS') {
             this.updateResultsCountdownDOM();
@@ -663,6 +776,16 @@ class MazingContestClient {
       } else if (msg.type === 'LEADERBOARD_DATA') {
         this.leaderboard = msg.leaderboard;
         this.renderLeaderboard();
+      } else if (msg.type === 'DAILY_LEADERBOARD_DATA') {
+        this.dailyData = msg.daily;
+        this.updateHomeDailyBadge();
+        this.renderDailyScreen();
+        if (
+          this.roomState?.mode === 'DAILY' &&
+          this.roomState.phase === 'GAME_OVER'
+        ) {
+          this.renderRoundResultsModal(this.roomState);
+        }
       } else if (msg.type === 'CHAT_MESSAGE') {
         if (this.roomState) {
           this.roomState.chat.push(msg.message);
@@ -671,6 +794,7 @@ class MazingContestClient {
           const drawerHidden =
             !lobbyDrawer || lobbyDrawer.classList.contains('hidden');
           if (
+            this.roomState.phase !== 'LOBBY' &&
             drawerHidden &&
             !msg.message.isSystem &&
             msg.message.senderName !== this.playerName
@@ -683,6 +807,9 @@ class MazingContestClient {
         }
       } else if (msg.type === 'ERROR_TOAST') {
         this.pendingJoinToast = null;
+        if (!this.roomState) {
+          this.syncUrlRoomCode(null);
+        }
         if (typeof msg.rejectedSeq === 'number') {
           this.pendingMutations = this.pendingMutations.filter(
             (m) => m.seq !== msg.rejectedSeq
@@ -719,11 +846,16 @@ class MazingContestClient {
     });
   }
 
-  private syncUrlRoomCode(code: string) {
+  private syncUrlRoomCode(code: string | null) {
     try {
       const url = new URL(window.location.href);
-      if (url.searchParams.get('room') !== code) {
-        url.searchParams.set('room', code);
+      if (code) {
+        if (url.searchParams.get('room') !== code) {
+          url.searchParams.set('room', code);
+          window.history.replaceState({}, '', url.toString());
+        }
+      } else if (url.searchParams.has('room')) {
+        url.searchParams.delete('room');
         window.history.replaceState({}, '', url.toString());
       }
     } catch {
@@ -822,7 +954,47 @@ class MazingContestClient {
     document.getElementById('round-brief-banner')?.classList.add('hidden');
   }
 
+  private hidePlanningBanner() {
+    document.getElementById('planning-banner')?.classList.add('hidden');
+  }
+
+  private updatePlanningBannerDOM(fromTick: boolean) {
+    if (!this.roomState || this.roomState.phase !== 'PLANNING') {
+      this.hidePlanningBanner();
+      return;
+    }
+    const banner = document.getElementById('planning-banner');
+    const numEl = document.getElementById('planning-countdown-num');
+    const lineEl = document.getElementById('planning-round-line');
+    const hintEl = document.getElementById('planning-hint-line');
+    if (!banner || !numEl || !lineEl) return;
+
+    const secs = Math.max(1, Math.ceil(this.roomState.phaseTimeRemaining));
+    const round = this.roomState.roundConfig;
+    const archKey = round.runnerType || 'SCOUT';
+    const arch = RUNNER_ARCHETYPES[archKey];
+
+    numEl.textContent = String(secs);
+    const roundPrefix =
+      this.roomState.mode === 'DAILY'
+        ? round.title
+        : `Round ${round.roundNumber} · ${round.title}`;
+    lineEl.textContent = `${roundPrefix} · Building unlocks in ${secs}s`;
+    if (hintEl) {
+      hintEl.textContent = `${arch.name} · Par ${formatParTarget(
+        round.parTimeSeconds
+      )} — inspect Spires and Red Keeps to plan your route!`;
+    }
+    banner.classList.remove('hidden');
+
+    if (fromTick && secs <= 3 && secs !== this.lastPlanningTickSec) {
+      this.lastPlanningTickSec = secs;
+      soundEngine.playCountdownTick(secs === 1);
+    }
+  }
+
   private triggerRoundBriefBanner() {
+    if (!this.showRoundTips) return;
     if (!this.roomState || this.roomState.phase !== 'BUILD') return;
     if (this.isHubOpen()) {
       this.pendingRoundBrief = true;
@@ -942,6 +1114,7 @@ class MazingContestClient {
     const prevPhase = this.roomState?.phase;
     this.roomState = state;
     document.body.dataset.phase = state.phase;
+    document.body.dataset.mode = state.mode || 'ONLINE';
 
     const undoSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
       state.roundConfig.seed ?? ''
@@ -960,6 +1133,27 @@ class MazingContestClient {
         );
       }
       this.replayPendingMutationsOntoLocalPlayer(state);
+    }
+
+    // Waiting Room LOBBY phase: keep player on the Multiplayer Lobby screen
+    if (state.phase === 'LOBBY') {
+      this.runPhaseActive = false;
+      this.hidePlanningBanner();
+      this.dismissRoundBrief();
+      document.getElementById('results-modal')?.classList.add('hidden');
+      document.getElementById('hud-bottom-dock')?.classList.add('dock-hidden');
+      document.getElementById('hud-run-dock')?.classList.add('hidden');
+      this.openMenuScreen('lobby');
+      this.renderWaitingLobby();
+      this.renderChat();
+      this.syncHostOnlyControls();
+      this.renderLobbyBrowser();
+      return;
+    }
+
+    // Leaving LOBBY into PLANNING/BUILD/RUN -> enter the 3D arena immediately
+    if (prevPhase === 'LOBBY' && this.isHubOpen()) {
+      this.closeHub();
     }
 
     this.renderer3d.syncRoomState(state, this.localPlayerId);
@@ -981,10 +1175,25 @@ class MazingContestClient {
       this.runPhaseActive = false;
     }
 
-    // Trigger Round Brief at start of each round's BUILD phase
+    // 5-second Planning Countdown before Building begins
+    if (state.phase === 'PLANNING') {
+      if (prevPhase !== 'PLANNING') {
+        this.lastPlanningTickSec = -1;
+        this.renderer3d.resetToMyIsland();
+      }
+      this.dismissRoundBrief();
+      this.updatePlanningBannerDOM(false);
+    } else {
+      this.hidePlanningBanner();
+    }
+
+    // Trigger Build unlock chime & Round Brief at start of each round's BUILD phase
     if (state.phase === 'BUILD') {
-      if (prevPhase && prevPhase !== 'BUILD') {
-        // Fresh BUILD round: return camera to the local island, North-up
+      if (prevPhase === 'PLANNING') {
+        soundEngine.playBuildUnlock();
+        soundEngine.haptic('ready');
+        this.showToast('Build phase open — place your walls!', true);
+      } else if (prevPhase && prevPhase !== 'BUILD') {
         this.renderer3d.resetToMyIsland();
       }
       const briefSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
@@ -2496,9 +2705,120 @@ class MazingContestClient {
   // AUDIO, SPECTATOR BAR & HOME HUB NAVIGATION
   // ==========================================================================
 
+  private syncAllNameInputs() {
+    const ids = [
+      'player-name-input',
+      'hub-player-name-input',
+      'settings-player-name',
+    ];
+    for (const id of ids) {
+      const inp = document.getElementById(id) as HTMLInputElement | null;
+      if (inp && inp.value !== this.playerName) {
+        inp.value = this.playerName;
+      }
+    }
+  }
+
+  private commitPlayerName(rawVal: string) {
+    const clean = rawVal.trim().slice(0, 18);
+    if (clean) {
+      this.playerName = clean;
+      try {
+        localStorage.setItem(NAME_STORAGE_KEY, clean);
+      } catch {
+        // ignore
+      }
+      this.syncAllNameInputs();
+      if (this.roomState) {
+        this.send({ type: 'SET_NAME', playerName: clean });
+      }
+      this.send({
+        type: 'REQUEST_DAILY',
+        dailyClientId: this.dailyClientId,
+        playerName: this.playerName,
+      });
+    } else {
+      this.syncAllNameInputs();
+    }
+  }
+
+  private renderMenuBackdropIsland() {
+    if (this.roomState) return;
+    const previewRound = generateRandomRoundLayout(ROUNDS[0], 20261126);
+    const previewState: RoomState = {
+      roomCode: 'PREVIEW',
+      mode: 'SOLO',
+      phase: 'LOBBY',
+      settings: {
+        roomName: 'Preview',
+        isPublic: false,
+        totalRounds: 8,
+        buildTimeSeconds: 90,
+        goldMultiplier: 1,
+        botCount: 0,
+        botDifficulty: 'ARCHITECT',
+        fogOfWar: false,
+      },
+      currentRoundIndex: 0,
+      roundsCompleted: 0,
+      roundConfig: previewRound,
+      phaseTimeRemaining: 0,
+      simSpeedMultiplier: 1,
+      players: [
+        {
+          id: 'preview_local',
+          name: this.playerName,
+          color: '#38bdf8',
+          isBot: false,
+          isHost: true,
+          ready: false,
+          gold: previewRound.startingGold,
+          towers: [],
+          pathDistance: 24,
+          totalScore: 0,
+          lastRoundTime: null,
+          lastRoundPoints: 0,
+          bestMazeTime: 0,
+          roundHistory: [],
+        },
+      ],
+      chat: [],
+    };
+    this.renderer3d.syncRoomState(previewState, 'preview_local');
+  }
+
+  private handleLeftRoomCleanup() {
+    this.roomState = null;
+    this.localPlayerId = null;
+    this.roomCode = null;
+    this.runPhaseActive = false;
+    this.simulators.clear();
+    this.undoStack = [];
+    this.redoStack = [];
+    this.pendingMutations = [];
+    this.lobbyRulesEditorOpen = false;
+    this.hidePlanningBanner();
+    this.dismissRoundBrief();
+    this.dismissAllTransientOverlays();
+    document.getElementById('results-modal')?.classList.add('hidden');
+    document.getElementById('hud-bottom-dock')?.classList.add('dock-hidden');
+    document.getElementById('hud-run-dock')?.classList.add('hidden');
+    document.getElementById('spectator-bar')?.classList.add('hidden');
+    document.body.dataset.phase = 'LOBBY';
+    document.body.dataset.mode = 'ONLINE';
+    this.syncUrlRoomCode(null);
+    this.renderMenuBackdropIsland();
+    this.openMenuScreen('home');
+    this.send({
+      type: 'REQUEST_DAILY',
+      dailyClientId: this.dailyClientId,
+      playerName: this.playerName,
+    });
+  }
+
   private syncAudioMuteButtons() {
     const hudIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 18);
-    const subIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 17);
+    const subIcon = icon(soundEngine.muted ? 'volumeOff' : 'volumeOn', 16);
 
     const muteBtn = document.getElementById('btn-mute');
     const muteIconSlot = document.getElementById('mute-icon-slot');
@@ -2512,8 +2832,43 @@ class MazingContestClient {
 
     const hubMuteBtn = document.getElementById('btn-hub-mute');
     const hubMuteIconSlot = document.getElementById('hub-mute-icon-slot');
+    const hubMuteLabel = document.getElementById('hub-mute-label');
     if (hubMuteIconSlot) hubMuteIconSlot.innerHTML = subIcon;
+    if (hubMuteLabel) {
+      hubMuteLabel.textContent = soundEngine.muted ? 'Muted' : 'Sound On';
+    }
     hubMuteBtn?.classList.toggle('active', soundEngine.muted);
+
+    this.syncSettingsScreenControls();
+  }
+
+  private syncSettingsScreenControls() {
+    const soundBtn = document.getElementById('settings-sound-toggle');
+    if (soundBtn) {
+      const soundOn = !soundEngine.muted;
+      soundBtn.textContent = soundOn ? 'On' : 'Muted';
+      soundBtn.classList.toggle('active', soundOn);
+    }
+
+    const volPct = Math.round(soundEngine.volume * 100);
+    const slider = document.getElementById(
+      'settings-volume-slider'
+    ) as HTMLInputElement | null;
+    if (slider) slider.value = String(volPct);
+    const volVal = document.getElementById('settings-volume-value');
+    if (volVal) volVal.textContent = `${volPct}%`;
+
+    const hapticsBtn = document.getElementById('settings-haptics-toggle');
+    if (hapticsBtn) {
+      hapticsBtn.textContent = soundEngine.hapticsEnabled ? 'On' : 'Off';
+      hapticsBtn.classList.toggle('active', soundEngine.hapticsEnabled);
+    }
+
+    const tipsBtn = document.getElementById('settings-tips-toggle');
+    if (tipsBtn) {
+      tipsBtn.textContent = this.showRoundTips ? 'On' : 'Off';
+      tipsBtn.classList.toggle('active', this.showRoundTips);
+    }
   }
 
   private syncSpectatorStateDOM() {
@@ -2524,10 +2879,10 @@ class MazingContestClient {
     const nameEl = document.getElementById('spectator-target-name');
     if (bar) {
       const phase = this.roomState?.phase;
-      // Desktop also shows the bar during RUN (touch uses #hud-run-dock's My Island toggle)
       const showBar =
         spectating &&
         (phase === 'BUILD' ||
+          phase === 'PLANNING' ||
           (phase === 'RUN' && document.body.dataset.input !== 'touch'));
       bar.classList.toggle('hidden', !showBar);
       if (showBar && nameEl && this.roomState) {
@@ -2540,6 +2895,7 @@ class MazingContestClient {
   }
 
   private toggleOverviewOrReturnHome() {
+    if (this.roomState?.mode === 'DAILY') return;
     this.renderer3d.cancelTouchGhost();
     this.hideTouchPrecisionTray();
     this.hideCursorPill();
@@ -2566,33 +2922,96 @@ class MazingContestClient {
       : `${icon('eye', 15)}<span>View Mazes</span>`;
   }
 
-  private openHub(
-    tab?: 'play' | 'leaderboard' | 'codex',
+  private openMenuScreen(
+    screen: MenuScreen,
     mobilePlayPane?: 'rooms' | 'setup'
   ) {
-    if (tab) {
-      this.switchHubTab(tab);
+    this.activeMenuScreen = screen;
+    const hub = document.getElementById('home-hub-modal');
+    if (hub) {
+      hub.dataset.screen = screen;
+      hub.classList.remove('hidden');
     }
+
+    const allScreens: MenuScreen[] = [
+      'home',
+      'solo-setup',
+      'online',
+      'lobby',
+      'daily',
+      'how-to-play',
+      'settings',
+      'leaderboard',
+    ];
+    for (const s of allScreens) {
+      document
+        .getElementById(`screen-${s}`)
+        ?.classList.toggle('hidden', s !== screen);
+    }
+
     if (mobilePlayPane) {
       this.setMobilePlayPane(mobilePlayPane);
     }
-    if (this.roomState) {
-      this.syncConfigFormFromSettings(this.roomState.settings);
-      this.updateHubHeroStatus();
-    }
+
+    document.body.dataset.inMenu = 'true';
     this.dismissAllTransientOverlays();
     this.renderer3d.cancelTouchGhost();
     this.hideTouchPrecisionTray();
     this.hideCursorPill();
-    document.getElementById('home-hub-modal')?.classList.remove('hidden');
     this.syncModalOpenState();
-    this.send({ type: 'CLIENT_ARENA_ACTIVE', active: false });
-    this.send({ type: 'REQUEST_LOBBIES' });
+
+    if (screen === 'home') {
+      this.updateHomeActiveMatchBar();
+      this.updateHomeDailyBadge();
+    } else if (screen === 'online') {
+      this.send({ type: 'REQUEST_LOBBIES' });
+      this.renderLobbyBrowser();
+    } else if (screen === 'lobby') {
+      this.renderWaitingLobby();
+    } else if (screen === 'daily') {
+      this.send({
+        type: 'REQUEST_DAILY',
+        dailyClientId: this.dailyClientId,
+        playerName: this.playerName,
+      });
+      this.renderDailyScreen();
+    } else if (screen === 'leaderboard') {
+      this.renderLeaderboard();
+    } else if (screen === 'settings') {
+      this.syncAllNameInputs();
+      this.syncSettingsScreenControls();
+    }
+  }
+
+  private openHub(
+    tab?: 'play' | 'leaderboard' | 'codex' | MenuScreen,
+    mobilePlayPane?: 'rooms' | 'setup'
+  ) {
+    let target: MenuScreen = 'home';
+    if (tab === 'leaderboard') target = 'leaderboard';
+    else if (tab === 'codex') target = 'how-to-play';
+    else if (tab === 'play') target = 'home';
+    else if (tab) target = tab;
+
+    this.openMenuScreen(target, mobilePlayPane);
+    if (this.roomState) {
+      this.send({ type: 'CLIENT_ARENA_ACTIVE', active: false });
+    }
   }
 
   private closeHub() {
+    if (!this.roomState || this.roomState.phase === 'LOBBY') {
+      if (this.roomState?.phase === 'LOBBY') {
+        this.openMenuScreen('lobby');
+      } else {
+        this.openMenuScreen('home');
+      }
+      return;
+    }
+
     this.disarmAllButtons();
     document.getElementById('home-hub-modal')?.classList.add('hidden');
+    document.body.dataset.inMenu = 'false';
     this.syncModalOpenState();
     this.send({ type: 'CLIENT_ARENA_ACTIVE', active: true });
     if (this.pendingRoundBrief) {
@@ -2613,88 +3032,558 @@ class MazingContestClient {
       });
   }
 
-  private switchHubTab(tab: 'play' | 'leaderboard' | 'codex') {
-    this.activeHubTab = tab;
-    document
-      .querySelectorAll<HTMLButtonElement>('.hub-tab-btn')
-      .forEach((btn) => {
-        const isActive = btn.dataset.hubTab === tab;
-        btn.classList.toggle('active', isActive);
-        btn.setAttribute('aria-selected', String(isActive));
-      });
+  private updateHubHeroStatus() {
+    this.updateHomeActiveMatchBar();
+  }
 
-    document
-      .getElementById('hub-tab-play')
-      ?.classList.toggle('hidden', tab !== 'play');
-    document
-      .getElementById('hub-tab-leaderboard')
-      ?.classList.toggle('hidden', tab !== 'leaderboard');
-    document
-      .getElementById('hub-tab-codex')
-      ?.classList.toggle('hidden', tab !== 'codex');
+  private updateHomeActiveMatchBar() {
+    const bar = document.getElementById('home-active-match-bar');
+    const textEl = document.getElementById('home-active-match-text');
+    const resumeBtn = document.getElementById('btn-home-resume');
+    if (!bar || !textEl) return;
 
-    if (tab === 'leaderboard') {
-      this.renderLeaderboard();
+    if (!this.roomState) {
+      bar.classList.add('hidden');
+      return;
+    }
+
+    bar.classList.remove('hidden');
+    const modeLabel =
+      this.roomState.mode === 'DAILY'
+        ? `Daily Maze #${this.roomState.dailyPuzzleNumber || 1}`
+        : this.roomState.mode === 'SOLO'
+        ? 'Solo Match'
+        : `Room ${this.roomState.roomCode}`;
+
+    let statusDetail = '';
+    if (this.roomState.phase === 'LOBBY') {
+      statusDetail = 'Waiting in Lobby';
+    } else if (this.roomState.phase === 'PLANNING') {
+      statusDetail = `Planning (${Math.max(
+        1,
+        Math.ceil(this.roomState.phaseTimeRemaining)
+      )}s)`;
+    } else if (this.roomState.phase === 'BUILD') {
+      statusDetail = `Round ${this.roomState.roundConfig.roundNumber} · Building`;
+    } else if (this.roomState.phase === 'RUN') {
+      statusDetail = `Round ${this.roomState.roundConfig.roundNumber} · Running`;
+    } else {
+      statusDetail = 'Results';
+    }
+
+    textEl.innerHTML = `<strong>${escapeHtml(modeLabel)}</strong> · ${escapeHtml(
+      statusDetail
+    )}`;
+    if (resumeBtn) {
+      const label =
+        this.roomState.phase === 'LOBBY' ? 'Return to Lobby' : 'Resume Match';
+      resumeBtn.innerHTML = `${icon('play', 14)}<span>${label}</span>`;
     }
   }
 
-  private updateHubHeroStatus() {
-    const statusEl = document.getElementById('hub-hero-status');
-    const heroPlayBtn = document.getElementById('btn-hero-play');
-    const closeHubBtn = document.getElementById('btn-close-hub');
-    if (!statusEl || !this.roomState) return;
-
-    const rNum = this.roomState.roundConfig.roundNumber;
-    const total = this.roomState.settings?.totalRounds || ROUNDS.length;
-    let phaseDesc = '';
-
-    if (this.roomState.phase === 'BUILD') {
-      if (this.roomState.buildTimerPaused) {
-        phaseDesc = `Round ${rNum}/${total} · Paused · Ready when you are`;
-      } else if (this.roomState.settings?.buildTimeSeconds === 999) {
-        phaseDesc = `Round ${rNum}/${total} · Build phase (∞)`;
-      } else {
-        const secs = Math.max(0, Math.ceil(this.roomState.phaseTimeRemaining));
-        const mm = String(Math.floor(secs / 60)).padStart(2, '0');
-        const ss = String(secs % 60).padStart(2, '0');
-        phaseDesc = `Round ${rNum}/${total} · Build ${mm}:${ss}`;
-      }
-    } else if (this.roomState.phase === 'RUN') {
-      phaseDesc = `Round ${rNum}/${total} · Run in progress`;
-    } else if (this.roomState.phase === 'GAME_OVER') {
-      phaseDesc = `Final Standings · ${total} Rounds`;
+  private updateHomeDailyBadge() {
+    const badge = document.getElementById('home-daily-badge');
+    if (!badge) return;
+    if (!this.dailyData) {
+      badge.textContent = 'Daily Challenge';
+      badge.classList.remove('completed');
+      return;
+    }
+    if (this.dailyData.completedToday && this.dailyData.myStanding) {
+      badge.textContent = `Rank #${this.dailyData.myStanding.rank} / ${this.dailyData.totalParticipants}`;
+      badge.classList.add('completed');
     } else {
-      phaseDesc = `Round ${rNum}/${total} · Standings`;
+      badge.textContent = `Daily #${this.dailyData.puzzleNumber}`;
+      badge.classList.remove('completed');
+    }
+  }
+
+  private startDailyCountdownTicker() {
+    if (this.dailyCountdownInterval !== null) {
+      window.clearInterval(this.dailyCountdownInterval);
+    }
+    const tick = () => {
+      const el = document.getElementById('daily-reset-countdown');
+      if (!el || !this.dailyData) return;
+      const msLeft = Math.max(0, this.dailyData.resetsAtUtcMs - Date.now());
+      el.textContent = `Next maze in ${formatCountdownHms(msLeft)}`;
+      if (msLeft === 0) {
+        this.send({
+          type: 'REQUEST_DAILY',
+          dailyClientId: this.dailyClientId,
+          playerName: this.playerName,
+        });
+      }
+    };
+    tick();
+    this.dailyCountdownInterval = window.setInterval(tick, 1000);
+  }
+
+  private renderDailyLeaderboardRows(
+    container: HTMLElement,
+    daily: DailyMazePayload
+  ) {
+    container.innerHTML = '';
+    if (!daily.top10 || daily.top10.length === 0) {
+      container.innerHTML = `<div class="daily-empty-note">No scores yet today. Be the very first to set the pace!</div>`;
+      return;
     }
 
-    statusEl.innerHTML = `
-      <span class="status-dot"></span>
-      <span>Room <strong>${escapeHtml(
-        this.roomState.roomCode
-      )}</strong> · ${escapeHtml(phaseDesc)}</span>
+    const head = document.createElement('div');
+    head.className = 'lb-table-head daily-lb-head';
+    head.innerHTML = `
+      <div>Rank</div>
+      <div>Player</div>
+      <div>Time</div>
+      <div class="lb-synergies">Maze Stats</div>
     `;
+    container.appendChild(head);
 
-    const me = this.getLocalPlayer();
-    const hasActiveProgress = Boolean(
-      (me && me.towers.length > 0) ||
-        rNum > 1 ||
-        this.roomState.phase !== 'BUILD'
-    );
+    daily.top10.forEach((rec, idx) => {
+      const rank = rec.rank || idx + 1;
+      const isMe =
+        rec.clientId === this.dailyClientId ||
+        Boolean(daily.myStanding && daily.myStanding.entry.id === rec.id);
+      const row = document.createElement('div');
+      const rankClass = rank <= 3 ? ` rank-${rank}` : '';
+      row.className = `lb-row daily-lb-row${rankClass}${isMe ? ' is-me' : ''}`;
 
-    if (heroPlayBtn) {
-      const label = hasActiveProgress ? 'Resume Match' : 'Play Now';
-      heroPlayBtn.innerHTML = `${icon('play', 14)}<span>${label}</span>`;
+      const rankBadge =
+        rank <= 3
+          ? getMedalBadge(rank as 1 | 2 | 3, 22)
+          : `<span>#${rank}</span>`;
+      const parBadge = rec.beatPar
+        ? `<span class="par-pill">${icon('starFilled', 10)}<span>Par</span></span>`
+        : '';
+      const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
+
+      row.innerHTML = `
+        <div class="lb-rank">${rankBadge}</div>
+        <div class="lb-architect">
+          <span class="player-swatch" style="background:${escapeHtml(
+            rec.playerColor
+          )}"></span>
+          <span class="lb-name">${escapeHtml(rec.playerName)}</span>
+          ${youBadge}
+        </div>
+        <div class="lb-time-primary">
+          <span>${rec.survivalTimeSeconds.toFixed(2)}s</span>
+          ${parBadge}
+        </div>
+        <div class="lb-synergies">
+          <span class="stat-chip" title="Spire Hits">${icon('bolt', 12)} ${
+        rec.clapsTaken
+      }</span>
+          <span class="stat-chip" title="Overcharge">${icon(
+            'diamondFilled',
+            11
+          )} ${rec.overchargedSpires}</span>
+          <span class="stat-chip" title="Path Length">${rec.pathDistance.toFixed(
+            0
+          )}m</span>
+        </div>
+      `;
+      container.appendChild(row);
+    });
+  }
+
+  private renderDailyScreen() {
+    const titleEl = document.getElementById('daily-screen-title');
+    const dateEl = document.getElementById('daily-screen-date');
+    const countdownEl = document.getElementById('daily-reset-countdown');
+    const puzzleNameEl = document.getElementById('daily-puzzle-name');
+    const specsEl = document.getElementById('daily-puzzle-specs');
+    const hintEl = document.getElementById('daily-puzzle-hint');
+    const ctaArea = document.getElementById('daily-cta-area');
+    const countBadge = document.getElementById('daily-participants-badge');
+    const tableWrap = document.getElementById('daily-leaderboard-table');
+    const standingBar = document.getElementById('daily-my-standing-bar');
+
+    if (!this.dailyData) {
+      if (tableWrap) {
+        tableWrap.innerHTML = `<div class="daily-empty-note">Loading today's Daily Maze…</div>`;
+      }
+      return;
     }
-    if (closeHubBtn) {
-      const resumeLabel = hasActiveProgress ? 'Resume' : 'Enter Island';
-      const resumeSpan = closeHubBtn.querySelector('.resume-btn-text');
-      if (resumeSpan) resumeSpan.textContent = resumeLabel;
-      closeHubBtn.title = `${resumeLabel} (Esc)`;
-      closeHubBtn.setAttribute('aria-label', resumeLabel);
+
+    const d = this.dailyData;
+    const p = d.puzzle;
+    const arch = RUNNER_ARCHETYPES[p.runnerType || 'SCOUT'];
+
+    if (titleEl) titleEl.textContent = `Daily Maze #${d.puzzleNumber}`;
+    if (dateEl) dateEl.textContent = formatDailyDateLabel(d.dateKey);
+    if (countdownEl) {
+      countdownEl.textContent = `Next maze in ${formatCountdownHms(
+        Math.max(0, d.resetsAtUtcMs - Date.now())
+      )}`;
+    }
+    if (puzzleNameEl) puzzleNameEl.textContent = p.title;
+    if (hintEl) hintEl.textContent = p.hint;
+    if (specsEl) {
+      specsEl.innerHTML = `
+        <span class="meta-pill">${getRunnerIcon(p.runnerType, 13)} ${escapeHtml(
+        arch.name
+      )}</span>
+        <span class="meta-pill">${icon('pillar', 13)} ${p.wallCount} Walls</span>
+        <span class="meta-pill">${icon('bolt', 13)} ${p.spireCount} Spires</span>
+        <span class="meta-pill">${icon('keep', 13)} ${p.keepCount} Keeps</span>
+        ${
+          p.hasWaystone
+            ? `<span class="meta-pill">${icon('target', 13)} Waystone</span>`
+            : ''
+        }
+        <span class="par-pill">${icon('starFilled', 11)} Par ${escapeHtml(
+        formatParTarget(p.parTimeSeconds)
+      )}</span>
+      `;
+    }
+
+    if (countBadge) {
+      countBadge.textContent = `${d.totalParticipants} ${
+        d.totalParticipants === 1 ? 'Player' : 'Players'
+      }`;
+    }
+
+    if (ctaArea) {
+      if (d.completedToday && d.myStanding) {
+        const s = d.myStanding;
+        ctaArea.innerHTML = `
+          <div class="daily-completed-box">
+            <div class="daily-completed-head">
+              <span class="meta-pill daily-done-pill">${icon('check', 13)} Completed Today</span>
+              <strong>${s.entry.survivalTimeSeconds.toFixed(2)}s</strong>
+              ${
+                s.entry.beatPar
+                  ? `<span class="par-pill">${icon('starFilled', 11)} Beat Par</span>`
+                  : ''
+              }
+            </div>
+            <p class="daily-completed-sub">
+              You placed <strong>#${s.rank} of ${s.totalParticipants}</strong> (Top ${
+          s.percentile
+        }%). A new maze unlocks at midnight UTC!
+            </p>
+            <button type="button" id="btn-daily-share" class="dock-ready-btn daily-play-cta">
+              ${icon('share', 15)}<span>Share Result</span>
+            </button>
+          </div>
+        `;
+        document
+          .getElementById('btn-daily-share')
+          ?.addEventListener('click', () => {
+            soundEngine.playUiClick();
+            this.shareDailyResult();
+          });
+      } else {
+        ctaArea.innerHTML = `
+          <button type="button" id="btn-start-daily" class="dock-ready-btn daily-play-cta">
+            ${icon('play', 15)}<span>Play Today's Maze</span>
+          </button>
+        `;
+        document
+          .getElementById('btn-start-daily')
+          ?.addEventListener('click', () => {
+            if (!this.ensureConnectedForAction()) return;
+            soundEngine.playUiClick();
+            this.pendingJoinToast = `Daily Maze #${d.puzzleNumber} — 5s to plan!`;
+            this.send({
+              type: 'START_DAILY',
+              playerName: this.playerName,
+              sessionId: this.sessionId,
+              dailyClientId: this.dailyClientId,
+            });
+          });
+      }
+    }
+
+    if (tableWrap) {
+      this.renderDailyLeaderboardRows(tableWrap, d);
+    }
+
+    if (standingBar) {
+      if (d.myStanding) {
+        const s = d.myStanding;
+        const inTop10 = s.rank <= 10;
+        standingBar.innerHTML = `
+          <div class="standing-left">
+            <span class="you-badge">Your Position</span>
+            <strong>#${s.rank}</strong>
+            <span>of ${s.totalParticipants} (Top ${s.percentile}%)</span>
+            ${inTop10 ? `<span class="meta-pill">Top 10!</span>` : ''}
+          </div>
+          <div class="standing-right">
+            <strong>${s.entry.survivalTimeSeconds.toFixed(2)}s</strong>
+            ${
+              s.entry.beatPar
+                ? `<span class="par-pill">${icon('starFilled', 10)} Par</span>`
+                : ''
+            }
+          </div>
+        `;
+      } else {
+        standingBar.innerHTML = `
+          <div class="standing-left">
+            <span class="meta-pill">Your Position</span>
+            <span>Not ranked yet today — play your daily attempt to claim your spot!</span>
+          </div>
+        `;
+      }
+    }
+  }
+
+  private async shareDailyResult() {
+    const d = this.dailyData;
+    const s = d?.myStanding;
+    if (!d || !s) return;
+    const e = s.entry;
+    const parIcon = e.beatPar
+      ? '⭐ Beat Par'
+      : `Par ${formatParTarget(e.parTimeSeconds)}`;
+    const shareText = [
+      `🏰 Mazing Contest · Daily Maze #${d.puzzleNumber} (${d.dateKey})`,
+      `⏱️ ${e.survivalTimeSeconds.toFixed(2)}s · ${parIcon}`,
+      `🏆 Rank #${s.rank} / ${s.totalParticipants} (Top ${s.percentile}%)`,
+      `⚡ ${e.clapsTaken} Spire Hits · ◆ ${e.overchargedSpires} Overcharge · 🧱 ${e.wallsUsed} Walls`,
+      `${window.location.origin}`,
+    ].join('\n');
+
+    if (
+      document.body.dataset.input === 'touch' &&
+      typeof navigator.share === 'function'
+    ) {
+      try {
+        await navigator.share({
+          title: `Mazing Contest Daily #${d.puzzleNumber}`,
+          text: shareText,
+        });
+        return;
+      } catch (err) {
+        if ((err as Error)?.name === 'AbortError') return;
+      }
+    }
+
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(shareText);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+    if (!copied) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = shareText;
+        ta.setAttribute('readonly', 'true');
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        copied = document.execCommand('copy');
+        ta.remove();
+      } catch {
+        copied = false;
+      }
+    }
+    this.showToast(
+      copied
+        ? 'Daily Maze result copied to clipboard!'
+        : 'Could not copy result.',
+      copied
+    );
+  }
+
+  private renderWaitingLobby() {
+    if (!this.roomState || this.roomState.phase !== 'LOBBY') return;
+    const state = this.roomState;
+    const me = this.getLocalPlayer();
+    const isHost = Boolean(me?.isHost);
+
+    const nameEl = document.getElementById('lobby-room-name');
+    const codeEl = document.getElementById('lobby-room-code');
+    const visEl = document.getElementById('lobby-visibility-badge');
+    const countEl = document.getElementById('lobby-player-count');
+    const slotsGrid = document.getElementById('lobby-slots-grid');
+    const rulesSummary = document.getElementById('lobby-rules-summary');
+    const editBtn = document.getElementById('btn-lobby-edit-rules');
+    const hostBotActions = document.getElementById('lobby-host-bot-actions');
+    const readyBtn = document.getElementById(
+      'btn-lobby-ready'
+    ) as HTMLButtonElement | null;
+    const readyLabel = document.getElementById('lobby-ready-label');
+    const startBtn = document.getElementById(
+      'btn-lobby-start'
+    ) as HTMLButtonElement | null;
+    const startLabel = document.getElementById('lobby-start-label');
+    const startHint = document.getElementById('lobby-start-hint');
+
+    if (nameEl)
+      nameEl.textContent = state.settings.roomName || `Room ${state.roomCode}`;
+    if (codeEl) codeEl.textContent = state.roomCode;
+    if (visEl)
+      visEl.textContent = state.settings.isPublic ? 'Public' : 'Private';
+    if (countEl) countEl.textContent = `${state.players.length} / 6`;
+
+    if (hostBotActions) {
+      hostBotActions.classList.toggle('hidden', !isHost);
+    }
+    if (editBtn) {
+      editBtn.classList.toggle('hidden', !isHost);
+    }
+    if (!isHost) {
+      this.lobbyRulesEditorOpen = false;
+      document.getElementById('lobby-rules-editor')?.classList.add('hidden');
+    }
+
+    const addBotBtn = document.getElementById(
+      'btn-lobby-add-bot'
+    ) as HTMLButtonElement | null;
+    const remBotBtn = document.getElementById(
+      'btn-lobby-remove-bot'
+    ) as HTMLButtonElement | null;
+    const botCount = state.players.filter((p) => p.isBot).length;
+    if (addBotBtn) addBotBtn.disabled = !isHost || state.players.length >= 6;
+    if (remBotBtn) remBotBtn.disabled = !isHost || botCount <= 0;
+
+    if (slotsGrid) {
+      slotsGrid.innerHTML = '';
+      for (let i = 0; i < 6; i++) {
+        const p = state.players[i];
+        const card = document.createElement('div');
+        if (p) {
+          const isMe = p.id === this.localPlayerId;
+          const isReady = p.isBot || p.ready;
+          card.className = `lobby-slot-card filled${isMe ? ' is-me' : ''}${
+            isReady ? ' is-ready' : ''
+          }`;
+          const roleBadge = p.isBot
+            ? `<span class="bot-badge">BOT · ${escapeHtml(
+                formatBotSkillLabel(p.botDifficulty)
+              )}</span>`
+            : p.isHost
+            ? `<span class="bot-badge host-badge">${icon('crown', 11)} HOST</span>`
+            : '';
+          const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
+          const statusPill = isReady
+            ? `<span class="lobby-ready-pill ready">${icon('check', 12)} Ready</span>`
+            : `<span class="lobby-ready-pill waiting">Not Ready</span>`;
+
+          card.innerHTML = `
+            <div class="lobby-slot-identity">
+              <span class="player-swatch" style="background:${escapeHtml(
+                p.color
+              )}"></span>
+              <span class="lobby-slot-name">${escapeHtml(p.name)}</span>
+              ${youBadge}
+              ${roleBadge}
+            </div>
+            ${statusPill}
+          `;
+        } else {
+          card.className = 'lobby-slot-card empty';
+          card.innerHTML = `
+            <div class="lobby-slot-identity">
+              <span class="lobby-empty-dot"></span>
+              <span class="lobby-empty-label">Open Slot · Waiting for player…</span>
+            </div>
+          `;
+        }
+        slotsGrid.appendChild(card);
+      }
+    }
+
+    if (rulesSummary) {
+      const s = state.settings;
+      const timerLabel =
+        s.buildTimeSeconds === 999
+          ? 'Unlimited (∞)'
+          : s.buildTimeSeconds > 0
+          ? `${s.buildTimeSeconds}s`
+          : 'Round Default (90s–120s)';
+      rulesSummary.innerHTML = `
+        <div class="lobby-rule-chip"><strong>Rounds:</strong> ${s.totalRounds}</div>
+        <div class="lobby-rule-chip"><strong>Build Timer:</strong> ${timerLabel}</div>
+        <div class="lobby-rule-chip"><strong>Wall Supply:</strong> ${formatWallSupplyLabel(
+          s.goldMultiplier
+        )}</div>
+        <div class="lobby-rule-chip"><strong>Bots:</strong> ${botCount} (${formatBotSkillLabel(
+        s.botDifficulty
+      )})</div>
+        <div class="lobby-rule-chip"><strong>Rival Mazes:</strong> ${
+          s.fogOfWar ? 'Hidden' : 'Visible'
+        }</div>
+        <div class="lobby-rule-chip"><strong>Planning:</strong> 5s before every round</div>
+      `;
+    }
+
+    const setLobbySeg = (groupId: string, val: string) => {
+      document
+        .querySelectorAll<HTMLButtonElement>(`#${groupId} .seg-btn`)
+        .forEach((b) => b.classList.toggle('active', b.dataset.val === val));
+    };
+    setLobbySeg(
+      'lobby-cfg-public-group',
+      String(Boolean(state.settings.isPublic))
+    );
+    setLobbySeg(
+      'lobby-cfg-rounds-group',
+      String(state.settings.totalRounds || 8)
+    );
+    setLobbySeg(
+      'lobby-cfg-buildtime-group',
+      String(state.settings.buildTimeSeconds || 0)
+    );
+    setLobbySeg(
+      'lobby-cfg-gold-group',
+      String(state.settings.goldMultiplier || 1)
+    );
+    setLobbySeg(
+      'lobby-cfg-botdiff-group',
+      state.settings.botDifficulty || 'ARCHITECT'
+    );
+    setLobbySeg('lobby-cfg-fog-group', String(Boolean(state.settings.fogOfWar)));
+
+    const connectedHumans = state.players.filter(
+      (p) => !p.isBot && p.connected !== false
+    );
+    const readyHumans = connectedHumans.filter((p) => p.ready).length;
+    const allHumansReady =
+      connectedHumans.length > 0 && readyHumans === connectedHumans.length;
+
+    if (readyBtn && readyLabel && me) {
+      readyBtn.classList.toggle('is-ready', me.ready);
+      readyLabel.textContent = me.ready ? 'Ready ✓' : 'Ready Up';
+    }
+
+    if (startBtn && startLabel) {
+      if (isHost) {
+        startBtn.classList.remove('hidden');
+        startBtn.disabled = !allHumansReady;
+        startLabel.textContent = allHumansReady
+          ? 'Start Round'
+          : `Waiting for Ready (${readyHumans}/${connectedHumans.length})`;
+      } else {
+        startBtn.classList.add('hidden');
+      }
+    }
+
+    if (startHint) {
+      if (allHumansReady) {
+        startHint.textContent = isHost
+          ? 'Everyone is ready! Click Start Round when you want to begin.'
+          : 'Everyone is ready! Waiting for the host to start the round…';
+      } else if (!me?.ready) {
+        startHint.textContent =
+          'Click Ready Up once you are set. All players must ready up before the round starts.';
+      } else {
+        startHint.textContent = `Waiting for other players to ready up (${readyHumans}/${connectedHumans.length} ready)…`;
+      }
     }
   }
 
   private async shareOrCopyInviteLink() {
+    if (!this.roomCode) return;
     const shareUrl = `${window.location.origin}/?room=${this.roomCode}`;
 
     if (
@@ -2704,7 +3593,7 @@ class MazingContestClient {
       try {
         await navigator.share({
           title: 'Mazing Contest',
-          text: `Join room ${this.roomCode} in Mazing Contest`,
+          text: `Join lobby ${this.roomCode} in Mazing Contest`,
           url: shareUrl,
         });
         return;
@@ -2714,7 +3603,10 @@ class MazingContestClient {
     }
 
     let copied = false;
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    if (
+      navigator.clipboard &&
+      typeof navigator.clipboard.writeText === 'function'
+    ) {
       try {
         await navigator.clipboard.writeText(shareUrl);
         copied = true;
@@ -2750,34 +3642,28 @@ class MazingContestClient {
   private setupHubEvents() {
     document.getElementById('btn-open-hub')?.addEventListener('click', () => {
       soundEngine.playUiClick();
-      this.openHub('play');
+      this.openMenuScreen('home');
     });
 
     document
       .getElementById('btn-open-leaderboard')
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
-        this.openHub('leaderboard');
+        this.openMenuScreen('leaderboard');
       });
 
     document
       .getElementById('btn-drawer-open-config')
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
-        const expandChk = document.getElementById(
-          'chk-expand-rules'
-        ) as HTMLInputElement | null;
-        if (expandChk) expandChk.checked = true;
         this.dismissAllTransientOverlays();
-        this.openHub('play', 'setup');
+        this.openMenuScreen('online', 'setup');
       });
 
-    document
-      .getElementById('btn-hub-mute')
-      ?.addEventListener('click', () => {
-        soundEngine.toggleMuted();
-        this.syncAudioMuteButtons();
-      });
+    document.getElementById('btn-hub-mute')?.addEventListener('click', () => {
+      soundEngine.toggleMuted();
+      this.syncAudioMuteButtons();
+    });
 
     document
       .getElementById('btn-results-leaderboard')
@@ -2788,35 +3674,78 @@ class MazingContestClient {
             this.roomState.roundConfig.roundNumber;
           this.leaderboardMode = 'rounds';
         }
-        this.openHub('leaderboard');
+        this.openMenuScreen('leaderboard');
       });
 
-    document.getElementById('btn-close-hub')?.addEventListener('click', () => {
-      soundEngine.playUiClick();
-      this.closeHub();
-    });
+    document
+      .getElementById('btn-results-share-daily')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.shareDailyResult();
+      });
 
-    document.getElementById('btn-hero-play')?.addEventListener('click', () => {
-      soundEngine.playUiClick();
-      this.closeHub();
-    });
+    document
+      .getElementById('btn-results-home')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        if (this.roomState) {
+          this.send({ type: 'LEAVE_ROOM' });
+        } else {
+          this.openMenuScreen('home');
+        }
+      });
 
     const hubModal = document.getElementById('home-hub-modal');
     hubModal?.addEventListener('click', (e) => {
-      if (e.target === hubModal) {
+      if (
+        e.target === hubModal &&
+        this.roomState &&
+        this.roomState.phase !== 'LOBBY'
+      ) {
         this.closeHub();
       }
     });
 
     document
-      .querySelectorAll<HTMLButtonElement>('.hub-tab-btn')
+      .querySelectorAll<HTMLButtonElement>('[data-nav]')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
           soundEngine.playUiClick();
-          const tab = btn.dataset.hubTab as 'play' | 'leaderboard' | 'codex';
-          this.switchHubTab(tab);
+          const target = btn.dataset.nav as MenuScreen;
+          if (target) {
+            this.openMenuScreen(target);
+          }
         });
       });
+
+    document
+      .getElementById('btn-home-resume')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        if (this.roomState?.phase === 'LOBBY') {
+          this.openMenuScreen('lobby');
+        } else {
+          this.closeHub();
+        }
+      });
+
+    const leaveHomeBtn = document.getElementById('btn-home-leave');
+    leaveHomeBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!this.roomState) return;
+      const isDailyActive =
+        this.roomState.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
+      this.armDestructiveButton(
+        leaveHomeBtn,
+        isDailyActive || this.roomState.phase === 'BUILD',
+        isDailyActive ? 'End Daily Try?' : 'Confirm Leave',
+        'logout',
+        () => {
+          soundEngine.playUiClick();
+          this.send({ type: 'LEAVE_ROOM' });
+        }
+      );
+    });
 
     document
       .querySelectorAll<HTMLButtonElement>('#hub-play-subtabs .subtab-pill')
@@ -2828,48 +3757,121 @@ class MazingContestClient {
         });
       });
 
-    // Sync player name between Hub and Room Drawer inputs
     const hubNameInput = document.getElementById(
       'hub-player-name-input'
     ) as HTMLInputElement | null;
-    const drawerNameInput = document.getElementById(
-      'player-name-input'
+    const settingsNameInput = document.getElementById(
+      'settings-player-name'
     ) as HTMLInputElement | null;
 
-    const commitName = (val: string) => {
-      const clean = val.trim().slice(0, 18);
-      if (clean) {
-        this.playerName = clean;
+    [hubNameInput, settingsNameInput].forEach((inp) => {
+      if (!inp) return;
+      inp.addEventListener('change', () => this.commitPlayerName(inp.value));
+      inp.addEventListener('blur', () => {
+        if (!inp.value.trim()) this.commitPlayerName('');
+      });
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          this.commitPlayerName(inp.value);
+          inp.blur();
+        }
+      });
+    });
+
+    document
+      .getElementById('settings-sound-toggle')
+      ?.addEventListener('click', () => {
+        soundEngine.toggleMuted();
+        this.syncAudioMuteButtons();
+      });
+
+    const volSlider = document.getElementById(
+      'settings-volume-slider'
+    ) as HTMLInputElement | null;
+    volSlider?.addEventListener('input', () => {
+      const pct = Number(volSlider.value);
+      soundEngine.volume = pct / 100;
+      if (pct > 0 && soundEngine.muted) {
+        soundEngine.muted = false;
+      }
+      this.syncAudioMuteButtons();
+    });
+
+    document
+      .getElementById('btn-settings-test-sound')
+      ?.addEventListener('click', () => {
+        if (soundEngine.muted) {
+          soundEngine.muted = false;
+          this.syncAudioMuteButtons();
+        }
+        soundEngine.playBuildUnlock();
+      });
+
+    document
+      .getElementById('settings-haptics-toggle')
+      ?.addEventListener('click', () => {
+        soundEngine.hapticsEnabled = !soundEngine.hapticsEnabled;
+        if (soundEngine.hapticsEnabled) soundEngine.haptic('snap');
+        soundEngine.playUiClick();
+        this.syncSettingsScreenControls();
+      });
+
+    document
+      .getElementById('settings-tips-toggle')
+      ?.addEventListener('click', () => {
+        this.showRoundTips = !this.showRoundTips;
         try {
-          localStorage.setItem(NAME_STORAGE_KEY, clean);
+          localStorage.setItem(
+            TIPS_STORAGE_KEY,
+            this.showRoundTips ? '1' : '0'
+          );
         } catch {
           // ignore
         }
-        if (hubNameInput) hubNameInput.value = clean;
-        if (drawerNameInput) drawerNameInput.value = clean;
-        this.send({ type: 'SET_NAME', playerName: clean });
-      } else {
-        // Blank name restores the last committed name instead of leaving an empty field
-        if (hubNameInput) hubNameInput.value = this.playerName;
-        if (drawerNameInput) drawerNameInput.value = this.playerName;
-      }
+        soundEngine.playUiClick();
+        this.syncSettingsScreenControls();
+      });
+
+    const wireSegmented = (selector: string, onChange?: () => void) => {
+      document.querySelectorAll<HTMLElement>(selector).forEach((group) => {
+        group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            if (btn.disabled) return;
+            soundEngine.playUiClick();
+            group
+              .querySelectorAll<HTMLButtonElement>('.seg-btn')
+              .forEach((b) => b.classList.remove('active'));
+            btn.classList.add('active');
+            onChange?.();
+          });
+        });
+      });
     };
 
-    hubNameInput?.addEventListener('change', () =>
-      commitName(hubNameInput.value)
+    wireSegmented('#screen-solo-setup .segmented-control', () =>
+      this.syncSoloBotSkillRow()
     );
-    hubNameInput?.addEventListener('blur', () => {
-      if (!hubNameInput.value.trim()) commitName('');
-    });
-    hubNameInput?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        commitName(hubNameInput.value);
-        hubNameInput.blur();
-      }
-    });
+    wireSegmented('#screen-online .segmented-control', () =>
+      this.syncBotSkillRow()
+    );
+    wireSegmented('#lobby-rules-editor .segmented-control');
 
-    // Join by Room Code (Honest Toast Fired on Server WELCOME)
+    document
+      .getElementById('btn-start-solo-match')
+      ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
+        soundEngine.playUiClick();
+        const settings = this.readSoloFormSettings();
+        this.pendingJoinToast = 'Solo match started — 5s to plan your route!';
+        this.send({
+          type: 'START_SOLO',
+          playerName: this.playerName,
+          sessionId: this.sessionId,
+          settings,
+        });
+      });
+
     const joinCodeInput = document.getElementById(
       'join-code-input'
     ) as HTMLInputElement | null;
@@ -2881,10 +3883,10 @@ class MazingContestClient {
         .replace(/[^A-Z0-9-]/g, '')
         .slice(0, 8);
       if (!code) {
-        this.showToast('Enter a room code (for example ARENA1)');
+        this.showToast('Enter a room code to join.');
         return;
       }
-      this.pendingJoinToast = `Joined room ${code}`;
+      this.pendingJoinToast = `Joined lobby ${code}`;
       this.send({
         type: 'JOIN_ROOM',
         roomCode: code,
@@ -2903,73 +3905,6 @@ class MazingContestClient {
       }
     });
 
-    // Solo vs Bots (1-Click Private Match, Guarded If Mid-Build Walls Exist)
-    const quickSoloBtn = document.getElementById('btn-quick-solo');
-    quickSoloBtn?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (!this.ensureConnectedForAction()) return;
-      const me = this.getLocalPlayer();
-      const hasWalls = Boolean(
-        this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
-      );
-      this.armDestructiveButton(
-        quickSoloBtn,
-        hasWalls,
-        'Abandon Maze?',
-        'user',
-        () => {
-          soundEngine.playUiClick();
-          const soloCode = `SOLO${Math.floor(10 + Math.random() * 89)}`;
-          this.pendingJoinToast = `Started solo match (${soloCode})`;
-          this.send({
-            type: 'CREATE_ROOM',
-            roomCode: soloCode,
-            playerName: this.playerName,
-            sessionId: this.sessionId,
-            settings: {
-              roomName: `${this.playerName}'s Island`,
-              isPublic: false,
-              totalRounds: 8,
-              buildTimeSeconds: 0,
-              goldMultiplier: 1.0,
-              botCount: 3,
-              botDifficulty: 'ARCHITECT',
-              fogOfWar: false,
-            },
-          });
-        }
-      );
-    });
-
-    // Two-Tap Guarded Restart Match
-    const restartBtn = document.getElementById('btn-hub-restart-match');
-    restartBtn?.addEventListener('click', () => {
-      if (!this.ensureConnectedForAction()) return;
-      if (!this.canControlRoomRules()) {
-        this.showToast('Only the room host can restart the match.');
-        return;
-      }
-      this.armDestructiveButton(
-        restartBtn,
-        true,
-        'Confirm Restart',
-        'refresh',
-        () => {
-          this.send({ type: 'RESTART_MATCH' });
-          this.showToast('Match restarted at Round 1', true);
-          this.closeHub();
-        }
-      );
-    });
-
-    // Invite Link
-    document
-      .getElementById('btn-hub-copy-invite')
-      ?.addEventListener('click', () => {
-        this.shareOrCopyInviteLink();
-      });
-
-    // Refresh Open Rooms
     document
       .getElementById('btn-refresh-lobbies')
       ?.addEventListener('click', () => {
@@ -2978,81 +3913,144 @@ class MazingContestClient {
         this.fetchInitialHubData();
       });
 
-    // Segmented Controls in Room Rules
     document
-      .querySelectorAll<HTMLElement>('.match-config-pane .segmented-control')
-      .forEach((group) => {
-        group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
-          btn.addEventListener('click', () => {
-            if (btn.disabled) return;
-            soundEngine.playUiClick();
-            group
-              .querySelectorAll<HTMLButtonElement>('.seg-btn')
-              .forEach((b) => b.classList.remove('active'));
-            btn.classList.add('active');
-            this.syncBotSkillRow();
-            this.syncRulesDirtyHighlight();
-          });
+      .getElementById('btn-refresh-daily')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.send({
+          type: 'REQUEST_DAILY',
+          dailyClientId: this.dailyClientId,
+          playerName: this.playerName,
         });
       });
 
     document
-      .getElementById('cfg-room-name')
-      ?.addEventListener('input', () => this.syncRulesDirtyHighlight());
-
-    // Update Current Room Rules
-    document
-      .getElementById('btn-apply-room-settings')
+      .getElementById('btn-create-custom-room')
       ?.addEventListener('click', () => {
         if (!this.ensureConnectedForAction()) return;
-        if (!this.canControlRoomRules()) {
-          this.showToast('Only the room host can update room rules.');
-          return;
-        }
         soundEngine.playUiClick();
         const settings = this.readConfigFormSettings();
+        const customCode = `RM${Math.floor(1000 + Math.random() * 8999)}`;
+        this.pendingJoinToast = `Lobby ${customCode} created — waiting for players!`;
         this.send({
-          type: 'UPDATE_SETTINGS',
+          type: 'CREATE_ROOM',
+          roomCode: customCode,
+          playerName: this.playerName,
+          sessionId: this.sessionId,
           settings,
         });
-        document
-          .getElementById('btn-apply-room-settings')
-          ?.classList.remove('is-dirty');
-        this.showToast(`Updated rules for ${this.roomCode}`, true);
-        this.closeHub();
       });
 
-    // Create New Custom Room (Guests may configure + host their own room; 2-tap guard mid-build)
-    const createRoomBtn = document.getElementById('btn-create-custom-room');
-    createRoomBtn?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (!this.ensureConnectedForAction()) return;
-      const me = this.getLocalPlayer();
-      const hasWalls = Boolean(
-        this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
-      );
-      this.armDestructiveButton(
-        createRoomBtn,
-        hasWalls,
-        'Leave Maze?',
-        'plus',
-        () => {
-          soundEngine.playUiClick();
-          const settings = this.readConfigFormSettings();
-          const customCode = `ROOM${Math.floor(100 + Math.random() * 899)}`;
-          this.pendingJoinToast = `Created room ${customCode}`;
-          this.send({
-            type: 'CREATE_ROOM',
-            roomCode: customCode,
-            playerName: this.playerName,
-            sessionId: this.sessionId,
-            settings,
-          });
-        }
-      );
+    document
+      .getElementById('lobby-room-code')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.shareOrCopyInviteLink();
+      });
+
+    document
+      .getElementById('btn-lobby-copy-invite')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.shareOrCopyInviteLink();
+      });
+
+    document
+      .getElementById('btn-leave-lobby')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.send({ type: 'LEAVE_ROOM' });
+      });
+
+    document
+      .getElementById('btn-lobby-ready')
+      ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
+        if (this.roomState?.phase !== 'LOBBY') return;
+        const me = this.getLocalPlayer();
+        soundEngine.playReady(!me?.ready);
+        soundEngine.haptic('ready');
+        this.send({ type: 'TOGGLE_READY' });
+      });
+
+    document
+      .getElementById('btn-lobby-start')
+      ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
+        if (this.roomState?.phase !== 'LOBBY') return;
+        soundEngine.playUiClick();
+        this.send({ type: 'START_GAME' });
+      });
+
+    document
+      .getElementById('btn-lobby-add-bot')
+      ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
+        soundEngine.playUiClick();
+        this.send({ type: 'ADD_BOT' });
+      });
+
+    document
+      .getElementById('btn-lobby-remove-bot')
+      ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
+        soundEngine.playUiClick();
+        this.send({ type: 'REMOVE_BOT' });
+      });
+
+    document
+      .getElementById('btn-lobby-edit-rules')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.lobbyRulesEditorOpen = !this.lobbyRulesEditorOpen;
+        document
+          .getElementById('lobby-rules-editor')
+          ?.classList.toggle('hidden', !this.lobbyRulesEditorOpen);
+      });
+
+    document
+      .getElementById('btn-lobby-save-rules')
+      ?.addEventListener('click', () => {
+        if (!this.ensureConnectedForAction()) return;
+        soundEngine.playUiClick();
+        const getSeg = (id: string, fb: string) =>
+          document.querySelector<HTMLButtonElement>(`#${id} .seg-btn.active`)
+            ?.dataset.val ?? fb;
+        this.send({
+          type: 'UPDATE_SETTINGS',
+          settings: {
+            isPublic: getSeg('lobby-cfg-public-group', 'true') === 'true',
+            totalRounds: Number(getSeg('lobby-cfg-rounds-group', '8')),
+            buildTimeSeconds: Number(getSeg('lobby-cfg-buildtime-group', '0')),
+            goldMultiplier: Number(getSeg('lobby-cfg-gold-group', '1')),
+            botDifficulty: getSeg('lobby-cfg-botdiff-group', 'ARCHITECT') as
+              | 'NOVICE'
+              | 'ARCHITECT'
+              | 'GRANDMASTER',
+            fogOfWar: getSeg('lobby-cfg-fog-group', 'false') === 'true',
+          },
+        });
+        this.lobbyRulesEditorOpen = false;
+        document.getElementById('lobby-rules-editor')?.classList.add('hidden');
+        this.showToast('Lobby rules updated', true);
+      });
+
+    const lobbyChatForm = document.getElementById(
+      'lobby-chat-form'
+    ) as HTMLFormElement | null;
+    const lobbyChatInput = document.getElementById(
+      'lobby-chat-input'
+    ) as HTMLInputElement | null;
+    lobbyChatForm?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (!lobbyChatInput || !this.ensureConnectedForAction()) return;
+      const text = lobbyChatInput.value.trim();
+      if (text) {
+        this.send({ type: 'CHAT', text });
+        lobbyChatInput.value = '';
+      }
     });
 
-    // Leaderboard Mode Switcher
     const lbModeGroup = document.getElementById('leaderboard-mode-group');
     lbModeGroup
       ?.querySelectorAll<HTMLButtonElement>('.seg-btn')
@@ -3070,26 +4068,38 @@ class MazingContestClient {
       });
   }
 
-  private syncRulesDirtyHighlight() {
-    const applyBtn = document.getElementById(
-      'btn-apply-room-settings'
-    ) as HTMLButtonElement | null;
-    if (!applyBtn || !this.roomState || !this.canControlRoomRules()) {
-      applyBtn?.classList.remove('is-dirty');
-      return;
-    }
-    const form = this.readConfigFormSettings();
-    const cur = this.roomState.settings;
-    const isDirty =
-      form.roomName !== cur.roomName ||
-      form.isPublic !== cur.isPublic ||
-      form.totalRounds !== cur.totalRounds ||
-      form.buildTimeSeconds !== cur.buildTimeSeconds ||
-      Math.abs(form.goldMultiplier - cur.goldMultiplier) > 0.01 ||
-      form.botCount !== cur.botCount ||
-      form.botDifficulty !== cur.botDifficulty ||
-      form.fogOfWar !== cur.fogOfWar;
-    applyBtn.classList.toggle('is-dirty', isDirty);
+  private readSoloFormSettings(): RoomSettings {
+    const getSegVal = (groupId: string, fallback: string) => {
+      const active = document.querySelector<HTMLButtonElement>(
+        `#${groupId} .seg-btn.active`
+      );
+      return active?.dataset.val ?? fallback;
+    };
+    return {
+      roomName: `${this.playerName}'s Island`,
+      isPublic: false,
+      totalRounds: Number(getSegVal('solo-rounds-group', '8')),
+      buildTimeSeconds: Number(getSegVal('solo-buildtime-group', '0')),
+      goldMultiplier: Number(getSegVal('solo-gold-group', '1')),
+      botCount: Number(getSegVal('solo-botcount-group', '3')),
+      botDifficulty: getSegVal('solo-botdiff-group', 'ARCHITECT') as
+        | 'NOVICE'
+        | 'ARCHITECT'
+        | 'GRANDMASTER',
+      fogOfWar: getSegVal('solo-fog-group', 'false') === 'true',
+    };
+  }
+
+  private syncSoloBotSkillRow() {
+    const zeroBots =
+      Number(
+        document.querySelector<HTMLButtonElement>(
+          '#solo-botcount-group .seg-btn.active'
+        )?.dataset.val ?? '3'
+      ) === 0;
+    document
+      .getElementById('solo-row-bot-skill')
+      ?.classList.toggle('hidden', zeroBots);
   }
 
   private readConfigFormSettings(): RoomSettings {
@@ -3104,7 +4114,7 @@ class MazingContestClient {
       'cfg-room-name'
     ) as HTMLInputElement | null;
     const roomName =
-      nameInput?.value.trim().slice(0, 26) || `${this.playerName}'s Room`;
+      nameInput?.value.trim().slice(0, 26) || `${this.playerName}'s Lobby`;
 
     return {
       roomName,
@@ -3112,7 +4122,7 @@ class MazingContestClient {
       totalRounds: Number(getSegVal('cfg-rounds-group', '8')),
       buildTimeSeconds: Number(getSegVal('cfg-buildtime-group', '0')),
       goldMultiplier: Number(getSegVal('cfg-gold-group', '1')),
-      botCount: Number(getSegVal('cfg-botcount-group', '3')),
+      botCount: Number(getSegVal('cfg-botcount-group', '0')),
       botDifficulty: getSegVal('cfg-botdiff-group', 'ARCHITECT') as
         | 'NOVICE'
         | 'ARCHITECT'
@@ -3126,15 +4136,15 @@ class MazingContestClient {
       Number(
         document.querySelector<HTMLButtonElement>(
           '#cfg-botcount-group .seg-btn.active'
-        )?.dataset.val ?? '3'
+        )?.dataset.val ?? '0'
       ) === 0;
-    document.getElementById('row-bot-skill')?.classList.toggle('hidden', zeroBots);
+    document
+      .getElementById('row-bot-skill')
+      ?.classList.toggle('hidden', zeroBots);
   }
 
   private syncHostOnlyControls() {
     const canEditRules = this.canControlRoomRules();
-    const hostTitle = 'Only the room host can change this';
-
     const fogChk = document.getElementById(
       'chk-fog'
     ) as HTMLInputElement | null;
@@ -3142,62 +4152,18 @@ class MazingContestClient {
       fogChk.checked = Boolean(this.roomState?.settings?.fogOfWar);
       fogChk.disabled = !canEditRules;
     }
-
-    const applyBtn = document.getElementById(
-      'btn-apply-room-settings'
-    ) as HTMLButtonElement | null;
-    if (applyBtn) {
-      applyBtn.disabled = !canEditRules;
-      applyBtn.title = canEditRules ? 'Update Rules in Current Room' : hostTitle;
-      if (!canEditRules) applyBtn.classList.remove('is-dirty');
-    }
-
-    const restartBtn = document.getElementById(
-      'btn-hub-restart-match'
-    ) as HTMLButtonElement | null;
-    if (restartBtn) {
-      restartBtn.disabled = !canEditRules;
-      restartBtn.title = canEditRules
-        ? 'Restart Current Match from Round 1'
-        : hostTitle;
-    }
   }
 
   private syncConfigFormFromSettings(settings: RoomSettings) {
-    // Guests keep Room Rules editable so they can host a New Room with custom rules;
-    // only Update Room / Restart Match / drawer host controls are host-locked.
     const nameInput = document.getElementById(
       'cfg-room-name'
     ) as HTMLInputElement | null;
-    if (nameInput && settings.roomName) {
+    if (nameInput && settings.roomName && this.roomState?.mode === 'ONLINE') {
       nameInput.value = settings.roomName;
     }
-    if (nameInput) {
-      nameInput.disabled = false;
-    }
-
-    const setSegVal = (groupId: string, val: string) => {
-      const group = document.getElementById(groupId);
-      if (!group) return;
-      group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
-        btn.classList.toggle('active', btn.dataset.val === val);
-        btn.disabled = false;
-      });
-    };
-
-    setSegVal('cfg-public-group', String(Boolean(settings.isPublic)));
-    setSegVal('cfg-rounds-group', String(settings.totalRounds || 8));
-    setSegVal('cfg-buildtime-group', String(settings.buildTimeSeconds || 0));
-    setSegVal('cfg-gold-group', String(settings.goldMultiplier || 1));
-    setSegVal('cfg-botcount-group', String(settings.botCount ?? 3));
-    setSegVal('cfg-botdiff-group', settings.botDifficulty || 'ARCHITECT');
-    setSegVal('cfg-fog-group', String(Boolean(settings.fogOfWar)));
-
     this.syncBotSkillRow();
+    this.syncSoloBotSkillRow();
     this.syncHostOnlyControls();
-    document
-      .getElementById('btn-apply-room-settings')
-      ?.classList.remove('is-dirty');
   }
 
   // ==========================================================================
@@ -3211,8 +4177,7 @@ class MazingContestClient {
     if (!listEl) return;
 
     const rooms = this.lobbies;
-    // Dirty-check: skip DOM rebuild when nothing visible changed (ROOM_STATE fires every 500ms)
-    const lobbySig = `${this.roomCode}|${JSON.stringify(
+    const lobbySig = `${this.roomCode ?? ''}|${JSON.stringify(
       rooms.map((r) => [
         r.roomCode,
         r.roomName,
@@ -3239,18 +4204,22 @@ class MazingContestClient {
 
     listEl.innerHTML = '';
     if (rooms.length === 0) {
-      listEl.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:12px">No public rooms open right now. Start Solo vs Bots or create a new room.</div>`;
+      listEl.innerHTML = `<div class="daily-empty-note">No public lobbies open right now. Host a new lobby and share your room code!</div>`;
       return;
     }
 
     for (const r of rooms) {
-      const isCurrent = r.roomCode === this.roomCode;
+      const isCurrent = Boolean(this.roomCode && r.roomCode === this.roomCode);
       const isFull = !isCurrent && r.humanCount >= r.maxPlayers;
       const card = document.createElement('div');
       card.className = `lobby-card${isCurrent ? ' current-room' : ''}`;
 
       const phaseText =
-        r.phase === 'BUILD'
+        r.phase === 'LOBBY'
+          ? 'In Lobby'
+          : r.phase === 'PLANNING'
+          ? `Planning R${r.currentRound}/${r.totalRounds}`
+          : r.phase === 'BUILD'
           ? `Build R${r.currentRound}/${r.totalRounds}`
           : r.phase === 'RUN'
           ? `Run R${r.currentRound}/${r.totalRounds}`
@@ -3275,7 +4244,11 @@ class MazingContestClient {
             <span class="lobby-card-name">${escapeHtml(r.roomName)}</span>
             <span class="room-code-badge">${escapeHtml(r.roomCode)}</span>
             <span class="lobby-phase-dot${
-              r.phase === 'RUN' ? ' running' : ''
+              r.phase === 'RUN'
+                ? ' running'
+                : r.phase === 'LOBBY'
+                ? ' waiting'
+                : ''
             }">${phaseText}</span>
           </div>
           <div class="lobby-card-subtitle">${subtitleText}</div>
@@ -3283,7 +4256,9 @@ class MazingContestClient {
         <div class="lobby-card-right">
           <span class="capacity-pill" title="${r.humanCount} Players · ${botsLabel}">
             ${icon('users', 14)}
-            <span>${r.humanCount}/${r.maxPlayers} · ${botsLabel}</span>
+            <span>${r.humanCount}/${r.maxPlayers}${
+        r.botCount > 0 ? ` · ${botsLabel}` : ''
+      }</span>
           </span>
           <button type="button" class="hub-action-pill ${
             isCurrent ? 'sage' : 'gold'
@@ -3304,22 +4279,20 @@ class MazingContestClient {
         e.stopPropagation();
         soundEngine.playUiClick();
         if (isCurrent) {
-          this.closeHub();
+          if (this.roomState?.phase === 'LOBBY') {
+            this.openMenuScreen('lobby');
+          } else {
+            this.closeHub();
+          }
           return;
         }
         if (!this.ensureConnectedForAction()) return;
-        const me = this.getLocalPlayer();
-        const hasWalls = Boolean(
-          this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
-        );
-        this.armDestructiveButton(btn, hasWalls, 'Leave Maze?', 'arrowRight', () => {
-          this.pendingJoinToast = `Joined ${r.roomName} (${r.roomCode})`;
-          this.send({
-            type: 'JOIN_ROOM',
-            roomCode: r.roomCode,
-            playerName: this.playerName,
-            sessionId: this.sessionId,
-          });
+        this.pendingJoinToast = `Joined ${r.roomName} (${r.roomCode})`;
+        this.send({
+          type: 'JOIN_ROOM',
+          roomCode: r.roomCode,
+          playerName: this.playerName,
+          sessionId: this.sessionId,
         });
       });
 
@@ -3703,10 +4676,17 @@ class MazingContestClient {
       }
 
       if (e.code === 'Escape') {
-        // Layered Escape: Hub -> Help -> Drawer -> armed/popovers -> ghost/inspect
-        // -> Remove tool back to Build -> rival spectate/Overview -> Results peek
         if (this.isHubOpen()) {
-          this.closeHub();
+          if (this.activeMenuScreen === 'lobby') {
+            return;
+          }
+          if (this.activeMenuScreen !== 'home') {
+            this.openMenuScreen('home');
+            return;
+          }
+          if (this.roomState && this.roomState.phase !== 'LOBBY') {
+            this.closeHub();
+          }
           return;
         }
         if (this.isHelpOpen()) {
@@ -3780,19 +4760,23 @@ class MazingContestClient {
         return;
       }
 
-      // Hub hotkeys: M mute · H close · L Leaderboard tab · ? How to Play tab
+      // Hub hotkeys: M mute · H resume/close · L Leaderboard · ? How to Play
       if (this.isHubOpen()) {
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         const hubKey = e.key.toUpperCase();
         if (hubKey === 'M') {
           soundEngine.toggleMuted();
           this.syncAudioMuteButtons();
-        } else if (hubKey === 'H') {
+        } else if (
+          hubKey === 'H' &&
+          this.roomState &&
+          this.roomState.phase !== 'LOBBY'
+        ) {
           this.closeHub();
-        } else if (hubKey === 'L') {
-          this.switchHubTab('leaderboard');
-        } else if (e.key === '?') {
-          this.switchHubTab('codex');
+        } else if (hubKey === 'L' && this.activeMenuScreen !== 'lobby') {
+          this.openMenuScreen('leaderboard');
+        } else if (e.key === '?' && this.activeMenuScreen !== 'lobby') {
+          this.openMenuScreen('how-to-play');
         }
         return;
       }
@@ -4338,11 +5322,16 @@ class MazingContestClient {
     const totalRounds = this.roomState.settings?.totalRounds || ROUNDS.length;
     const effectivePar = round.parTimeSeconds;
 
-    document.getElementById('round-code-label')!.textContent =
-      `R${round.roundNumber}/${totalRounds}`;
-    document.getElementById('round-subtitle')!.textContent = round.title;
-    document.getElementById('btn-round-picker')!.title =
-      `Round ${round.roundNumber}: ${round.title} · ${arch.name} (${arch.traitSummary})`;
+    const isDaily = this.roomState.mode === 'DAILY';
+    document.getElementById('round-code-label')!.textContent = isDaily
+      ? `DAILY #${this.roomState.dailyPuzzleNumber || 1}`
+      : `R${round.roundNumber}/${totalRounds}`;
+    document.getElementById('round-subtitle')!.textContent = isDaily
+      ? round.title.replace(/^Daily #\d+\s*·\s*/i, '')
+      : round.title;
+    document.getElementById('btn-round-picker')!.title = isDaily
+      ? `${round.title} · ${arch.name} (${arch.traitSummary})`
+      : `Round ${round.roundNumber}: ${round.title} · ${arch.name} (${arch.traitSummary})`;
 
     const runnerBadge = document.getElementById('round-runner-badge');
     if (runnerBadge) {
@@ -4411,7 +5400,11 @@ class MazingContestClient {
     const phaseLabel = document.getElementById('phase-label')!;
     const speedControls = document.getElementById('speed-controls')!;
 
-    if (this.roomState.phase === 'BUILD') {
+    if (this.roomState.phase === 'PLANNING') {
+      phaseDot.className = 'phase-dot plan';
+      phaseLabel.textContent = 'PLAN';
+      speedControls.classList.add('hidden');
+    } else if (this.roomState.phase === 'BUILD') {
       phaseDot.className = 'phase-dot build';
       phaseLabel.textContent = 'BUILD';
       speedControls.classList.add('hidden');
@@ -4841,6 +5834,7 @@ class MazingContestClient {
 
   private renderRoundResultsModal(state: RoomState) {
     const round = state.roundConfig;
+    const isDaily = state.mode === 'DAILY';
     const isGameOver = state.phase === 'GAME_OVER';
     const roundsDone = state.roundsCompleted || round.roundNumber;
     const totalRounds = state.settings?.totalRounds || ROUNDS.length;
@@ -4854,6 +5848,89 @@ class MazingContestClient {
     const progressEl = document.getElementById('results-match-progress')!;
     const podiumEl = document.getElementById('results-podium')!;
     const recordCallout = document.getElementById('results-record-callout')!;
+    const dailyPanel = document.getElementById('results-daily-panel');
+    const tableEl = document.getElementById('results-table')!;
+    const lbBtn = document.getElementById('btn-results-leaderboard');
+    const shareDailyBtn = document.getElementById('btn-results-share-daily');
+    const homeDailyBtn = document.getElementById('btn-results-home');
+    const nextRoundBtn = document.getElementById('btn-next-round');
+
+    if (isDaily) {
+      const me = this.getLocalPlayer();
+      const myTime = me?.lastRoundTime ?? 0;
+      const beatPar = myTime >= parTarget;
+      const d = this.dailyData;
+      const standing = d?.myStanding;
+
+      titleEl.textContent = `Daily Maze #${state.dailyPuzzleNumber || 1} Complete`;
+      progressEl.textContent = d ? formatDailyDateLabel(d.dateKey) : 'Daily Maze';
+      subEl.textContent = beatPar
+        ? `You survived ${myTime.toFixed(2)}s and beat today's Par (${parLabel})!`
+        : `You survived ${myTime.toFixed(2)}s · Today's Par was ${parLabel}.`;
+
+      podiumEl.classList.add('hidden');
+      recordCallout.classList.add('hidden');
+      tableEl.classList.add('hidden');
+      lbBtn?.classList.add('hidden');
+      nextRoundBtn?.classList.add('hidden');
+      shareDailyBtn?.classList.remove('hidden');
+      homeDailyBtn?.classList.remove('hidden');
+
+      const winnerPeekBtn = document.getElementById('btn-peek-winner');
+      winnerPeekBtn?.classList.add('hidden');
+
+      if (dailyPanel) {
+        dailyPanel.classList.remove('hidden');
+        const rankText = standing
+          ? `#${standing.rank} of ${standing.totalParticipants} (Top ${standing.percentile}%)`
+          : 'Recording rank…';
+        dailyPanel.innerHTML = `
+          <div class="daily-result-hero">
+            <div class="daily-result-stat">
+              <span class="daily-stat-label">Your Time</span>
+              <strong>${myTime.toFixed(2)}s</strong>
+            </div>
+            <div class="daily-result-stat">
+              <span class="daily-stat-label">Today's Rank</span>
+              <strong>${escapeHtml(rankText)}</strong>
+            </div>
+            <div class="daily-result-stat">
+              <span class="daily-stat-label">Spire Hits / Overcharge</span>
+              <strong>${me?.lastRoundClaps || 0} / ${me?.lastRoundOvercharge || 0}</strong>
+            </div>
+          </div>
+          <div class="daily-result-lb-head">Today's Top 10 Leaderboard</div>
+          <div id="results-daily-top10" class="leaderboard-table-wrap daily-table-wrap"></div>
+          ${
+            standing && standing.rank > 10
+              ? `<div class="daily-my-standing-bar">
+                  <div class="standing-left">
+                    <span class="you-badge">Your Position</span>
+                    <strong>#${standing.rank}</strong>
+                    <span>of ${standing.totalParticipants} (Top ${standing.percentile}%)</span>
+                  </div>
+                  <div class="standing-right">
+                    <strong>${standing.entry.survivalTimeSeconds.toFixed(2)}s</strong>
+                  </div>
+                </div>`
+              : ''
+          }
+        `;
+        const top10Host = document.getElementById('results-daily-top10');
+        if (top10Host && d) {
+          this.renderDailyLeaderboardRows(top10Host, d);
+        }
+      }
+      return;
+    }
+
+    // Standard Solo / Online Results view
+    dailyPanel?.classList.add('hidden');
+    tableEl.classList.remove('hidden');
+    lbBtn?.classList.remove('hidden');
+    nextRoundBtn?.classList.remove('hidden');
+    shareDailyBtn?.classList.add('hidden');
+    homeDailyBtn?.classList.add('hidden');
 
     // Inject / toggle Winner's Maze quick-focus button next to View Mazes
     const peekBtn = document.getElementById('btn-peek-mazes');
@@ -5079,7 +6156,12 @@ class MazingContestClient {
 
   private renderChat() {
     if (!this.roomState) return;
-    const box = document.getElementById('chat-messages')!;
+    const boxes = [
+      document.getElementById('chat-messages'),
+      document.getElementById('lobby-chat-messages'),
+    ].filter((el): el is HTMLElement => Boolean(el));
+    if (boxes.length === 0) return;
+
     const chat = this.roomState.chat;
     const last = chat[chat.length - 1];
     const chatSig = `${this.roomState.roomCode}|${chat.length}|${
@@ -5088,38 +6170,40 @@ class MazingContestClient {
     if (chatSig === this.lastChatSignature) return;
     this.lastChatSignature = chatSig;
 
-    const prevScrollTop = box.scrollTop;
-    const stickToBottom =
-      box.scrollHeight - box.scrollTop - box.clientHeight < 48;
-    box.innerHTML = '';
-    for (const m of chat) {
-      const div = document.createElement('div');
-      div.className = `chat-line${m.isSystem ? ' system' : ''}`;
-      if (m.isSystem) {
-        div.textContent = m.text;
-      } else {
-        const swatch = document.createElement('span');
-        swatch.className = 'player-swatch';
-        swatch.style.background = m.senderColor;
-        swatch.style.display = 'inline-block';
-        swatch.style.verticalAlign = 'middle';
-        swatch.style.marginRight = '5px';
+    for (const box of boxes) {
+      const prevScrollTop = box.scrollTop;
+      const stickToBottom =
+        box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+      box.innerHTML = '';
+      for (const m of chat) {
+        const div = document.createElement('div');
+        div.className = `chat-line${m.isSystem ? ' system' : ''}`;
+        if (m.isSystem) {
+          div.textContent = m.text;
+        } else {
+          const swatch = document.createElement('span');
+          swatch.className = 'player-swatch';
+          swatch.style.background = m.senderColor;
+          swatch.style.display = 'inline-block';
+          swatch.style.verticalAlign = 'middle';
+          swatch.style.marginRight = '5px';
 
-        const strong = document.createElement('strong');
-        strong.style.color = 'var(--text-primary)';
-        strong.textContent = `${m.senderName}: `;
+          const strong = document.createElement('strong');
+          strong.style.color = 'var(--text-primary)';
+          strong.textContent = `${m.senderName}: `;
 
-        const span = document.createElement('span');
-        span.textContent = m.text;
+          const span = document.createElement('span');
+          span.textContent = m.text;
 
-        div.append(swatch, strong, span);
+          div.append(swatch, strong, span);
+        }
+        box.appendChild(div);
       }
-      box.appendChild(div);
-    }
-    if (stickToBottom) {
-      box.scrollTop = box.scrollHeight;
-    } else {
-      box.scrollTop = prevScrollTop;
+      if (stickToBottom) {
+        box.scrollTop = box.scrollHeight;
+      } else {
+        box.scrollTop = prevScrollTop;
+      }
     }
   }
 

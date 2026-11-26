@@ -56,7 +56,10 @@ export type IconName =
   | 'arrowDown'
   | 'diamond'
   | 'diamondFilled'
-  | 'share';
+  | 'share'
+  | 'calendar'
+  | 'copy'
+  | 'logout';
 
 const SVG_PATHS: Record<IconName, string> = {
   // Battlemented Citadel Keep Crest (3.2-unit embrasures prevent stroke fusion at 16-18px)
@@ -363,6 +366,22 @@ const SVG_PATHS: Record<IconName, string> = {
     <path d="M12 3.5v11" />
     <path d="M8 7.5l4-4 4 4" />
     <path d="M5 13.5v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
+  `,
+  // Daily Maze Calendar Icon
+  calendar: `
+    <rect x="3.5" y="5" width="17" height="15.5" rx="2.5" />
+    <path d="M8 2.8v4.2M16 2.8v4.2M3.5 10h17" />
+    <path d="M9.5 14.5l1.7 1.7 3.5-3.5" />
+  `,
+  // Copy Code Icon
+  copy: `
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15H4.5A1.5 1.5 0 0 1 3 13.5v-9A1.5 1.5 0 0 1 4.5 3h9A1.5 1.5 0 0 1 15 4.5V5" />
+  `,
+  // Leave Room / Lobby Icon
+  logout: `
+    <path d="M10 4.5H5.5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2H10" />
+    <path d="M15 16l4.5-4L15 8M19.5 12H9" />
   `,
 };
 

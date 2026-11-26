@@ -2,7 +2,14 @@ export type SpireType = 'THUNDERCLAP' | 'FROST_OBELISK' | 'CHRONO_SPIRE';
 export type TowerType = 'BLOCK' | SpireType;
 export type ActiveBuildTool = 'BLOCK' | 'SELL' | 'PAN';
 export type RunnerArchetype = 'SCOUT' | 'OUTRIDER' | 'JUGGERNAUT' | 'HERALD';
-export type GamePhase = 'LOBBY' | 'BUILD' | 'RUN' | 'ROUND_RESULTS' | 'GAME_OVER';
+export type RoomMode = 'SOLO' | 'ONLINE' | 'DAILY';
+export type GamePhase =
+  | 'LOBBY'
+  | 'PLANNING'
+  | 'BUILD'
+  | 'RUN'
+  | 'ROUND_RESULTS'
+  | 'GAME_OVER';
 
 export interface GridPoint {
   x: number;
@@ -435,6 +442,57 @@ export interface LeaderboardPayload {
   updatedAt: number;
 }
 
+export interface DailyMazeEntry {
+  id: string;
+  clientId: string;
+  playerName: string;
+  playerColor: string;
+  survivalTimeSeconds: number;
+  parTimeSeconds: number;
+  beatPar: boolean;
+  clapsTaken: number;
+  overchargedSpires: number;
+  linkedKeeps: number;
+  pathDistance: number;
+  wallsUsed: number;
+  timestamp: number;
+  rank?: number;
+}
+
+export interface DailyMazePuzzleMeta {
+  dateKey: string;
+  puzzleNumber: number;
+  title: string;
+  subtitle: string;
+  hint: string;
+  runnerType: RunnerArchetype;
+  parTimeSeconds: number;
+  buildTimeSeconds: number;
+  wallCount: number;
+  spireCount: number;
+  keepCount: number;
+  hasWaystone: boolean;
+}
+
+export interface DailyPlayerStanding {
+  rank: number;
+  totalParticipants: number;
+  percentile: number;
+  entry: DailyMazeEntry;
+}
+
+export interface DailyMazePayload {
+  dateKey: string;
+  puzzleNumber: number;
+  resetsAtUtcMs: number;
+  puzzle: DailyMazePuzzleMeta;
+  top10: DailyMazeEntry[];
+  totalParticipants: number;
+  completedToday: boolean;
+  myStanding: DailyPlayerStanding | null;
+  updatedAt: number;
+}
+
 export interface ChatMessage {
   id: string;
   senderName: string;
@@ -446,6 +504,9 @@ export interface ChatMessage {
 
 export interface RoomState {
   roomCode: string;
+  mode: RoomMode;
+  dailyDateKey?: string;
+  dailyPuzzleNumber?: number;
   phase: GamePhase;
   settings: RoomSettings;
   currentRoundIndex: number;
@@ -476,6 +537,20 @@ export type ClientToServerMessage =
       sessionId?: string;
       settings: Partial<RoomSettings>;
     }
+  | {
+      type: 'START_SOLO';
+      playerName: string;
+      sessionId?: string;
+      settings: Partial<RoomSettings>;
+    }
+  | {
+      type: 'START_DAILY';
+      playerName: string;
+      sessionId?: string;
+      dailyClientId: string;
+    }
+  | { type: 'LEAVE_ROOM' }
+  | { type: 'REQUEST_DAILY'; dailyClientId?: string; playerName?: string }
   | { type: 'SET_NAME'; playerName: string }
   | {
       type: 'PLACE_TOWER';
@@ -516,6 +591,7 @@ export type ClientToServerMessage =
 export type ServerToClientMessage =
   | { type: 'WELCOME'; playerId: string; sessionId?: string; state: RoomState }
   | { type: 'ROOM_STATE'; state: RoomState }
+  | { type: 'LEFT_ROOM' }
   | {
       type: 'TIMER_TICK';
       phaseTimeRemaining: number;
@@ -525,6 +601,7 @@ export type ServerToClientMessage =
     }
   | { type: 'LOBBY_LIST'; rooms: LobbyRoomSummary[] }
   | { type: 'LEADERBOARD_DATA'; leaderboard: LeaderboardPayload }
+  | { type: 'DAILY_LEADERBOARD_DATA'; daily: DailyMazePayload }
   | { type: 'CHAT_MESSAGE'; message: ChatMessage }
   | {
       type: 'ERROR_TOAST';
