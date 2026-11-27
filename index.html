@@ -273,6 +273,20 @@
             <span class="time-verb">Est </span>6.2s<span class="par-full"> · Par </span><span class="par-short">/</span>28s+
           </span>
         </div>
+
+        <div class="pill-divider divider-before-synergy"></div>
+
+        <div
+          class="telemetry-chip synergy-chip"
+          id="hud-synergy-chip"
+          title="Projected Spire Hits &amp; Overcharged Spire Tiers"
+        >
+          <span class="icon-slot chip-icon" data-icon="bolt" data-icon-size="13"></span>
+          <span id="hud-synergy-hits">0</span>
+          <span class="synergy-sep">·</span>
+          <span class="icon-slot chip-icon" data-icon="diamondFilled" data-icon-size="11"></span>
+          <span id="hud-synergy-over">0</span>
+        </div>
       </div>
 
       <!-- Right Cluster: Leaderboard, Room & Chat, Audio, Guide -->
@@ -421,10 +435,10 @@
           >
             <span
               class="icon-slot"
-              data-icon="sliders"
+              data-icon="globe"
               data-icon-size="13"
             ></span>
-            <span>Rules</span>
+            <span>Rooms</span>
           </button>
           <label
             class="fog-toggle"
@@ -599,6 +613,7 @@
       >
         <span class="icon-slot" data-icon="redo" data-icon-size="17"></span>
         <span class="tool-label">Redo</span>
+        <kbd>Y</kbd>
       </button>
 
       <div class="dock-tools-menu-wrap" id="dock-tools-wrap">
@@ -638,6 +653,16 @@
             <span>New Map</span>
           </button>
           <div class="popover-divider"></div>
+          <button
+            type="button"
+            id="btn-popover-redo"
+            class="popover-action-btn touch-only-tool"
+            title="Redo Last Action"
+            disabled
+          >
+            <span class="icon-slot" data-icon="redo" data-icon-size="16"></span>
+            <span>Redo Wall</span>
+          </button>
           <button
             type="button"
             id="btn-demo-layout"
@@ -714,6 +739,25 @@
       </button>
     </div>
 
+    <!-- Compact Mobile Synergy Micro-Pill (Visible in Portrait BUILD when Banners Hidden) -->
+    <div
+      id="mobile-synergy-pill"
+      class="mobile-synergy-pill surface-pill hidden"
+      title="Projected Spire Hits &amp; Overcharged Tiers"
+    >
+      <span class="icon-slot" data-icon="bolt" data-icon-size="11"></span>
+      <span id="mobile-synergy-hits">0</span>
+      <span class="synergy-sep">·</span>
+      <span class="icon-slot" data-icon="diamondFilled" data-icon-size="10"></span>
+      <span id="mobile-synergy-over">0</span>
+    </div>
+
+    <!-- Peek Mode Focused Island Identity Pill -->
+    <div id="peek-identity-pill" class="peek-identity-pill surface-pill hidden">
+      <span class="icon-slot" data-icon="eye" data-icon-size="14"></span>
+      <span id="peek-identity-text">Viewing Maze</span>
+    </div>
+
     <!-- Round Results & Final Standings Modal -->
     <div
       id="results-modal"
@@ -731,15 +775,17 @@
                 Round 1 of 8
               </span>
             </div>
-            <button
-              type="button"
-              id="btn-peek-mazes"
-              class="mini-action-btn peek-mazes-btn"
-              title="Inspect 3D Mazes on the Board"
-            >
-              <span class="icon-slot" data-icon="eye" data-icon-size="15"></span>
-              <span>View Mazes</span>
-            </button>
+            <div class="results-header-actions" id="results-header-actions">
+              <button
+                type="button"
+                id="btn-peek-mazes"
+                class="mini-action-btn peek-mazes-btn"
+                title="Inspect 3D Mazes on the Board"
+              >
+                <span class="icon-slot" data-icon="eye" data-icon-size="15"></span>
+                <span>View Mazes</span>
+              </button>
+            </div>
           </div>
           <p id="results-subtitle">Survive past Par for +2 bonus pts</p>
         </div>
@@ -751,6 +797,14 @@
         ></div>
         <div id="results-daily-panel" class="results-daily-panel hidden"></div>
         <div id="results-table" class="results-table"></div>
+        <div id="results-coaching-tip" class="results-coaching-tip hidden"></div>
+        <div id="results-stats-legend" class="stats-icon-legend">
+          <span><span class="icon-slot" data-icon="bolt" data-icon-size="11"></span> Spire Hits</span>
+          <span>·</span>
+          <span><span class="icon-slot" data-icon="diamondFilled" data-icon-size="10"></span> Overcharge</span>
+          <span>·</span>
+          <span>m Path Length</span>
+        </div>
 
         <div class="modal-actions results-actions">
           <button
@@ -767,8 +821,16 @@
           </button>
           <button
             type="button"
-            id="btn-results-share-daily"
+            id="btn-results-home"
             class="hub-secondary-btn hidden"
+          >
+            <span class="icon-slot" data-icon="hub" data-icon-size="15"></span>
+            <span>Back to Home</span>
+          </button>
+          <button
+            type="button"
+            id="btn-results-share-daily"
+            class="dock-ready-btn hidden"
           >
             <span
               class="icon-slot"
@@ -776,14 +838,6 @@
               data-icon-size="15"
             ></span>
             <span>Share Result</span>
-          </button>
-          <button
-            type="button"
-            id="btn-results-home"
-            class="dock-ready-btn hidden"
-          >
-            <span class="icon-slot" data-icon="hub" data-icon-size="15"></span>
-            <span>Back to Home</span>
           </button>
           <button type="button" id="btn-next-round" class="dock-ready-btn">
             <span id="next-round-label">Next Round</span>
@@ -829,7 +883,7 @@
                 </div>
               </div>
 
-              <div class="hub-name-box home-name-box" title="Your Display Name">
+              <div class="hub-name-box home-name-box" title="Click or tap to edit your Display Name">
                 <span
                   class="icon-slot hub-name-icon"
                   data-icon="user"
@@ -840,12 +894,17 @@
                   type="text"
                   maxlength="18"
                   placeholder="Your Name"
-                  aria-label="Your Name"
+                  aria-label="Your Display Name"
                   autocomplete="nickname"
                   autocorrect="off"
                   spellcheck="false"
                   enterkeyhint="done"
                 />
+                <span
+                  class="icon-slot hub-name-edit-icon"
+                  data-icon="edit"
+                  data-icon-size="12"
+                ></span>
               </div>
             </div>
           </div>
@@ -890,7 +949,7 @@
             <button
               type="button"
               id="btn-menu-solo"
-              class="home-option-card"
+              class="home-option-card play-mode-card"
               data-nav="solo-setup"
             >
               <span class="home-option-icon tone-sage">
@@ -902,7 +961,7 @@
               </span>
               <span class="home-option-body">
                 <strong>Solo Play</strong>
-                <span>Pick your settings and build against AI bots</span>
+                <span>Custom rules vs AI bots</span>
               </span>
               <span
                 class="icon-slot home-option-arrow"
@@ -914,7 +973,7 @@
             <button
               type="button"
               id="btn-menu-online"
-              class="home-option-card"
+              class="home-option-card play-mode-card"
               data-nav="online"
             >
               <span class="home-option-icon tone-sky">
@@ -925,8 +984,13 @@
                 ></span>
               </span>
               <span class="home-option-body">
-                <strong>Play Online</strong>
-                <span>Host a lobby with friends or join open rooms</span>
+                <span class="home-option-title-row">
+                  <strong>Play Online</strong>
+                  <span id="home-online-badge" class="meta-pill online-count-badge hidden">
+                    0 Open
+                  </span>
+                </span>
+                <span>Host or join live rooms</span>
               </span>
               <span
                 class="icon-slot home-option-arrow"
@@ -938,7 +1002,7 @@
             <button
               type="button"
               id="btn-menu-daily"
-              class="home-option-card featured-daily"
+              class="home-option-card play-mode-card featured-daily"
               data-nav="daily"
             >
               <span class="home-option-icon tone-gold">
@@ -955,7 +1019,7 @@
                     Daily Challenge
                   </span>
                 </span>
-                <span>One global maze · 120s build · 1 try per day</span>
+                <span>Global puzzle · 120s · 1 try</span>
               </span>
               <span
                 class="icon-slot home-option-arrow"
@@ -964,53 +1028,45 @@
               ></span>
             </button>
 
-            <button
-              type="button"
-              id="btn-menu-how-to-play"
-              class="home-option-card"
-              data-nav="how-to-play"
-            >
-              <span class="home-option-icon tone-neutral">
-                <span
-                  class="icon-slot"
-                  data-icon="book"
-                  data-icon-size="20"
-                ></span>
-              </span>
-              <span class="home-option-body">
-                <strong>How to Play</strong>
-                <span>Beginner-friendly guide with simple examples</span>
-              </span>
-              <span
-                class="icon-slot home-option-arrow"
-                data-icon="arrowRight"
-                data-icon-size="16"
-              ></span>
-            </button>
+            <div class="home-utility-pair">
+              <button
+                type="button"
+                id="btn-menu-how-to-play"
+                class="home-option-card utility-card"
+                data-nav="how-to-play"
+              >
+                <span class="home-option-icon tone-neutral">
+                  <span
+                    class="icon-slot"
+                    data-icon="book"
+                    data-icon-size="18"
+                  ></span>
+                </span>
+                <span class="home-option-body">
+                  <strong>How to Play</strong>
+                  <span>Rules &amp; examples</span>
+                </span>
+              </button>
 
-            <button
-              type="button"
-              id="btn-menu-settings"
-              class="home-option-card"
-              data-nav="settings"
-            >
-              <span class="home-option-icon tone-neutral">
-                <span
-                  class="icon-slot"
-                  data-icon="sliders"
-                  data-icon-size="20"
-                ></span>
-              </span>
-              <span class="home-option-body">
-                <strong>Settings &amp; Controls</strong>
-                <span>Audio, volume, preferences, and keybindings</span>
-              </span>
-              <span
-                class="icon-slot home-option-arrow"
-                data-icon="arrowRight"
-                data-icon-size="16"
-              ></span>
-            </button>
+              <button
+                type="button"
+                id="btn-menu-settings"
+                class="home-option-card utility-card"
+                data-nav="settings"
+              >
+                <span class="home-option-icon tone-neutral">
+                  <span
+                    class="icon-slot"
+                    data-icon="sliders"
+                    data-icon-size="18"
+                  ></span>
+                </span>
+                <span class="home-option-body">
+                  <strong>Settings</strong>
+                  <span>Audio &amp; controls</span>
+                </span>
+              </button>
+            </div>
           </nav>
 
           <footer class="home-footer-bar">
@@ -1073,13 +1129,13 @@
               <div class="config-row">
                 <label class="config-label">Rounds</label>
                 <div class="segmented-control" id="solo-rounds-group">
-                  <button type="button" class="seg-btn" data-val="3">
+                  <button type="button" class="seg-btn active" data-val="3">
                     3 Rounds
                   </button>
                   <button type="button" class="seg-btn" data-val="5">
                     5 Rounds
                   </button>
-                  <button type="button" class="seg-btn active" data-val="8">
+                  <button type="button" class="seg-btn" data-val="8">
                     8 Rounds
                   </button>
                 </div>
@@ -1159,7 +1215,7 @@
                 </div>
               </div>
 
-              <div class="config-row">
+              <div class="config-row" id="solo-row-fog">
                 <label class="config-label">Rival Mazes</label>
                 <div class="segmented-control" id="solo-fog-group">
                   <button type="button" class="seg-btn active" data-val="false">
@@ -1518,16 +1574,17 @@
                   type="button"
                   id="lobby-room-code"
                   class="room-code-badge clickable-code lobby-code-pill"
-                  title="Click to copy invite link"
+                  title="Copy invite link"
                 >
-                  RM0000
+                  <span id="lobby-room-code-text">RM0000</span>
+                  <span class="icon-slot" data-icon="copy" data-icon-size="12"></span>
                 </button>
                 <span id="lobby-visibility-badge" class="meta-pill">
                   Public
                 </span>
               </div>
               <p class="lobby-wait-sub">
-                Share the room code with friends. Every player must click
+                Share the room code with friends. Every player must press
                 <strong>Ready Up</strong> before the host can start the round.
               </p>
             </div>
@@ -1602,7 +1659,7 @@
 
               <div class="lobby-ready-footer">
                 <div id="lobby-start-hint" class="lobby-start-hint">
-                  Click Ready Up to signal you are set.
+                  Press Ready Up to signal you are set.
                 </div>
                 <div class="lobby-ready-buttons">
                   <button
@@ -1715,7 +1772,7 @@
                           class="seg-btn active"
                           data-val="0"
                         >
-                          Def
+                          Default
                         </button>
                         <button type="button" class="seg-btn" data-val="45">
                           45s
@@ -1745,7 +1802,7 @@
                           class="seg-btn active"
                           data-val="1"
                         >
-                          100%
+                          Normal
                         </button>
                         <button type="button" class="seg-btn" data-val="1.25">
                           125%
@@ -1891,6 +1948,16 @@
                 </span>
               </div>
 
+              <div class="daily-player-strip" id="daily-player-strip">
+                <span class="daily-player-identity">
+                  Playing as <strong id="daily-player-name-label">Player</strong>
+                  <button type="button" class="text-link-btn" data-nav="settings">Edit</button>
+                </span>
+                <button type="button" class="text-link-btn" data-nav="how-to-play">
+                  Quick Guide →
+                </button>
+              </div>
+
               <div id="daily-cta-area" class="daily-cta-area">
                 <button
                   type="button"
@@ -1976,7 +2043,7 @@
               <div class="htp-hero-badge">THE BIG IDEA</div>
               <h3>Don't kill the runner — just waste their time!</h3>
               <p>
-                A little runner starts at the <strong>TOP gate</strong> and wants to walk to the <strong>BOTTOM gate</strong> as fast as they can. You place <strong>Stone Walls</strong> on the grass to force them to take the <strong>longest, slowest walk possible</strong>. Whoever keeps their runner trapped inside their maze for the <strong>most seconds</strong> wins the round!
+                A little runner starts at the <strong>North Gate (top)</strong> and wants to reach the <strong>South Exit (bottom)</strong> as fast as they can. You place <strong>Stone Walls</strong> on the grass to force them to take the <strong>longest, slowest walk possible</strong>. Whoever keeps their runner trapped inside their maze for the <strong>most seconds</strong> wins the round!
               </p>
             </div>
 
@@ -1989,7 +2056,7 @@
                   <div>
                     <strong>Plan for 5 Seconds</strong>
                     <p>
-                      Each round starts with a <strong>5-second look-around timer</strong>. You can't place walls yet — use this time to spot where the glowing Spires and Red Keeps are!
+                      Each round starts with a <strong>5-second look-around timer</strong>. You can't place walls yet — use this time to spot where the glowing Spires and <strong>Crimson Keeps</strong> are!
                     </p>
                   </div>
                 </div>
@@ -1998,7 +2065,7 @@
                   <div>
                     <strong>Build Your Maze</strong>
                     <p>
-                      Click or tap any open grass to place <strong>Stone Walls</strong>. Watch the white path line stretch! Made a mistake? Removing a wall gives it right back for free.
+                      Tap or click open grass to place <strong>2×2 Stone Walls</strong> from your round's <strong>Wall Supply</strong>. Watch the white path line stretch! Removing a wall refunds it for free.
                     </p>
                   </div>
                 </div>
@@ -2007,7 +2074,7 @@
                   <div>
                     <strong>Golden Rule: Leave a Path!</strong>
                     <p>
-                      You can <strong>never</strong> completely seal off the exit. There must always be at least a 1-tile open walkway from the Top Gate to the Bottom Gate.
+                      You can <strong>never</strong> completely seal off the exit. There must always be at least a 1-tile open walkway from the <strong>North Gate</strong> to the <strong>South Exit</strong>.
                     </p>
                   </div>
                 </div>
@@ -2110,32 +2177,32 @@
                     <h4>Gold Waystone (Checkpoint)</h4>
                   </div>
                   <p>
-                    A mandatory pit-stop! On maps with 1 or 2 Gold Waystones, the runner <strong>must touch each one in order</strong> before heading to the South Shrine.
+                    A mandatory pit-stop! On maps with 1 or 2 Gold Waystones, the runner <strong>must touch each one in order</strong> before heading to the <strong>South Exit</strong>.
                   </p>
                 </div>
               </div>
 
-              <!-- Secret #2: Red Keeps = Batteries Visual -->
+              <!-- Secret #2: Crimson Keeps = Batteries Visual -->
               <div class="htp-diagram-card htp-keep-card">
                 <div class="htp-diagram-copy">
                   <div class="codex-card-head">
                     <span class="codex-icon" data-icon="keep" data-icon-size="19"></span>
-                    <h4>Secret #2: Red Keeps Are Power Batteries!</h4>
+                    <h4>Secret #2: Crimson Keeps Are Power Batteries!</h4>
                   </div>
                   <p>
-                    See the red stone buildings (<strong>Crimson Keeps</strong>)? They act like <strong>batteries</strong>! If you connect a continuous chain of your Stone Walls touching a Red Keep and bringing it <strong>within 1 tile of a Spire</strong>, that Spire lights up with <strong>Overcharge</strong> — giving it bigger range and faster slow pulses!
+                    See the red stone buildings (<strong>Crimson Keeps</strong>)? They act like <strong>batteries</strong>! If you connect a continuous chain of your Stone Walls touching a <strong>Crimson Keep</strong> and bringing it <strong>within 1 tile of a Spire</strong>, that Spire lights up with <strong>Overcharge</strong> — giving it bigger range and faster slow pulses!
                   </p>
                   <p>
-                    Link up to <strong>3 Red Keeps</strong> into the same wall network for maximum power (shown as glowing diamonds ◆◆◆ on the Spire).
+                    Link up to <strong>3 Crimson Keeps</strong> into the same wall network for maximum power (shown as glowing diamonds ◆◆◆ on the Spire).
                   </p>
                 </div>
                 <div class="htp-svg-single" aria-hidden="true">
                   <figure class="htp-mini-diagram keep-diag">
                     <svg viewBox="0 0 210 74" fill="none">
                       <rect x="2" y="2" width="206" height="70" rx="8" fill="#f7f1e3" stroke="#b45309" stroke-opacity="0.3" />
-                      <!-- Red Keep -->
+                      <!-- Crimson Keep -->
                       <rect x="14" y="20" width="30" height="30" rx="5" fill="#be123c" />
-                      <text x="29" y="61" text-anchor="middle" font-size="9" font-weight="700" fill="#9f1239">Red Keep</text>
+                      <text x="29" y="61" text-anchor="middle" font-size="8.5" font-weight="700" fill="#9f1239">Crimson Keep</text>
                       <!-- Connected Stone Walls -->
                       <rect x="46" y="24" width="22" height="22" rx="3" fill="#64748b" />
                       <rect x="70" y="24" width="22" height="22" rx="3" fill="#64748b" />
@@ -2177,7 +2244,7 @@
                   <span class="icon-slot" data-icon="juggernaut" data-icon-size="16"></span>
                   <div>
                     <strong>Iron Juggernaut</strong>
-                    <span>Shrugs off part of normal slows — link a <strong>Red Keep</strong> to break through their armor!</span>
+                    <span>Shrugs off part of normal slows — link a <strong>Crimson Keep</strong> to break through their armor!</span>
                   </div>
                 </div>
                 <div class="htp-runner-chip">
@@ -2209,11 +2276,30 @@
                     <h4>Daily Maze &amp; Online Lobbies</h4>
                   </div>
                   <p>
-                    Try the <strong>Daily Maze</strong> for one shared global puzzle every day (120s build, 1 attempt/day), or open a <strong>Play Online</strong> lobby where everyone clicks Ready Up before the host starts!
+                    Try the <strong>Daily Maze</strong> for one shared global puzzle every day (120s build, 1 attempt/day), or open a <strong>Play Online</strong> lobby where everyone presses Ready Up before the host starts!
                   </p>
                 </div>
               </div>
             </div>
+          </div>
+
+          <div class="htp-action-footer">
+            <button
+              type="button"
+              class="dock-ready-btn"
+              data-nav="solo-setup"
+            >
+              <span class="icon-slot" data-icon="play" data-icon-size="14"></span>
+              <span>Start Solo Practice</span>
+            </button>
+            <button
+              type="button"
+              class="hub-secondary-btn"
+              data-nav="daily"
+            >
+              <span class="icon-slot" data-icon="calendar" data-icon-size="14"></span>
+              <span>Try Daily Maze</span>
+            </button>
           </div>
         </section>
 
@@ -2331,59 +2417,67 @@
             </div>
 
             <!-- Right: Desktop & Mobile Controls Reference -->
-            <div class="settings-card">
-              <h3>Desktop Controls</h3>
-              <div class="controls-key-list">
-                <div class="control-kv">
-                  <span>Place Stone Wall</span>
-                  <kbd>Left Click</kbd>
-                </div>
-                <div class="control-kv">
-                  <span>Paint a Line of Walls</span>
-                  <span><kbd>Shift</kbd> + Drag</span>
-                </div>
-                <div class="control-kv">
-                  <span>Remove Wall (Free Refund)</span>
-                  <span><kbd>Right Click</kbd> / <kbd>X</kbd></span>
-                </div>
-                <div class="control-kv">
-                  <span>Build / Remove Tools</span>
-                  <span><kbd>Q</kbd> / <kbd>X</kbd></span>
-                </div>
-                <div class="control-kv">
-                  <span>Undo / Redo</span>
-                  <span><kbd>Z</kbd> / <kbd>Ctrl+Y</kbd></span>
-                </div>
-                <div class="control-kv">
-                  <span>Pan &amp; Zoom Camera</span>
-                  <span><kbd>WASD</kbd> / Drag / Scroll</span>
-                </div>
-                <div class="control-kv">
-                  <span>Reset Camera View</span>
-                  <kbd>R</kbd>
-                </div>
-                <div class="control-kv">
-                  <span>Lock In / Ready Up</span>
-                  <kbd>Space</kbd>
-                </div>
-                <div class="control-kv">
-                  <span>View All / Rival Islands</span>
-                  <span><kbd>Tab</kbd> / <kbd>1–6</kbd></span>
-                </div>
-                <div class="control-kv">
-                  <span>Mute Audio / Quick Help</span>
-                  <span><kbd>M</kbd> / <kbd>?</kbd></span>
+            <div class="settings-card controls-card">
+              <div class="controls-section-desktop">
+                <h3>Desktop Controls</h3>
+                <div class="controls-key-list">
+                  <div class="control-kv">
+                    <span>Place Stone Wall</span>
+                    <kbd>Left Click</kbd>
+                  </div>
+                  <div class="control-kv">
+                    <span>Paint a Line of Walls</span>
+                    <span><kbd>Shift</kbd> + Drag</span>
+                  </div>
+                  <div class="control-kv">
+                    <span>Remove Wall (Free Refund)</span>
+                    <span><kbd>Right Click</kbd> / <kbd>X</kbd></span>
+                  </div>
+                  <div class="control-kv">
+                    <span>Build / Remove Tools</span>
+                    <span><kbd>Q</kbd> / <kbd>X</kbd></span>
+                  </div>
+                  <div class="control-kv">
+                    <span>Undo / Redo</span>
+                    <span><kbd>Z</kbd> / <kbd>Ctrl+Y</kbd></span>
+                  </div>
+                  <div class="control-kv">
+                    <span>Pan &amp; Zoom Camera</span>
+                    <span><kbd>WASD</kbd> / Right-Drag / Scroll</span>
+                  </div>
+                  <div class="control-kv">
+                    <span>Reset Camera View</span>
+                    <kbd>R</kbd>
+                  </div>
+                  <div class="control-kv">
+                    <span>Lock In / Ready Up</span>
+                    <kbd>Space</kbd>
+                  </div>
+                  <div class="control-kv">
+                    <span>View All / Rival Islands</span>
+                    <span><kbd>Tab</kbd> / <kbd>1–6</kbd></span>
+                  </div>
+                  <div class="control-kv">
+                    <span>Menu / Leaderboard / Chat</span>
+                    <span><kbd>H</kbd> / <kbd>L</kbd> / <kbd>C</kbd></span>
+                  </div>
+                  <div class="control-kv">
+                    <span>Mute Audio / Quick Help</span>
+                    <span><kbd>M</kbd> / <kbd>?</kbd></span>
+                  </div>
                 </div>
               </div>
 
-              <h3 class="settings-subhead">Touch &amp; Mobile Controls</h3>
-              <ul class="touch-controls-list">
-                <li><strong>Tap grass or hold-drag</strong> to aim your 2×2 wall preview.</li>
-                <li>Use the <strong>Arrow Nudge Pad</strong> for exact 1-tile precision, then tap <strong>Place</strong>.</li>
-                <li><strong>Tap an existing wall</strong> to select and remove it (+1 wall refunded).</li>
-                <li><strong>Tap any Spire, Red Keep, or Waystone</strong> to see its range and details.</li>
-                <li><strong>Pinch</strong> with two fingers to zoom, or use the <strong>Pan</strong> tool to glide around.</li>
-              </ul>
+              <div class="controls-section-touch">
+                <h3 class="settings-subhead">Touch &amp; Mobile Controls</h3>
+                <ul class="touch-controls-list">
+                  <li><strong>Tap grass or hold-drag</strong> to aim your 2×2 wall preview.</li>
+                  <li>Use the <strong>Arrow Nudge Pad</strong> for exact 1-tile precision, then tap <strong>Place</strong>.</li>
+                  <li><strong>Tap an existing wall</strong> to select and remove it (+1 wall refunded).</li>
+                  <li><strong>Tap any Spire, Crimson Keep, or Waystone</strong> to see its range and details.</li>
+                  <li><strong>Pinch</strong> with two fingers to zoom, or use the <strong>Pan</strong> tool to glide around.</li>
+                </ul>
+              </div>
             </div>
           </div>
         </section>
@@ -2459,6 +2553,16 @@
           <div id="leaderboard-round-meta" class="leaderboard-round-meta"></div>
 
           <div id="leaderboard-table-wrap" class="leaderboard-table-wrap"></div>
+
+          <div class="stats-icon-legend">
+            <span><span class="icon-slot" data-icon="bolt" data-icon-size="11"></span> Spire Hits</span>
+            <span>·</span>
+            <span><span class="icon-slot" data-icon="diamondFilled" data-icon-size="10"></span> Overcharge</span>
+            <span>·</span>
+            <span><span class="icon-slot" data-icon="keep" data-icon-size="11"></span> Linked Keeps</span>
+            <span>·</span>
+            <span>m Path Length</span>
+          </div>
         </section>
       </div>
     </div>
@@ -2485,7 +2589,7 @@
             </button>
           </div>
           <p>
-            Build on any open grass tile while leaving a valid path from North Gate to South Shrine.
+            Build on any open grass tile while leaving a valid path from North Gate to South Exit.
           </p>
         </div>
 

@@ -59,7 +59,8 @@ export type IconName =
   | 'share'
   | 'calendar'
   | 'copy'
-  | 'logout';
+  | 'logout'
+  | 'edit';
 
 const SVG_PATHS: Record<IconName, string> = {
   // Battlemented Citadel Keep Crest (3.2-unit embrasures prevent stroke fusion at 16-18px)
@@ -98,13 +99,10 @@ const SVG_PATHS: Record<IconName, string> = {
     <path d="M6.5 20v-9L5.5 8.5V5h4.5v2.5h4V5h4.5v3.5L17.5 11v9" />
     <path d="M6.5 11h11" />
   `,
-  // Remove 2x2 Stone Wall Reticle (distinct from Undo curved arrow)
+  // Remove Stone Wall (clear eraser/demolish block icon — unmistakable at 16-18px)
   reclaim: `
-    <path d="M4.5 8.5V5.5a1 1 0 0 1 1-1h3" />
-    <path d="M15.5 4.5h3a1 1 0 0 1 1 1v3" />
-    <path d="M19.5 15.5v3a1 1 0 0 1-1 1h-3" />
-    <path d="M8.5 19.5h-3a1 1 0 0 1-1-1v-3" />
-    <path d="M9.5 9.5l5 5M14.5 9.5l-5 5" />
+    <path d="M20 20H7l-4-4a2 2 0 0 1 0-2.8l9.2-9.2a2 2 0 0 1 2.8 0l5.6 5.6a2 2 0 0 1 0 2.8L13 20" />
+    <path d="M9.5 7.5l7 7" />
   `,
   // Stopwatch / Run Time
   clock: `
@@ -382,6 +380,10 @@ const SVG_PATHS: Record<IconName, string> = {
   logout: `
     <path d="M10 4.5H5.5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2H10" />
     <path d="M15 16l4.5-4L15 8M19.5 12H9" />
+  `,
+  // Inline Edit Pencil Icon
+  edit: `
+    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4 11.5-11.5z" />
   `,
 };
 

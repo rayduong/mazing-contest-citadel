@@ -207,6 +207,31 @@ function formatBotSkillLabel(
   return 'Normal';
 }
 
+function formatDailyRankLabel(
+  rank: number,
+  total: number,
+  compact = false
+): string {
+  if (total <= 1) {
+    return compact ? '#1 of 1 · Leader' : '#1 of 1 · First on Board';
+  }
+  if (rank === 1) {
+    return compact ? `#1 of ${total} · 1st` : `#1 of ${total} · 1st Place`;
+  }
+  if (total >= 5) {
+    const pct = Math.max(1, Math.min(99, Math.ceil((rank / total) * 100)));
+    return `#${rank} of ${total} (Top ${pct}%)`;
+  }
+  return `#${rank} of ${total}`;
+}
+
+function buildDailyParShareBar(timeSec: number, parSec: number): string {
+  const ratio = Math.max(0, Math.min(1, timeSec / Math.max(1, parSec)));
+  const filled = Math.min(5, Math.max(1, Math.round(ratio * 5)));
+  const blocks = '🟩'.repeat(filled) + '⬜'.repeat(5 - filled);
+  return timeSec >= parSec ? `${blocks} ⭐ Par!` : `${blocks} (${Math.round(ratio * 100)}% of Par)`;
+}
+
 class MazingContestClient {
   private renderer3d: Arena3DRenderer;
   private ws: WebSocket | null = null;
@@ -223,6 +248,7 @@ class MazingContestClient {
   private leaderboard: LeaderboardPayload | null = null;
   private dailyData: DailyMazePayload | null = null;
   private activeMenuScreen: MenuScreen = 'home';
+  private returnToMatchOnBack = false;
   private leaderboardMode: 'rounds' | 'champions' = 'rounds';
   private selectedLeaderboardRound = 1;
   private roundSwitcherTab: 'match' | 'catalog' = 'match';
@@ -363,10 +389,21 @@ class MazingContestClient {
   }
 
   private setupVisualViewportAndInsets() {
+    let baselineLandscapeH = 0;
+    let baselinePortraitH = 0;
+
     const updateViewportVars = () => {
       const vv = window.visualViewport;
       const vvh = vv ? vv.height : window.innerHeight;
       const offsetTop = vv ? vv.offsetTop : 0;
+      const isLand = window.innerWidth > window.innerHeight;
+      if (isLand) {
+        baselineLandscapeH = Math.max(baselineLandscapeH, window.innerHeight, vvh);
+      } else {
+        baselinePortraitH = Math.max(baselinePortraitH, window.innerHeight, vvh);
+      }
+      const baseline = isLand ? baselineLandscapeH : baselinePortraitH;
+
       document.documentElement.style.setProperty(
         '--vvh',
         `${Math.round(vvh)}px`
@@ -375,7 +412,11 @@ class MazingContestClient {
         '--vv-offset-top',
         `${Math.round(offsetTop)}px`
       );
-      const keyboardOpen = window.innerHeight - vvh > 140;
+      const activeTag = document.activeElement?.tagName;
+      const inputFocused = activeTag === 'INPUT' || activeTag === 'TEXTAREA';
+      const keyboardOpen =
+        window.innerHeight - vvh > 140 ||
+        (inputFocused && baseline - vvh > 140);
       document.body.classList.toggle('keyboard-open', keyboardOpen);
       this.scheduleHudSafeInsetsSync();
     };
@@ -387,6 +428,16 @@ class MazingContestClient {
     });
     window.visualViewport?.addEventListener('scroll', updateViewportVars, {
       passive: true,
+    });
+
+    // Keep focused inputs visible inside mobile full-bleed menus when software keyboard shrinks viewport
+    document.getElementById('home-hub-modal')?.addEventListener('focusin', (e) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+        window.setTimeout(() => {
+          target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }, 180);
+      }
     });
   }
 
@@ -738,13 +789,12 @@ class MazingContestClient {
           this.showToast(joinToast, true);
         }
 
+        this.applyRoomState(msg.state);
         if (msg.state.phase === 'LOBBY') {
           this.openMenuScreen('lobby');
         } else {
           this.closeHub();
         }
-
-        this.applyRoomState(msg.state);
         this.syncConfigFormFromSettings(msg.state.settings);
       } else if (msg.type === 'ROOM_STATE') {
         this.roomCode = msg.state.roomCode;
@@ -988,7 +1038,7 @@ class MazingContestClient {
     if (hintEl) {
       hintEl.textContent = `${arch.name} · Par ${formatParTarget(
         round.parTimeSeconds
-      )} — inspect Spires and Red Keeps to plan your route!`;
+      )} — inspect Spires and Crimson Keeps to plan your route!`;
     }
     banner.classList.remove('hidden');
 
@@ -1016,9 +1066,11 @@ class MazingContestClient {
 
     textEl.innerHTML = `
       <span class="brief-head-line">
-        ${getRunnerIcon(archKey, 14)}
-        <strong>${escapeHtml(arch.name)}</strong>
-        <span class="brief-trait">· ${escapeHtml(arch.traitSummary)}</span>
+        <span class="brief-runner-lead">
+          ${getRunnerIcon(archKey, 14)}
+          <strong>${escapeHtml(arch.name)}</strong>
+        </span>
+        <span class="brief-trait">${escapeHtml(arch.traitSummary)}</span>
         <span class="brief-par-chip">${icon('starFilled', 11)} Par ${escapeHtml(
           formatParTarget(round.parTimeSeconds)
         )}</span>
@@ -1031,7 +1083,8 @@ class MazingContestClient {
     if (this.briefDismissTimer !== null) {
       window.clearTimeout(this.briefDismissTimer);
     }
-    const holdMs = round.roundNumber === 1 ? 8500 : 6200;
+    const isShortLand = window.innerHeight <= 500 && window.innerWidth > window.innerHeight;
+    const holdMs = isShortLand ? 3800 : round.roundNumber === 1 ? 8000 : 6000;
     this.briefDismissTimer = window.setTimeout(() => {
       document.body.dataset.briefVisible = 'false';
       banner.classList.add('hidden');
@@ -1156,8 +1209,8 @@ class MazingContestClient {
       return;
     }
 
-    // Leaving LOBBY into PLANNING/BUILD/RUN -> enter the 3D arena immediately
-    if (prevPhase === 'LOBBY' && this.isHubOpen()) {
+    // Entering an active match from Home/no-room or leaving LOBBY -> enter the 3D arena immediately
+    if ((!prevPhase || prevPhase === 'LOBBY') && this.isHubOpen()) {
       this.closeHub();
     }
 
@@ -1197,7 +1250,9 @@ class MazingContestClient {
       if (prevPhase === 'PLANNING') {
         soundEngine.playBuildUnlock();
         soundEngine.haptic('ready');
-        this.showToast('Build phase open — place your walls!', true);
+        if (!this.showRoundTips) {
+          this.showToast('Build phase open — place your walls!', true);
+        }
       } else if (prevPhase && prevPhase !== 'BUILD') {
         this.renderer3d.resetToMyIsland();
       }
@@ -1928,6 +1983,13 @@ class MazingContestClient {
       redoBtn.disabled = !canEdit || this.redoStack.length === 0;
     }
 
+    const popoverRedoBtn = document.getElementById(
+      'btn-popover-redo'
+    ) as HTMLButtonElement | null;
+    if (popoverRedoBtn) {
+      popoverRedoBtn.disabled = !canEdit || this.redoStack.length === 0;
+    }
+
     const clearBtn = document.getElementById(
       'btn-clear-maze'
     ) as HTMLButtonElement | null;
@@ -2250,10 +2312,9 @@ class MazingContestClient {
               : '';
           tagHtml = `<span>${sign}${dt.toFixed(1)}s</span>${overPart}`;
         } else {
-          tagTone = 'invalid';
-          tagHtml = `${icon('close', 12)}<span>${escapeHtml(
-            info.reason || 'Blocked'
-          )}</span>`;
+          // Suppress duplicate floating red error pill on touch preview: #btn-touch-confirm already shows the exact reason in the thumb zone!
+          this.hideCursorPill();
+          return;
         }
 
         const nextClass = `cursor-telemetry-pill micro-touch-tag ${tagTone}`;
@@ -2425,6 +2486,7 @@ class MazingContestClient {
     const wasHidden = tray.classList.contains('hidden');
     tray.classList.remove('hidden');
     if (wasHidden) {
+      this.dismissRoundBrief();
       this.scheduleHudSafeInsetsSync();
     }
 
@@ -2447,7 +2509,7 @@ class MazingContestClient {
       const dt = info.deltaTime;
       const dOver = info.deltaOvercharge ?? 0;
       const dtPart =
-        typeof dt === 'number' ? ` · ${dt >= 0 ? '+' : ''}${dt.toFixed(1)}s` : '';
+        typeof dt === 'number' ? ` ${dt >= 0 ? '+' : ''}${dt.toFixed(1)}s` : '';
       const overLoss =
         dOver < 0
           ? `<span class="overcharge-pips">${dOver}${icon(
@@ -2485,7 +2547,7 @@ class MazingContestClient {
       btnHtml = `${icon(
         'pillar',
         15
-      )}<span id="touch-confirm-label">Place · ${sign}${dt.toFixed(
+      )}<span id="touch-confirm-label">Place ${sign}${dt.toFixed(
         1
       )}s</span>${overBadge}`;
     } else {
@@ -2722,11 +2784,16 @@ class MazingContestClient {
         inp.value = this.playerName;
       }
     }
+    const dailyName = document.getElementById('daily-player-name-label');
+    if (dailyName) {
+      dailyName.textContent = this.playerName;
+    }
   }
 
-  private commitPlayerName(rawVal: string) {
+  private commitPlayerName(rawVal: string, silent = false) {
     const clean = rawVal.trim().slice(0, 18);
     if (clean) {
+      const changed = clean !== this.playerName;
       this.playerName = clean;
       try {
         localStorage.setItem(NAME_STORAGE_KEY, clean);
@@ -2742,6 +2809,9 @@ class MazingContestClient {
         dailyClientId: this.dailyClientId,
         playerName: this.playerName,
       });
+      if (changed && !silent) {
+        this.showToast(`Display name set to ${clean}`, true);
+      }
     } else {
       this.syncAllNameInputs();
     }
@@ -2863,14 +2933,31 @@ class MazingContestClient {
     const slider = document.getElementById(
       'settings-volume-slider'
     ) as HTMLInputElement | null;
-    if (slider) slider.value = String(volPct);
+    if (slider) {
+      slider.value = String(volPct);
+      slider.classList.toggle('is-muted', soundEngine.muted);
+    }
     const volVal = document.getElementById('settings-volume-value');
-    if (volVal) volVal.textContent = `${volPct}%`;
+    if (volVal) {
+      volVal.textContent = soundEngine.muted ? `Muted (${volPct}%)` : `${volPct}%`;
+    }
 
-    const hapticsBtn = document.getElementById('settings-haptics-toggle');
+    const hapticsBtn = document.getElementById(
+      'settings-haptics-toggle'
+    ) as HTMLButtonElement | null;
     if (hapticsBtn) {
-      hapticsBtn.textContent = soundEngine.hapticsEnabled ? 'On' : 'Off';
-      hapticsBtn.classList.toggle('active', soundEngine.hapticsEnabled);
+      const isTouchDevice =
+        document.body.dataset.input === 'touch' ||
+        Boolean(window.matchMedia?.('(pointer: coarse)').matches);
+      if (!isTouchDevice) {
+        hapticsBtn.textContent = 'Mobile';
+        hapticsBtn.classList.remove('active');
+        hapticsBtn.disabled = true;
+      } else {
+        hapticsBtn.disabled = false;
+        hapticsBtn.textContent = soundEngine.hapticsEnabled ? 'On' : 'Off';
+        hapticsBtn.classList.toggle('active', soundEngine.hapticsEnabled);
+      }
     }
 
     const tipsBtn = document.getElementById('settings-tips-toggle');
@@ -2925,17 +3012,70 @@ class MazingContestClient {
 
   private syncPeekMazesButton(isPeeking: boolean) {
     const peekBtn = document.getElementById('btn-peek-mazes');
-    if (!peekBtn) return;
-    peekBtn.innerHTML = isPeeking
-      ? `${icon('eyeOff', 15)}<span>Back to Results</span>`
-      : `${icon('eye', 15)}<span>View Mazes</span>`;
+    const isCompact = window.innerWidth <= 480;
+    const isSoloMaze =
+      this.roomState?.mode === 'DAILY' ||
+      (this.roomState?.players.length ?? 0) <= 1;
+    if (peekBtn) {
+      const openLabel = isSoloMaze
+        ? isCompact
+          ? 'My Maze'
+          : 'View My Maze'
+        : isCompact
+        ? 'Mazes'
+        : 'View Mazes';
+      const backLabel = isCompact ? 'Results' : 'Back to Results';
+      peekBtn.innerHTML = isPeeking
+        ? `${icon('eyeOff', 15)}<span>${backLabel}</span>`
+        : `${icon('eye', 15)}<span>${openLabel}</span>`;
+    }
+
+    const identityPill = document.getElementById('peek-identity-pill');
+    const identityText = document.getElementById('peek-identity-text');
+    if (identityPill && identityText) {
+      if (isPeeking && this.roomState) {
+        const focused =
+          this.roomState.players.find(
+            (p) => p.id === this.renderer3d.focusedPlayerId
+          ) || this.getLocalPlayer();
+        const isMe = focused?.id === this.localPlayerId;
+        const t = (focused?.lastRoundTime ?? 0).toFixed(2);
+        const dist = Math.round(focused?.pathDistance ?? 0);
+        identityText.textContent = this.renderer3d.arenaOverviewMode
+          ? 'Viewing All Islands'
+          : isMe
+          ? `Your Maze · ${t}s · ${dist}m`
+          : `${focused?.name || 'Rival'}'s Maze · ${t}s · ${dist}m`;
+        identityPill.classList.remove('hidden');
+      } else {
+        identityPill.classList.add('hidden');
+      }
+    }
+
+    const winnerBtn = document.getElementById('btn-peek-winner');
+    if (winnerBtn && this.roomState) {
+      const isWinnerFocused =
+        isPeeking &&
+        !this.renderer3d.arenaOverviewMode &&
+        this.renderer3d.focusedPlayerId !== this.localPlayerId;
+      winnerBtn.classList.toggle('active', isWinnerFocused);
+      winnerBtn.innerHTML = isCompact
+        ? `${icon('crown', 14)}<span>${isWinnerFocused ? 'My Maze' : 'Winner'}</span>`
+        : `${icon('crown', 14)}<span>${
+            isWinnerFocused ? 'My Maze' : "Winner's Maze"
+          }</span>`;
+    }
   }
 
   private openMenuScreen(
     screen: MenuScreen,
-    mobilePlayPane?: 'rooms' | 'setup'
+    mobilePlayPane?: 'rooms' | 'setup',
+    returnToMatch = false
   ) {
     this.activeMenuScreen = screen;
+    this.returnToMatchOnBack = Boolean(
+      returnToMatch && this.roomState && this.roomState.phase !== 'LOBBY'
+    );
     const hub = document.getElementById('home-hub-modal');
     if (hub) {
       hub.dataset.screen = screen;
@@ -2957,6 +3097,18 @@ class MazingContestClient {
         .getElementById(`screen-${s}`)
         ?.classList.toggle('hidden', s !== screen);
     }
+
+    // Update top-left Back button context ("Back to Match" vs "Home")
+    document
+      .querySelectorAll<HTMLButtonElement>('.screen-back-btn')
+      .forEach((btn) => {
+        const label = btn.querySelector('span:last-child');
+        if (label) {
+          label.textContent = this.returnToMatchOnBack
+            ? 'Back to Match'
+            : 'Home';
+        }
+      });
 
     if (mobilePlayPane) {
       this.setMobilePlayPane(mobilePlayPane);
@@ -3100,7 +3252,7 @@ class MazingContestClient {
       return;
     }
     if (this.dailyData.completedToday && this.dailyData.myStanding) {
-      badge.textContent = `Rank #${this.dailyData.myStanding.rank} / ${this.dailyData.totalParticipants}`;
+      badge.textContent = `✓ #${this.dailyData.myStanding.rank} / ${this.dailyData.totalParticipants}`;
       badge.classList.add('completed');
     } else {
       badge.textContent = `Daily #${this.dailyData.puzzleNumber}`;
@@ -3113,10 +3265,13 @@ class MazingContestClient {
       window.clearInterval(this.dailyCountdownInterval);
     }
     const tick = () => {
-      const el = document.getElementById('daily-reset-countdown');
-      if (!el || !this.dailyData) return;
+      if (!this.dailyData) return;
       const msLeft = Math.max(0, this.dailyData.resetsAtUtcMs - Date.now());
-      el.textContent = `Next maze in ${formatCountdownHms(msLeft)}`;
+      const hms = formatCountdownHms(msLeft);
+      const el = document.getElementById('daily-reset-countdown');
+      if (el) el.textContent = `Next maze in ${hms}`;
+      const resEl = document.getElementById('results-daily-countdown');
+      if (resEl) resEl.textContent = `Next maze in ${hms}`;
       if (msLeft === 0) {
         this.send({
           type: 'REQUEST_DAILY',
@@ -3135,7 +3290,13 @@ class MazingContestClient {
   ) {
     container.innerHTML = '';
     if (!daily.top10 || daily.top10.length === 0) {
-      container.innerHTML = `<div class="daily-empty-note">No scores yet today. Be the very first to set the pace!</div>`;
+      container.innerHTML = `
+        <div class="daily-empty-state">
+          <div class="daily-empty-medallion">${icon('trophy', 20)}</div>
+          <strong>No scores yet today</strong>
+          <span>Be the first architect on today's global board!</span>
+        </div>
+      `;
       return;
     }
 
@@ -3274,8 +3435,15 @@ class MazingContestClient {
     }
 
     if (ctaArea) {
+      const playerStrip = document.getElementById('daily-player-strip');
+      if (playerStrip) {
+        playerStrip.classList.toggle('hidden', Boolean(d.completedToday));
+      }
+      this.syncAllNameInputs();
+
       if (d.completedToday && d.myStanding) {
         const s = d.myStanding;
+        const rankLabel = formatDailyRankLabel(s.rank, s.totalParticipants);
         ctaArea.innerHTML = `
           <div class="daily-completed-box">
             <div class="daily-completed-head">
@@ -3288,9 +3456,7 @@ class MazingContestClient {
               }
             </div>
             <p class="daily-completed-sub">
-              You placed <strong>#${s.rank} of ${s.totalParticipants}</strong> (Top ${
-          s.percentile
-        }%). A new maze unlocks at midnight UTC!
+              You placed <strong>${escapeHtml(rankLabel)}</strong>. A new maze unlocks at midnight UTC!
             </p>
             <button type="button" id="btn-daily-share" class="dock-ready-btn daily-play-cta">
               ${icon('share', 15)}<span>Share Result</span>
@@ -3299,9 +3465,9 @@ class MazingContestClient {
         `;
         document
           .getElementById('btn-daily-share')
-          ?.addEventListener('click', () => {
+          ?.addEventListener('click', (ev) => {
             soundEngine.playUiClick();
-            this.shareDailyResult();
+            this.shareDailyResult(ev.currentTarget as HTMLButtonElement | null);
           });
       } else {
         ctaArea.innerHTML = `
@@ -3314,7 +3480,7 @@ class MazingContestClient {
           ?.addEventListener('click', () => {
             if (!this.ensureConnectedForAction()) return;
             soundEngine.playUiClick();
-            this.pendingJoinToast = `Daily Maze #${d.puzzleNumber} — 5s to plan!`;
+            this.pendingJoinToast = null;
             this.send({
               type: 'START_DAILY',
               playerName: this.playerName,
@@ -3333,12 +3499,16 @@ class MazingContestClient {
       if (d.myStanding) {
         const s = d.myStanding;
         const inTop10 = s.rank <= 10;
+        const shortRank = formatDailyRankLabel(
+          s.rank,
+          s.totalParticipants,
+          true
+        );
         standingBar.innerHTML = `
           <div class="standing-left">
             <span class="you-badge">Your Position</span>
-            <strong>#${s.rank}</strong>
-            <span>of ${s.totalParticipants} (Top ${s.percentile}%)</span>
-            ${inTop10 ? `<span class="meta-pill">Top 10!</span>` : ''}
+            <strong>${escapeHtml(shortRank)}</strong>
+            ${inTop10 && s.totalParticipants > 1 ? `<span class="meta-pill">Top 10!</span>` : ''}
           </div>
           <div class="standing-right">
             <strong>${s.entry.survivalTimeSeconds.toFixed(2)}s</strong>
@@ -3360,21 +3530,32 @@ class MazingContestClient {
     }
   }
 
-  private async shareDailyResult() {
+  private async shareDailyResult(triggerBtn?: HTMLButtonElement | null) {
     const d = this.dailyData;
     const s = d?.myStanding;
     if (!d || !s) return;
     const e = s.entry;
-    const parIcon = e.beatPar
-      ? '⭐ Beat Par'
-      : `Par ${formatParTarget(e.parTimeSeconds)}`;
+    const rankStr = formatDailyRankLabel(s.rank, s.totalParticipants);
+    const parBar = buildDailyParShareBar(
+      e.survivalTimeSeconds,
+      e.parTimeSeconds
+    );
     const shareText = [
       `🏰 Mazing Contest · Daily Maze #${d.puzzleNumber} (${d.dateKey})`,
-      `⏱️ ${e.survivalTimeSeconds.toFixed(2)}s · ${parIcon}`,
-      `🏆 Rank #${s.rank} / ${s.totalParticipants} (Top ${s.percentile}%)`,
+      parBar,
+      `⏱️ ${e.survivalTimeSeconds.toFixed(2)}s · 🏆 ${rankStr}`,
       `⚡ ${e.clapsTaken} Spire Hits · ◆ ${e.overchargedSpires} Overcharge · 🧱 ${e.wallsUsed} Walls`,
       `${window.location.origin}`,
     ].join('\n');
+
+    const flashCopied = () => {
+      if (!triggerBtn) return;
+      const orig = triggerBtn.innerHTML;
+      triggerBtn.innerHTML = `${icon('check', 15)}<span>Copied!</span>`;
+      window.setTimeout(() => {
+        if (triggerBtn.isConnected) triggerBtn.innerHTML = orig;
+      }, 2200);
+    };
 
     if (
       document.body.dataset.input === 'touch' &&
@@ -3385,6 +3566,7 @@ class MazingContestClient {
           title: `Mazing Contest Daily #${d.puzzleNumber}`,
           text: shareText,
         });
+        flashCopied();
         return;
       } catch (err) {
         if ((err as Error)?.name === 'AbortError') return;
@@ -3414,6 +3596,9 @@ class MazingContestClient {
       } catch {
         copied = false;
       }
+    }
+    if (copied) {
+      flashCopied();
     }
     this.showToast(
       copied
@@ -3449,7 +3634,12 @@ class MazingContestClient {
 
     if (nameEl)
       nameEl.textContent = state.settings.roomName || `Room ${state.roomCode}`;
-    if (codeEl) codeEl.textContent = state.roomCode;
+    const codeTextEl = document.getElementById('lobby-room-code-text');
+    if (codeTextEl) {
+      codeTextEl.textContent = state.roomCode;
+    } else if (codeEl) {
+      codeEl.textContent = state.roomCode;
+    }
     if (visEl)
       visEl.textContent = state.settings.isPublic ? 'Public' : 'Private';
     if (countEl) countEl.textContent = `${state.players.length} / 6`;
@@ -3477,39 +3667,63 @@ class MazingContestClient {
 
     if (slotsGrid) {
       slotsGrid.innerHTML = '';
-      for (let i = 0; i < 6; i++) {
-        const p = state.players[i];
-        const card = document.createElement('div');
-        if (p) {
-          const isMe = p.id === this.localPlayerId;
-          const isReady = p.isBot || p.ready;
-          card.className = `lobby-slot-card filled${isMe ? ' is-me' : ''}${
-            isReady ? ' is-ready' : ''
-          }`;
-          const roleBadge = p.isBot
-            ? `<span class="bot-badge">BOT · ${escapeHtml(
-                formatBotSkillLabel(p.botDifficulty)
-              )}</span>`
-            : p.isHost
-            ? `<span class="bot-badge host-badge">${icon('crown', 11)} HOST</span>`
-            : '';
-          const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
-          const statusPill = isReady
-            ? `<span class="lobby-ready-pill ready">${icon('check', 12)} Ready</span>`
-            : `<span class="lobby-ready-pill waiting">Not Ready</span>`;
+      const emptyCount = Math.max(0, 6 - state.players.length);
+      const compactEmptyMobile = window.innerWidth <= 640 && emptyCount > 1;
 
-          card.innerHTML = `
-            <div class="lobby-slot-identity">
-              <span class="player-swatch" style="background:${escapeHtml(
-                p.color
-              )}"></span>
-              <span class="lobby-slot-name">${escapeHtml(p.name)}</span>
-              ${youBadge}
-              ${roleBadge}
-            </div>
-            ${statusPill}
-          `;
-        } else {
+      state.players.forEach((p) => {
+        const card = document.createElement('div');
+        const isMe = p.id === this.localPlayerId;
+        const isReady = p.isBot || p.ready;
+        card.className = `lobby-slot-card filled${isMe ? ' is-me' : ''}${
+          isReady ? ' is-ready' : ''
+        }`;
+        const roleBadge = p.isBot
+          ? `<span class="bot-badge">BOT · ${escapeHtml(
+              formatBotSkillLabel(p.botDifficulty)
+            )}</span>`
+          : p.isHost
+          ? `<span class="bot-badge host-badge">${icon('crown', 11)} HOST</span>`
+          : '';
+        const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
+        const statusPill = isReady
+          ? `<span class="lobby-ready-pill ready">${icon('check', 12)} Ready</span>`
+          : `<span class="lobby-ready-pill waiting">Not Ready</span>`;
+
+        card.innerHTML = `
+          <div class="lobby-slot-identity">
+            <span class="player-swatch" style="background:${escapeHtml(
+              p.color
+            )}"></span>
+            <span class="lobby-slot-name">${escapeHtml(p.name)}</span>
+            ${youBadge}
+            ${roleBadge}
+          </div>
+          ${statusPill}
+        `;
+        slotsGrid.appendChild(card);
+      });
+
+      if (compactEmptyMobile) {
+        const inviteSlot = document.createElement('button');
+        inviteSlot.type = 'button';
+        inviteSlot.className = 'lobby-slot-card empty lobby-invite-slot-btn';
+        inviteSlot.innerHTML = `
+          <div class="lobby-slot-identity">
+            <span class="lobby-empty-dot"></span>
+            <span class="lobby-empty-label">${emptyCount} Open Slots · Tap to invite friends (${escapeHtml(
+              state.roomCode
+            )})</span>
+          </div>
+          <span class="lobby-invite-chip">${icon('copy', 12)} Invite</span>
+        `;
+        inviteSlot.addEventListener('click', () => {
+          soundEngine.playUiClick();
+          this.shareOrCopyInviteLink();
+        });
+        slotsGrid.appendChild(inviteSlot);
+      } else {
+        for (let i = 0; i < emptyCount; i++) {
+          const card = document.createElement('div');
           card.className = 'lobby-slot-card empty';
           card.innerHTML = `
             <div class="lobby-slot-identity">
@@ -3517,8 +3731,8 @@ class MazingContestClient {
               <span class="lobby-empty-label">Open Slot · Waiting for player…</span>
             </div>
           `;
+          slotsGrid.appendChild(card);
         }
-        slotsGrid.appendChild(card);
       }
     }
 
@@ -3529,21 +3743,21 @@ class MazingContestClient {
           ? 'Unlimited (∞)'
           : s.buildTimeSeconds > 0
           ? `${s.buildTimeSeconds}s`
-          : 'Round Default (90s–120s)';
+          : 'Default (90–120s)';
       rulesSummary.innerHTML = `
-        <div class="lobby-rule-chip"><strong>Rounds:</strong> ${s.totalRounds}</div>
-        <div class="lobby-rule-chip"><strong>Maps:</strong> Randomized (${ROUNDS.length} pool)</div>
-        <div class="lobby-rule-chip"><strong>Build Timer:</strong> ${timerLabel}</div>
-        <div class="lobby-rule-chip"><strong>Wall Supply:</strong> ${formatWallSupplyLabel(
+        <div class="lobby-rule-chip"><span class="rule-k">Rounds</span><strong>${s.totalRounds}</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Maps</span><strong>Randomized (${ROUNDS.length})</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Build Timer</span><strong>${timerLabel}</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Wall Supply</span><strong>${formatWallSupplyLabel(
           s.goldMultiplier
-        )}</div>
-        <div class="lobby-rule-chip"><strong>Bots:</strong> ${botCount} (${formatBotSkillLabel(
+        )}</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">AI Bots</span><strong>${botCount} (${formatBotSkillLabel(
         s.botDifficulty
-      )})</div>
-        <div class="lobby-rule-chip"><strong>Rival Mazes:</strong> ${
+      )})</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Rival Mazes</span><strong>${
           s.fogOfWar ? 'Hidden' : 'Visible'
-        }</div>
-        <div class="lobby-rule-chip"><strong>Planning:</strong> 5s before every round</div>
+        }</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Planning</span><strong>5s / round</strong></div>
       `;
     }
 
@@ -3583,6 +3797,7 @@ class MazingContestClient {
 
     if (readyBtn && readyLabel && me) {
       readyBtn.classList.toggle('is-ready', me.ready);
+      readyBtn.classList.toggle('needs-ready', !me.ready);
       readyLabel.textContent = me.ready ? 'Ready' : 'Ready Up';
     }
 
@@ -3592,22 +3807,22 @@ class MazingContestClient {
         startBtn.disabled = !allHumansReady;
         startLabel.textContent = allHumansReady
           ? 'Start Round'
-          : `Waiting for Ready (${readyHumans}/${connectedHumans.length})`;
+          : `Start (${readyHumans}/${connectedHumans.length} Ready)`;
       } else {
         startBtn.classList.add('hidden');
       }
     }
 
     if (startHint) {
+      const botNote = botCount > 0 ? ' Bots are auto-ready.' : '';
       if (allHumansReady) {
         startHint.textContent = isHost
-          ? 'Everyone is ready! Click Start Round when you want to begin.'
+          ? 'Everyone is ready! Press Start Round when you want to begin.'
           : 'Everyone is ready! Waiting for the host to start the round…';
       } else if (!me?.ready) {
-        startHint.textContent =
-          'Click Ready Up once you are set. All players must ready up before the round starts.';
+        startHint.textContent = `Press Ready Up once you are set. All players (${readyHumans}/${connectedHumans.length}) must ready up before the host starts.${botNote}`;
       } else {
-        startHint.textContent = `Waiting for other players to ready up (${readyHumans}/${connectedHumans.length} ready)…`;
+        startHint.textContent = `Waiting for other players to ready up (${readyHumans}/${connectedHumans.length} ready)…${botNote}`;
       }
     }
   }
@@ -3679,7 +3894,7 @@ class MazingContestClient {
       .getElementById('btn-open-leaderboard')
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
-        this.openMenuScreen('leaderboard');
+        this.openMenuScreen('leaderboard', undefined, true);
       });
 
     document
@@ -3687,7 +3902,11 @@ class MazingContestClient {
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
         this.dismissAllTransientOverlays();
-        this.openMenuScreen('online', 'setup');
+        if (this.roomState?.phase === 'LOBBY') {
+          this.openMenuScreen('lobby');
+        } else {
+          this.openMenuScreen('online', 'setup', true);
+        }
       });
 
     document.getElementById('btn-hub-mute')?.addEventListener('click', () => {
@@ -3705,14 +3924,14 @@ class MazingContestClient {
             this.roomState.roundConfig.roundNumber;
           this.leaderboardMode = 'rounds';
         }
-        this.openMenuScreen('leaderboard');
+        this.openMenuScreen('leaderboard', undefined, true);
       });
 
     document
       .getElementById('btn-results-share-daily')
-      ?.addEventListener('click', () => {
+      ?.addEventListener('click', (ev) => {
         soundEngine.playUiClick();
-        this.shareDailyResult();
+        this.shareDailyResult(ev.currentTarget as HTMLButtonElement | null);
       });
 
     document
@@ -3743,6 +3962,17 @@ class MazingContestClient {
         btn.addEventListener('click', () => {
           soundEngine.playUiClick();
           const target = btn.dataset.nav as MenuScreen;
+          if (
+            target === 'home' &&
+            btn.classList.contains('screen-back-btn') &&
+            this.returnToMatchOnBack &&
+            this.roomState &&
+            this.roomState.phase !== 'LOBBY'
+          ) {
+            this.returnToMatchOnBack = false;
+            this.closeHub();
+            return;
+          }
           if (target) {
             this.openMenuScreen(target);
           }
@@ -3888,24 +4118,38 @@ class MazingContestClient {
     );
     wireSegmented('#lobby-rules-editor .segmented-control');
 
-    document
-      .getElementById('btn-start-solo-match')
-      ?.addEventListener('click', () => {
-        if (!this.ensureConnectedForAction()) return;
-        soundEngine.playUiClick();
-        const settings = this.readSoloFormSettings();
-        this.pendingJoinToast = 'Solo match started — 5s to plan your route!';
-        this.send({
-          type: 'START_SOLO',
-          playerName: this.playerName,
-          sessionId: this.sessionId,
-          settings,
-        });
-      });
+    const startSoloBtn = document.getElementById('btn-start-solo-match');
+    startSoloBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
+      const hasActiveMatch = Boolean(
+        this.roomState && this.roomState.phase !== 'GAME_OVER'
+      );
+      const isDailyActive =
+        this.roomState?.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
+      this.armDestructiveButton(
+        startSoloBtn,
+        hasActiveMatch,
+        isDailyActive ? 'End Daily Try?' : 'Leave Current Match?',
+        'play',
+        () => {
+          soundEngine.playUiClick();
+          const settings = this.readSoloFormSettings();
+          this.pendingJoinToast = null;
+          this.send({
+            type: 'START_SOLO',
+            playerName: this.playerName,
+            sessionId: this.sessionId,
+            settings,
+          });
+        }
+      );
+    });
 
     const joinCodeInput = document.getElementById(
       'join-code-input'
     ) as HTMLInputElement | null;
+    const joinCodeBtn = document.getElementById('btn-join-code');
     const handleJoinByCode = () => {
       if (!this.ensureConnectedForAction()) return;
       const code = (joinCodeInput?.value || '')
@@ -3917,18 +4161,37 @@ class MazingContestClient {
         this.showToast('Enter a room code to join.');
         return;
       }
-      this.pendingJoinToast = `Joined lobby ${code}`;
-      this.send({
-        type: 'JOIN_ROOM',
-        roomCode: code,
-        playerName: this.playerName,
-        sessionId: this.sessionId,
-      });
-      if (joinCodeInput) joinCodeInput.value = '';
+      const hasActiveMatch = Boolean(
+        this.roomState && this.roomState.phase !== 'GAME_OVER'
+      );
+      const isDailyActive =
+        this.roomState?.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
+      const doJoin = () => {
+        this.pendingJoinToast = `Joined lobby ${code}`;
+        this.send({
+          type: 'JOIN_ROOM',
+          roomCode: code,
+          playerName: this.playerName,
+          sessionId: this.sessionId,
+        });
+        if (joinCodeInput) joinCodeInput.value = '';
+      };
+      if (joinCodeBtn && hasActiveMatch) {
+        this.armDestructiveButton(
+          joinCodeBtn,
+          true,
+          isDailyActive ? 'End Daily?' : 'Leave Match?',
+          'arrowRight',
+          doJoin
+        );
+      } else {
+        doJoin();
+      }
     };
-    document
-      .getElementById('btn-join-code')
-      ?.addEventListener('click', handleJoinByCode);
+    joinCodeBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      handleJoinByCode();
+    });
     joinCodeInput?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -3956,22 +4219,35 @@ class MazingContestClient {
         void this.refreshDailyFromApi();
       });
 
-    document
-      .getElementById('btn-create-custom-room')
-      ?.addEventListener('click', () => {
-        if (!this.ensureConnectedForAction()) return;
-        soundEngine.playUiClick();
-        const settings = this.readConfigFormSettings();
-        const customCode = `RM${Math.floor(1000 + Math.random() * 8999)}`;
-        this.pendingJoinToast = `Lobby ${customCode} created — waiting for players!`;
-        this.send({
-          type: 'CREATE_ROOM',
-          roomCode: customCode,
-          playerName: this.playerName,
-          sessionId: this.sessionId,
-          settings,
-        });
-      });
+    const createCustomBtn = document.getElementById('btn-create-custom-room');
+    createCustomBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!this.ensureConnectedForAction()) return;
+      const hasActiveMatch = Boolean(
+        this.roomState && this.roomState.phase !== 'GAME_OVER'
+      );
+      const isDailyActive =
+        this.roomState?.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
+      this.armDestructiveButton(
+        createCustomBtn,
+        hasActiveMatch,
+        isDailyActive ? 'End Daily Try?' : 'Leave Current Match?',
+        'plus',
+        () => {
+          soundEngine.playUiClick();
+          const settings = this.readConfigFormSettings();
+          const customCode = `RM${Math.floor(1000 + Math.random() * 8999)}`;
+          this.pendingJoinToast = null;
+          this.send({
+            type: 'CREATE_ROOM',
+            roomCode: customCode,
+            playerName: this.playerName,
+            sessionId: this.sessionId,
+            settings,
+          });
+        }
+      );
+    });
 
     document
       .getElementById('lobby-room-code')
@@ -3987,12 +4263,22 @@ class MazingContestClient {
         this.shareOrCopyInviteLink();
       });
 
-    document
-      .getElementById('btn-leave-lobby')
-      ?.addEventListener('click', () => {
-        soundEngine.playUiClick();
-        this.send({ type: 'LEAVE_ROOM' });
-      });
+    const leaveLobbyBtn = document.getElementById('btn-leave-lobby');
+    leaveLobbyBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const me = this.getLocalPlayer();
+      const multiHumans = this.getHumanCount() > 1;
+      this.armDestructiveButton(
+        leaveLobbyBtn,
+        Boolean(me?.isHost && multiHumans),
+        'Leave Lobby?',
+        'logout',
+        () => {
+          soundEngine.playUiClick();
+          this.send({ type: 'LEAVE_ROOM' });
+        }
+      );
+    });
 
     document
       .getElementById('btn-lobby-ready')
@@ -4132,6 +4418,9 @@ class MazingContestClient {
     document
       .getElementById('solo-row-bot-skill')
       ?.classList.toggle('hidden', zeroBots);
+    document
+      .getElementById('solo-row-fog')
+      ?.classList.toggle('hidden', zeroBots);
   }
 
   private readConfigFormSettings(): RoomSettings {
@@ -4233,10 +4522,35 @@ class MazingContestClient {
     if (mobileCountEl) {
       mobileCountEl.textContent = String(rooms.length);
     }
+    const homeOnlineBadge = document.getElementById('home-online-badge');
+    if (homeOnlineBadge) {
+      if (rooms.length > 0) {
+        homeOnlineBadge.textContent = `${rooms.length} Live`;
+        homeOnlineBadge.classList.remove('hidden');
+      } else {
+        homeOnlineBadge.classList.add('hidden');
+      }
+    }
 
     listEl.innerHTML = '';
     if (rooms.length === 0) {
-      listEl.innerHTML = `<div class="daily-empty-note">No public lobbies open right now. Host a new lobby and share your room code!</div>`;
+      listEl.innerHTML = `
+        <div class="daily-empty-state">
+          <div class="daily-empty-medallion">${icon('globe', 20)}</div>
+          <strong>No public lobbies open right now</strong>
+          <span>Host a new lobby and share your room code with friends!</span>
+          <button type="button" id="btn-empty-host-lobby" class="dock-ready-btn empty-host-cta">
+            ${icon('plus', 14)}<span>Host a Lobby</span>
+          </button>
+        </div>
+      `;
+      document
+        .getElementById('btn-empty-host-lobby')
+        ?.addEventListener('click', () => {
+          soundEngine.playUiClick();
+          this.setMobilePlayPane('setup');
+          document.getElementById('cfg-room-name')?.focus();
+        });
       return;
     }
 
@@ -4319,13 +4633,27 @@ class MazingContestClient {
           return;
         }
         if (!this.ensureConnectedForAction()) return;
-        this.pendingJoinToast = `Joined ${r.roomName} (${r.roomCode})`;
-        this.send({
-          type: 'JOIN_ROOM',
-          roomCode: r.roomCode,
-          playerName: this.playerName,
-          sessionId: this.sessionId,
-        });
+        const hasActiveMatch = Boolean(
+          this.roomState && this.roomState.phase !== 'GAME_OVER'
+        );
+        const isDailyActive =
+          this.roomState?.mode === 'DAILY' &&
+          this.roomState.phase !== 'GAME_OVER';
+        this.armDestructiveButton(
+          btn,
+          hasActiveMatch,
+          isDailyActive ? 'End Daily?' : 'Leave Match?',
+          'arrowRight',
+          () => {
+            this.pendingJoinToast = `Joined ${r.roomName} (${r.roomCode})`;
+            this.send({
+              type: 'JOIN_ROOM',
+              roomCode: r.roomCode,
+              playerName: this.playerName,
+              sessionId: this.sessionId,
+            });
+          }
+        );
       });
 
       listEl.appendChild(card);
@@ -4621,6 +4949,9 @@ class MazingContestClient {
     document.getElementById('btn-redo')?.addEventListener('click', () => {
       this.performRedo();
     });
+    document.getElementById('btn-popover-redo')?.addEventListener('click', () => {
+      this.performRedo();
+    });
 
     // Bottom Progressive-Disclosure Tools Popover
     const dockToolsBtn = document.getElementById('btn-dock-tools')!;
@@ -4631,6 +4962,8 @@ class MazingContestClient {
       const willOpen = dockToolsPopover.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
+        this.renderer3d.cancelTouchGhost();
+        this.hideTouchPrecisionTray();
         dockToolsPopover.classList.remove('hidden');
         dockToolsBtn.classList.add('active');
         dockToolsBtn.setAttribute('aria-expanded', 'true');
@@ -4646,6 +4979,7 @@ class MazingContestClient {
       const willOpen = standingsDropdown.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
+        this.dismissRoundBrief();
         standingsDropdown.classList.remove('hidden');
         standingsBtn.classList.add('active');
         standingsBtn.setAttribute('aria-expanded', 'true');
@@ -4708,6 +5042,7 @@ class MazingContestClient {
       const willOpen = lobbyDrawer.classList.contains('hidden');
       this.dismissAllTransientOverlays();
       if (willOpen) {
+        this.dismissRoundBrief();
         lobbyDrawer.classList.remove('hidden');
         lobbyToggleBtn.classList.add('active');
         lobbyToggleBtn.setAttribute('aria-expanded', 'true');
@@ -4778,6 +5113,15 @@ class MazingContestClient {
             return;
           }
           if (this.activeMenuScreen !== 'home') {
+            if (
+              this.returnToMatchOnBack &&
+              this.roomState &&
+              this.roomState.phase !== 'LOBBY'
+            ) {
+              this.returnToMatchOnBack = false;
+              this.closeHub();
+              return;
+            }
             this.openMenuScreen('home');
             return;
           }
@@ -4846,13 +5190,17 @@ class MazingContestClient {
         return;
       }
 
-      // Results Modal Shortcuts (Space / Enter -> Next Round)
+      // Results Modal Shortcuts (Space / Enter -> Next Round; never fire hidden Next Round in Daily mode)
       if (this.isResultsBlocking()) {
         if (e.code === 'Space' || e.code === 'Enter') {
           e.preventDefault();
-          document.getElementById('btn-next-round')?.click();
+          if (this.roomState?.mode === 'DAILY') {
+            document.getElementById('btn-results-home')?.click();
+          } else {
+            document.getElementById('btn-next-round')?.click();
+          }
         } else if (e.key.toUpperCase() === 'L') {
-          this.openHub('leaderboard');
+          this.openMenuScreen('leaderboard', undefined, true);
         }
         return;
       }
@@ -4938,7 +5286,11 @@ class MazingContestClient {
           this.roomState?.phase === 'ROUND_RESULTS' ||
           this.roomState?.phase === 'GAME_OVER'
         ) {
-          document.getElementById('btn-next-round')?.click();
+          if (this.roomState.mode === 'DAILY') {
+            document.getElementById('btn-results-home')?.click();
+          } else {
+            document.getElementById('btn-next-round')?.click();
+          }
         }
       } else if (key === '0' || e.code === 'Tab') {
         e.preventDefault();
@@ -5120,7 +5472,7 @@ class MazingContestClient {
       this.armDestructiveButton(
         readyBtn,
         isEmptySoloStart,
-        window.innerWidth <= 385 ? 'Empty?' : 'Start Empty?',
+        window.innerWidth <= 420 ? 'Empty?' : 'Start Empty?',
         'play',
         () => {
           const nextReady = !me.ready;
@@ -5178,6 +5530,7 @@ class MazingContestClient {
         if (!resultsModal) return;
         const isPeeking = resultsModal.classList.toggle('peek-minimized');
         this.syncPeekMazesButton(isPeeking);
+        this.updateResultsCountdownDOM();
         this.syncModalOpenState();
         this.scheduleHudSafeInsetsSync();
       });
@@ -5250,20 +5603,7 @@ class MazingContestClient {
       'player-name-input'
     ) as HTMLInputElement | null;
     const commitDrawerName = () => {
-      const val = (nameInput?.value || '').trim().slice(0, 18);
-      if (val) {
-        this.playerName = val;
-        try {
-          localStorage.setItem(NAME_STORAGE_KEY, val);
-        } catch {
-          // ignore
-        }
-        const hubName = document.getElementById(
-          'hub-player-name-input'
-        ) as HTMLInputElement | null;
-        if (hubName) hubName.value = val;
-        this.send({ type: 'SET_NAME', playerName: val });
-      }
+      this.commitPlayerName(nameInput?.value || '');
     };
     nameInput?.addEventListener('change', commitDrawerName);
     nameInput?.addEventListener('keydown', (e) => {
@@ -5632,7 +5972,7 @@ class MazingContestClient {
       phaseLabel.textContent = 'RUN';
       speedControls.classList.remove('hidden');
     } else {
-      phaseDot.className = 'phase-dot build';
+      phaseDot.className = 'phase-dot results';
       phaseLabel.textContent =
         this.roomState.phase === 'GAME_OVER' ? 'FINAL' : 'STANDINGS';
       speedControls.classList.add('hidden');
@@ -5695,6 +6035,30 @@ class MazingContestClient {
         } · Overcharge: ${evalRun.overchargedSpires}`;
       }
 
+      const synChip = document.getElementById('hud-synergy-chip');
+      const synHits = document.getElementById('hud-synergy-hits');
+      const synOver = document.getElementById('hud-synergy-over');
+      if (synChip && synHits && synOver && evalRun) {
+        synHits.textContent = String(evalRun.clapsTaken);
+        synOver.textContent = String(evalRun.overchargedSpires);
+        synChip.classList.toggle('is-overcharged', evalRun.overchargedSpires > 0);
+        synChip.title = `Projected Spire Hits: ${evalRun.clapsTaken} · Overcharge Tiers: ${evalRun.overchargedSpires} · Linked Keeps: ${evalRun.linkedKeeps}/${round.obstacles.length}`;
+      }
+
+      const mobSynPill = document.getElementById('mobile-synergy-pill');
+      const mobSynHits = document.getElementById('mobile-synergy-hits');
+      const mobSynOver = document.getElementById('mobile-synergy-over');
+      if (mobSynPill && mobSynHits && mobSynOver && evalRun) {
+        mobSynHits.textContent = String(evalRun.clapsTaken);
+        mobSynOver.textContent = String(evalRun.overchargedSpires);
+        mobSynPill.classList.toggle(
+          'is-overcharged',
+          evalRun.overchargedSpires > 0
+        );
+        const showMobSyn = this.roomState.phase === 'BUILD';
+        mobSynPill.classList.toggle('hidden', !showMobSyn);
+      }
+
       const readyBtn = document.getElementById('btn-ready-lock')!;
       const readyText = document.getElementById('ready-btn-text')!;
       const readyIcon = document.getElementById('ready-btn-icon')!;
@@ -5747,27 +6111,38 @@ class MazingContestClient {
 
   private updateTimerDOM(fromTick: boolean) {
     if (!this.roomState) return;
+    const timerEl = document.getElementById('timer-display')!;
+    const clockCluster = timerEl.closest('.phase-clock-cluster');
     if (
       this.roomState.phase === 'BUILD' &&
       this.roomState.settings?.buildTimeSeconds === 999
     ) {
-      document.getElementById('timer-display')!.textContent = '∞';
+      timerEl.textContent = '∞';
+      timerEl.classList.remove('timer-warn', 'timer-urgent');
+      clockCluster?.classList.remove('timer-urgent-pulse');
       return;
     }
 
     const secs = Math.max(0, Math.ceil(this.roomState.phaseTimeRemaining));
     const mm = String(Math.floor(secs / 60)).padStart(2, '0');
     const ss = String(secs % 60).padStart(2, '0');
-    document.getElementById('timer-display')!.textContent = `${mm}:${ss}`;
+    timerEl.textContent = `${mm}:${ss}`;
+
+    const isBuildUnready =
+      this.roomState.phase === 'BUILD' && !this.getLocalPlayer()?.ready;
+    const isWarn = isBuildUnready && secs > 10 && secs <= 15;
+    const isUrgent = isBuildUnready && secs > 0 && secs <= 10;
+    timerEl.classList.toggle('timer-warn', isWarn);
+    timerEl.classList.toggle('timer-urgent', isUrgent);
+    clockCluster?.classList.toggle('timer-urgent-pulse', isUrgent);
 
     // Subtle countdown ticks in the final 5s of BUILD when player hasn't readied yet
     if (
       fromTick &&
-      this.roomState.phase === 'BUILD' &&
+      isBuildUnready &&
       secs >= 1 &&
       secs <= 5 &&
       secs !== this.lastCountdownTickSec &&
-      !this.getLocalPlayer()?.ready &&
       !this.isHubOpen()
     ) {
       this.lastCountdownTickSec = secs;
@@ -6050,14 +6425,23 @@ class MazingContestClient {
     }
 
     const secs = Math.max(0, Math.ceil(this.roomState.phaseTimeRemaining));
+    const isCompactPeek =
+      window.innerWidth <= 480 &&
+      Boolean(
+        document
+          .getElementById('results-modal')
+          ?.classList.contains('peek-minimized')
+      );
     if (connectedHumans.length > 1) {
       const prefix = meReady
         ? `Ready (${readyHumans}/${connectedHumans.length})`
+        : isCompactPeek
+        ? `Next (${readyHumans}/${connectedHumans.length})`
         : `Next Round (${readyHumans}/${connectedHumans.length})`;
       nextBtnLabel.textContent = secs > 0 ? `${prefix} · ${secs}s` : prefix;
     } else {
-      nextBtnLabel.textContent =
-        secs > 0 ? `Next Round (${secs}s)` : 'Next Round';
+      const base = isCompactPeek ? 'Next' : 'Next Round';
+      nextBtnLabel.textContent = secs > 0 ? `${base} (${secs}s)` : base;
     }
   }
 
@@ -6079,15 +6463,22 @@ class MazingContestClient {
     const recordCallout = document.getElementById('results-record-callout')!;
     const dailyPanel = document.getElementById('results-daily-panel');
     const tableEl = document.getElementById('results-table')!;
+    const coachingTipEl = document.getElementById('results-coaching-tip');
     const lbBtn = document.getElementById('btn-results-leaderboard');
     const shareDailyBtn = document.getElementById('btn-results-share-daily');
     const homeDailyBtn = document.getElementById('btn-results-home');
     const nextRoundBtn = document.getElementById('btn-next-round');
+    const resultsModal = document.getElementById('results-modal');
+    const isPeeking = Boolean(resultsModal?.classList.contains('peek-minimized'));
 
     if (isDaily) {
       const me = this.getLocalPlayer();
       const myTime = me?.lastRoundTime ?? 0;
       const beatPar = myTime >= parTarget;
+      const parPct = Math.min(
+        100,
+        Math.round((myTime / Math.max(1, parTarget)) * 100)
+      );
       const d = this.dailyData;
       const standing = d?.myStanding;
 
@@ -6100,6 +6491,7 @@ class MazingContestClient {
       podiumEl.classList.add('hidden');
       recordCallout.classList.add('hidden');
       tableEl.classList.add('hidden');
+      coachingTipEl?.classList.add('hidden');
       lbBtn?.classList.add('hidden');
       nextRoundBtn?.classList.add('hidden');
       shareDailyBtn?.classList.remove('hidden');
@@ -6107,15 +6499,17 @@ class MazingContestClient {
 
       const winnerPeekBtn = document.getElementById('btn-peek-winner');
       winnerPeekBtn?.classList.add('hidden');
+      this.syncPeekMazesButton(isPeeking);
 
       if (dailyPanel) {
         dailyPanel.classList.remove('hidden');
         const rankText = standing
-          ? `#${standing.rank} of ${standing.totalParticipants} (Top ${standing.percentile}%)`
-          : 'Recording rank…';
+          ? formatDailyRankLabel(standing.rank, standing.totalParticipants, true)
+          : 'Recording…';
+        const msLeft = d ? Math.max(0, d.resetsAtUtcMs - Date.now()) : 0;
         dailyPanel.innerHTML = `
           <div class="daily-result-hero">
-            <div class="daily-result-stat">
+            <div class="daily-result-stat hero-time-stat${beatPar ? ' beat-par' : ''}">
               <span class="daily-stat-label">Your Time</span>
               <strong>${myTime.toFixed(2)}s</strong>
             </div>
@@ -6128,15 +6522,32 @@ class MazingContestClient {
               <strong>${me?.lastRoundClaps || 0} / ${me?.lastRoundOvercharge || 0}</strong>
             </div>
           </div>
-          <div class="daily-result-lb-head">Today's Top 10 Leaderboard</div>
+          <div class="daily-par-progress-card">
+            <div class="daily-par-progress-head">
+              <span>${beatPar ? '★ Par Cleared!' : `${parPct}% of Today's Par (${parLabel})`}</span>
+              <span id="results-daily-countdown" class="daily-mini-countdown">Next maze in ${formatCountdownHms(msLeft)}</span>
+            </div>
+            <div class="daily-par-track">
+              <div class="daily-par-fill${beatPar ? ' beat-par' : ''}" style="width:${parPct}%"></div>
+            </div>
+          </div>
+          <div class="daily-result-lb-head-row">
+            <span class="daily-result-lb-head">Today's Top 10 Leaderboard</span>
+            <button type="button" id="btn-daily-results-practice" class="text-link-btn">Practice in Solo →</button>
+          </div>
           <div id="results-daily-top10" class="leaderboard-table-wrap daily-table-wrap"></div>
           ${
             standing && standing.rank > 10
               ? `<div class="daily-my-standing-bar">
                   <div class="standing-left">
                     <span class="you-badge">Your Position</span>
-                    <strong>#${standing.rank}</strong>
-                    <span>of ${standing.totalParticipants} (Top ${standing.percentile}%)</span>
+                    <strong>${escapeHtml(
+                      formatDailyRankLabel(
+                        standing.rank,
+                        standing.totalParticipants,
+                        true
+                      )
+                    )}</strong>
                   </div>
                   <div class="standing-right">
                     <strong>${standing.entry.survivalTimeSeconds.toFixed(2)}s</strong>
@@ -6145,6 +6556,15 @@ class MazingContestClient {
               : ''
           }
         `;
+        document
+          .getElementById('btn-daily-results-practice')
+          ?.addEventListener('click', () => {
+            soundEngine.playUiClick();
+            if (this.roomState) {
+              this.send({ type: 'LEAVE_ROOM' });
+            }
+            window.setTimeout(() => this.openMenuScreen('solo-setup'), 120);
+          });
         const top10Host = document.getElementById('results-daily-top10');
         if (top10Host && d) {
           this.renderDailyLeaderboardRows(top10Host, d);
@@ -6161,7 +6581,8 @@ class MazingContestClient {
     shareDailyBtn?.classList.add('hidden');
     homeDailyBtn?.classList.add('hidden');
 
-    // Inject / toggle Winner's Maze quick-focus button next to View Mazes
+    // Inject / toggle Winner's Maze quick-focus button inside #results-header-actions
+    const headerActions = document.getElementById('results-header-actions');
     const peekBtn = document.getElementById('btn-peek-mazes');
     let winnerPeekBtn = document.getElementById(
       'btn-peek-winner'
@@ -6171,27 +6592,57 @@ class MazingContestClient {
       winnerPeekBtn.type = 'button';
       winnerPeekBtn.id = 'btn-peek-winner';
       winnerPeekBtn.className = 'mini-action-btn peek-winner-btn';
-      winnerPeekBtn.title = "Focus Camera on the Leader's Maze";
+      winnerPeekBtn.title = "Toggle Camera Between Leader's Maze and Your Maze";
       winnerPeekBtn.innerHTML = `${icon('crown', 14)}<span>Winner's Maze</span>`;
       winnerPeekBtn.addEventListener('click', () => {
         soundEngine.playUiClick();
-        const resultsModal = document.getElementById('results-modal');
-        if (resultsModal) {
-          resultsModal.classList.add('peek-minimized');
-          this.syncPeekMazesButton(true);
-          this.syncModalOpenState();
+        const modal = document.getElementById('results-modal');
+        const alreadyPeekingWinner =
+          Boolean(modal?.classList.contains('peek-minimized')) &&
+          !this.renderer3d.arenaOverviewMode &&
+          this.renderer3d.focusedPlayerId !== this.localPlayerId;
+        if (modal) {
+          modal.classList.add('peek-minimized');
         }
-        const winnerId = this.renderer3d.focusWinnerIsland();
-        if (winnerId) {
-          this.syncSpectatorStateDOM();
-          this.updateScoreboardDOM();
+        if (alreadyPeekingWinner && this.localPlayerId) {
+          this.renderer3d.focusOnPlayerIsland(this.localPlayerId);
+        } else {
+          this.renderer3d.focusWinnerIsland();
         }
+        this.syncPeekMazesButton(true);
+        this.syncModalOpenState();
+        this.syncSpectatorStateDOM();
+        this.updateScoreboardDOM();
+        this.updateResultsCountdownDOM();
         this.scheduleHudSafeInsetsSync();
       });
-      peekBtn.parentElement?.insertBefore(winnerPeekBtn, peekBtn);
+      (headerActions || peekBtn.parentElement)?.insertBefore(
+        winnerPeekBtn,
+        peekBtn
+      );
     }
     if (winnerPeekBtn) {
       winnerPeekBtn.classList.toggle('hidden', state.players.length <= 1);
+    }
+    this.syncPeekMazesButton(isPeeking);
+
+    if (coachingTipEl) {
+      const me = this.getLocalPlayer();
+      const myTime = me?.lastRoundTime ?? 0;
+      if (!isGameOver && me && myTime < parTarget) {
+        let tip = '';
+        if ((me.lastRoundOvercharge ?? 0) === 0 && round.obstacles.length > 0) {
+          tip =
+            'Tip: Link a Crimson Keep into your walls within 1 tile of a Spire to Overcharge its slow!';
+        } else if ((me.lastRoundClaps ?? 0) < 2) {
+          tip =
+            'Tip: Fold switchbacks past the glowing Spire rings so the runner gets slowed multiple times.';
+        }
+        coachingTipEl.textContent = tip;
+        coachingTipEl.classList.toggle('hidden', !tip);
+      } else {
+        coachingTipEl.classList.add('hidden');
+      }
     }
 
     progressEl.textContent = isGameOver
