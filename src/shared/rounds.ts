@@ -1,6 +1,9 @@
 import { computeFullMazePath, do2x2Overlap } from './pathfinding.js';
 import {
+  ALL_RUNNER_ARCHETYPES,
   GridPoint,
+  INFINITE_BUILD_TIME,
+  INFINITE_ROUNDS,
   MapKeepStyle,
   MapLayoutPattern,
   RoundConfig,
@@ -1279,19 +1282,58 @@ export function getMapById(mapId?: number): RoundConfig {
   return ROUNDS[0];
 }
 
+export function isInfiniteRounds(totalRounds?: number): boolean {
+  return totalRounds === INFINITE_ROUNDS;
+}
+
+export function isInfiniteBuildTime(buildTimeSeconds?: number): boolean {
+  return buildTimeSeconds === INFINITE_BUILD_TIME;
+}
+
+export function normalizeAllowedRunners(
+  raw?: ReadonlyArray<string> | null
+): RunnerArchetype[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return [...ALL_RUNNER_ARCHETYPES];
+  }
+  const validSet = new Set<RunnerArchetype>();
+  for (const r of raw) {
+    const upper = String(r || '').toUpperCase() as RunnerArchetype;
+    if ((ALL_RUNNER_ARCHETYPES as readonly string[]).includes(upper)) {
+      validSet.add(upper);
+    }
+  }
+  if (validSet.size === 0) {
+    return [...ALL_RUNNER_ARCHETYPES];
+  }
+  return ALL_RUNNER_ARCHETYPES.filter((r) => validSet.has(r));
+}
+
+export function getMapsMatchingRunners(
+  allowedRunners?: ReadonlyArray<RunnerArchetype>
+): RoundConfig[] {
+  const allowedSet = new Set(normalizeAllowedRunners(allowedRunners));
+  return ROUNDS.filter((r) => allowedSet.has(r.runnerType || 'SCOUT'));
+}
+
 /**
- * Builds a randomized permutation of all map indices `[0..ROUNDS.length-1]`.
- * Any indices passed in `deprioritizeIndices` are shuffled to the back half so
- * consecutive matches never immediately repeat maps.
+ * Builds a randomized permutation of matching map indices from `ROUNDS`.
+ * When `allowedRunners` is provided, only maps whose `runnerType` is included
+ * are placed in the deck. Indices in `deprioritizeIndices` are shuffled to the
+ * back half so consecutive matches avoid immediate repeats.
  */
 export function createShuffledMapDeck(
   deprioritizeIndices: ReadonlyArray<number> = [],
-  rng: () => number = Math.random
+  rng: () => number = Math.random,
+  allowedRunners?: ReadonlyArray<RunnerArchetype>
 ): number[] {
+  const allowedSet = new Set(normalizeAllowedRunners(allowedRunners));
   const deprioritized = new Set(deprioritizeIndices);
   const fresh: number[] = [];
   const recent: number[] = [];
   for (let i = 0; i < ROUNDS.length; i++) {
+    const runner = ROUNDS[i].runnerType || 'SCOUT';
+    if (!allowedSet.has(runner)) continue;
     if (deprioritized.has(i)) {
       recent.push(i);
     } else {

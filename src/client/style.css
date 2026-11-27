@@ -3921,13 +3921,17 @@ body.keyboard-open .lobby-drawer:has(#chat-input:focus) .drawer-player-roster {
   }
 
   .lb-synergies {
-    grid-column: 2 / -1;
+    grid-column: 2 / 3;
     font-size: var(--text-2xs);
     color: var(--text-muted);
   }
 
   .lb-meta-right {
-    display: none;
+    grid-column: 3 / 4;
+    font-size: var(--text-2xs);
+    color: var(--text-secondary);
+    text-align: right;
+    white-space: nowrap;
   }
 }
 
@@ -4562,7 +4566,8 @@ body[data-in-menu='true'] #round-brief-banner,
 body[data-in-menu='true'] #planning-banner,
 body[data-in-menu='true'] #touch-precision-tray,
 body[data-in-menu='true'] #mobile-synergy-pill,
-body[data-in-menu='true'] #lobby-drawer {
+body[data-in-menu='true'] #lobby-drawer,
+body[data-in-menu='true'] #tutorial-coach-panel {
   display: none !important;
 }
 
@@ -7359,6 +7364,353 @@ body[data-input='touch'] .controls-section-desktop h3 {
 @media (max-width: 780px) and (max-height: 500px) and (orientation: landscape) {
   .touch-precision-tray {
     bottom: calc(var(--safe-bottom) + 64px);
+  }
+}
+
+/* ============================================================================
+   CUSTOM ROOM RULES (MANUAL ROUNDS / TIMERS & ADDITIONAL OPTIONS RUNNER FILTER)
+   ============================================================================ */
+
+.config-control-combo {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.config-control-combo .segmented-control {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.cfg-custom-input-wrap {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
+.cfg-custom-num {
+  width: 74px;
+  min-height: 36px;
+  height: 36px;
+  padding: 0 8px;
+  border-radius: 10px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-card);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  outline: none;
+  transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+}
+
+.cfg-custom-num::placeholder {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.cfg-custom-num:focus,
+.cfg-custom-num.active {
+  border-color: var(--border-tint-gold);
+  background: var(--surface-tint-gold);
+  color: var(--accent-gold-deep);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.16);
+}
+
+.additional-options-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 2px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--surface-border);
+}
+
+.additional-options-toggle {
+  width: 100%;
+  min-height: 40px;
+  padding: 6px 12px;
+  border-radius: 11px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-subtle);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.additional-options-toggle:hover,
+.additional-options-toggle[aria-expanded='true'] {
+  background: var(--surface-tint-gold);
+  border-color: var(--border-tint-gold);
+}
+
+.additional-toggle-left,
+.additional-toggle-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.additional-options-toggle[aria-expanded='true'] .caret-slot {
+  transform: rotate(180deg);
+}
+
+.additional-options-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--surface-card);
+  border: 1px solid var(--surface-border);
+}
+
+.runner-filter-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.runner-filter-label {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.runner-pool-count {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--accent-gold-deep);
+}
+
+.runner-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.runner-filter-chip {
+  min-height: 38px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  opacity: 0.65;
+  text-decoration: line-through;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, opacity 0.14s ease;
+}
+
+.runner-filter-chip.active {
+  background: var(--surface-tint-gold);
+  border-color: var(--border-tint-gold);
+  color: var(--text-primary);
+  opacity: 1;
+  text-decoration: none;
+}
+
+/* ============================================================================
+   GUIDED INTERACTIVE TUTORIAL (CTA CARD, LIVE COACH BANNER & COMPLETION MODAL)
+   ============================================================================ */
+
+.htp-tutorial-cta-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(254, 243, 199, 0.92), rgba(253, 230, 138, 0.58));
+  border: 1.5px solid var(--border-tint-gold);
+  margin-bottom: 12px;
+}
+
+.htp-tutorial-cta-copy {
+  flex: 1 1 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.htp-tutorial-cta-copy h3 {
+  margin: 0;
+  font-size: var(--text-md, 15px);
+  font-weight: 800;
+  color: var(--text-primary);
+}
+
+.htp-tutorial-cta-copy p {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.btn-launch-tutorial {
+  flex-shrink: 0;
+}
+
+.tutorial-coach-panel {
+  position: fixed;
+  top: calc(var(--safe-top) + 66px);
+  left: 16px;
+  transform: none;
+  width: min(352px, calc(100vw - 32px));
+  padding: 12px 14px;
+  border-radius: 16px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1.5px solid var(--border-tint-gold);
+  box-shadow: 0 12px 28px rgba(40, 26, 8, 0.18);
+  pointer-events: auto;
+}
+
+.tutorial-coach-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tutorial-coach-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tutorial-step-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--surface-tint-gold);
+  border: 1px solid var(--border-tint-gold);
+  color: var(--accent-gold-deep);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.tutorial-step-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tutorial-step-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--surface-border);
+  transition: background 0.18s ease, transform 0.18s ease;
+}
+
+.tutorial-step-dot.done {
+  background: var(--accent-sage);
+}
+
+.tutorial-step-dot.current {
+  background: var(--accent-gold);
+  transform: scale(1.25);
+}
+
+.tutorial-coach-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tutorial-step-title {
+  font-size: var(--text-sm);
+  font-weight: 800;
+  color: var(--text-primary);
+  line-height: 1.25;
+}
+
+.tutorial-step-copy {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.42;
+  color: var(--text-secondary);
+}
+
+.tutorial-coach-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.tutorial-progress-chip {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  color: var(--accent-gold-deep);
+}
+
+.tutorial-step-tip {
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+}
+
+body[data-mode='TUTORIAL'] #btn-reroll-map,
+body[data-mode='TUTORIAL'] #btn-demo-layout,
+body[data-mode='TUTORIAL'] #btn-clear-maze,
+body[data-mode='TUTORIAL'] #round-switcher-header,
+body[data-mode='TUTORIAL'] #round-map-search-wrap,
+body[data-mode='TUTORIAL'] #round-pills,
+body[data-mode='TUTORIAL'] #round-dropdown .popover-divider,
+body[data-mode='TUTORIAL'] #btn-toggle-lobby,
+body[data-mode='TUTORIAL'] #standings-wrap,
+body[data-mode='TUTORIAL'] #btn-camera-overview,
+body[data-mode='TUTORIAL'] #btn-run-overview-toggle,
+body[data-mode='TUTORIAL'] #hud-run-dock .pill-divider,
+body[data-mode='TUTORIAL'] #round-brief-banner {
+  display: none !important;
+}
+
+@media (max-width: 960px) {
+  .tutorial-coach-panel {
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(440px, calc(100vw - 20px));
+  }
+}
+
+@media (max-width: 640px) {
+  .tutorial-coach-panel {
+    top: calc(var(--safe-top) + 56px);
+    padding: 10px 12px;
+  }
+
+  .runner-filter-grid {
+    grid-template-columns: 1fr;
   }
 }
 

@@ -2,7 +2,19 @@ export type SpireType = 'THUNDERCLAP' | 'FROST_OBELISK' | 'CHRONO_SPIRE';
 export type TowerType = 'BLOCK' | SpireType;
 export type ActiveBuildTool = 'BLOCK' | 'SELL' | 'PAN';
 export type RunnerArchetype = 'SCOUT' | 'OUTRIDER' | 'JUGGERNAUT' | 'HERALD';
-export type RoomMode = 'SOLO' | 'ONLINE' | 'DAILY';
+export const ALL_RUNNER_ARCHETYPES: readonly RunnerArchetype[] = [
+  'SCOUT',
+  'OUTRIDER',
+  'JUGGERNAUT',
+  'HERALD',
+];
+export const INFINITE_ROUNDS = 999;
+export const INFINITE_BUILD_TIME = 999;
+export const MIN_CUSTOM_ROUNDS = 1;
+export const MAX_CUSTOM_ROUNDS = 100;
+export const MIN_CUSTOM_BUILD_SECONDS = 15;
+export const MAX_CUSTOM_BUILD_SECONDS = 600;
+export type RoomMode = 'SOLO' | 'ONLINE' | 'DAILY' | 'TUTORIAL';
 export type GamePhase =
   | 'LOBBY'
   | 'PLANNING'
@@ -413,12 +425,13 @@ export interface PlayerState {
 export interface RoomSettings {
   roomName: string;
   isPublic: boolean;
-  totalRounds: number;
-  buildTimeSeconds: number; // 0 = Round Default, or custom override (e.g. 45, 60, 90, 120, 999)
+  totalRounds: number;      // 1..100 or INFINITE_ROUNDS (999) for Endless
+  buildTimeSeconds: number; // 0 = Round Default, 15..600 = custom seconds, or 999 = Unlimited
   goldMultiplier: number;   // 0.8 (80%), 1.0 (Normal), 1.25 (125%)
   botCount: number;         // 0..5
   botDifficulty: 'NOVICE' | 'ARCHITECT' | 'GRANDMASTER';
   fogOfWar: boolean;
+  allowedRunners?: RunnerArchetype[];
 }
 
 export interface LobbyRoomSummary {
@@ -437,6 +450,8 @@ export interface LobbyRoomSummary {
 
 export interface LeaderboardRoundEntry {
   id: string;
+  mapId?: number;
+  mapTitle?: string;
   roundNumber: number;
   roundTitle: string;
   runnerType: RunnerArchetype;
@@ -464,10 +479,13 @@ export interface LeaderboardChampionEntry {
   parStarsEarned: number;
   bestSurvivalTime: number;
   bestRoundNumber: number;
+  bestMapId?: number;
+  bestMapTitle?: string;
   lastPlayedAt: number;
 }
 
 export interface LeaderboardPayload {
+  mapRecords?: Record<number, LeaderboardRoundEntry[]>;
   roundRecords: Record<number, LeaderboardRoundEntry[]>;
   champions: LeaderboardChampionEntry[];
   updatedAt: number;

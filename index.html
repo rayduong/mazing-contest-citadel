@@ -79,6 +79,90 @@
       </div>
     </div>
 
+    <!-- Non-Blocking Guided Tutorial Coach Banner -->
+    <div
+      id="tutorial-coach-panel"
+      class="tutorial-coach-panel surface-panel hidden"
+      role="region"
+      aria-label="Guided Tutorial Coach"
+    >
+      <div class="tutorial-coach-head">
+        <div class="tutorial-coach-meta">
+          <span id="tutorial-step-badge" class="tutorial-step-badge">STEP 1 OF 6</span>
+          <div id="tutorial-step-dots" class="tutorial-step-dots" aria-hidden="true"></div>
+        </div>
+        <div class="tutorial-coach-actions">
+          <button
+            type="button"
+            id="btn-tutorial-focus"
+            class="mini-action-btn"
+            title="Center Camera on Tutorial Targets"
+          >
+            <span class="icon-slot" data-icon="target" data-icon-size="13"></span>
+            <span>Focus</span>
+          </button>
+          <button
+            type="button"
+            id="btn-tutorial-exit"
+            class="mini-action-btn"
+            title="Exit Guided Tutorial"
+          >
+            <span class="icon-slot" data-icon="close" data-icon-size="13"></span>
+            <span>Exit</span>
+          </button>
+        </div>
+      </div>
+      <div id="tutorial-step-title" class="tutorial-step-title">
+        Block the Lane &amp; Overcharge the Storm Spire
+      </div>
+      <p id="tutorial-step-copy" class="tutorial-step-copy">
+        Follow the glowing gold squares to place your Stone Walls.
+      </p>
+      <div class="tutorial-coach-foot">
+        <span id="tutorial-step-progress" class="tutorial-progress-chip">0 / 3 placed</span>
+        <span id="tutorial-step-tip" class="tutorial-step-tip">Glowing squares snap your wall automatically</span>
+      </div>
+    </div>
+
+    <!-- Guided Tutorial Completion Modal -->
+    <div
+      id="tutorial-complete-modal"
+      class="modal-backdrop hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="tutorial-complete-title"
+    >
+      <div class="modal-card tutorial-complete-card surface-panel">
+        <div class="modal-header">
+          <div class="results-header-row">
+            <h2 id="tutorial-complete-title">Tutorial Complete!</h2>
+            <span class="par-pill">
+              <span class="icon-slot" data-icon="starFilled" data-icon-size="11"></span>
+              <span>Ready to Play</span>
+            </span>
+          </div>
+          <p id="tutorial-complete-sub">
+            You built an Overcharged switchback maze and slowed the Citadel Scout!
+          </p>
+        </div>
+        <div id="tutorial-complete-stats" class="daily-result-hero"></div>
+        <div class="modal-actions results-actions">
+          <button type="button" id="btn-tutorial-replay" class="hub-secondary-btn">
+            <span class="icon-slot" data-icon="refresh" data-icon-size="14"></span>
+            <span>Replay Tutorial</span>
+          </button>
+          <button type="button" id="btn-tutorial-home" class="hub-secondary-btn">
+            <span class="icon-slot" data-icon="hub" data-icon-size="14"></span>
+            <span>Home</span>
+          </button>
+          <button type="button" id="btn-tutorial-play-solo" class="dock-ready-btn">
+            <span class="icon-slot" data-icon="play" data-icon-size="14"></span>
+            <span>Play Solo Match</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Non-Blocking Round Strategy Brief Banner -->
     <div
       id="round-brief-banner"
@@ -1128,42 +1212,85 @@
             <div class="config-matrix">
               <div class="config-row">
                 <label class="config-label">Rounds</label>
-                <div class="segmented-control" id="solo-rounds-group">
-                  <button type="button" class="seg-btn active" data-val="3">
-                    3 Rounds
-                  </button>
-                  <button type="button" class="seg-btn" data-val="5">
-                    5 Rounds
-                  </button>
-                  <button type="button" class="seg-btn" data-val="8">
-                    8 Rounds
-                  </button>
+                <div class="config-control-combo">
+                  <div class="segmented-control" id="solo-rounds-group">
+                    <button type="button" class="seg-btn active" data-val="3">
+                      3
+                    </button>
+                    <button type="button" class="seg-btn" data-val="5">
+                      5
+                    </button>
+                    <button type="button" class="seg-btn" data-val="8">
+                      8
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      data-val="999"
+                      title="Endless Rounds (∞)"
+                    >
+                      ∞
+                    </button>
+                  </div>
+                  <div class="cfg-custom-input-wrap" title="Custom round count (1–100)">
+                    <input
+                      id="solo-rounds-custom"
+                      class="cfg-custom-num"
+                      type="number"
+                      min="1"
+                      max="100"
+                      step="1"
+                      inputmode="numeric"
+                      placeholder="Custom"
+                      aria-label="Custom number of rounds (1 to 100)"
+                    />
+                  </div>
                 </div>
               </div>
 
               <div class="config-row">
                 <label class="config-label">Build Timer</label>
-                <div class="segmented-control" id="solo-buildtime-group">
-                  <button
-                    type="button"
-                    class="seg-btn active"
-                    data-val="0"
-                    title="Round default (90s to 120s)"
-                  >
-                    Default
-                  </button>
-                  <button type="button" class="seg-btn" data-val="45">
-                    45s
-                  </button>
-                  <button type="button" class="seg-btn" data-val="60">
-                    60s
-                  </button>
-                  <button type="button" class="seg-btn" data-val="120">
-                    120s
-                  </button>
-                  <button type="button" class="seg-btn" data-val="999">
-                    ∞
-                  </button>
+                <div class="config-control-combo">
+                  <div class="segmented-control" id="solo-buildtime-group">
+                    <button
+                      type="button"
+                      class="seg-btn active"
+                      data-val="0"
+                      title="Map default (90s to 125s)"
+                    >
+                      Default
+                    </button>
+                    <button type="button" class="seg-btn" data-val="45">
+                      45s
+                    </button>
+                    <button type="button" class="seg-btn" data-val="60">
+                      60s
+                    </button>
+                    <button type="button" class="seg-btn" data-val="120">
+                      120s
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      data-val="999"
+                      title="Unlimited build time (∞)"
+                    >
+                      ∞
+                    </button>
+                  </div>
+                  <div class="cfg-custom-input-wrap" title="Custom build timer in seconds (15–600s)">
+                    <input
+                      id="solo-buildtime-custom"
+                      class="cfg-custom-num"
+                      type="number"
+                      min="15"
+                      max="600"
+                      step="5"
+                      inputmode="numeric"
+                      placeholder="Sec"
+                      aria-label="Custom build timer in seconds (15 to 600)"
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -1224,6 +1351,49 @@
                   <button type="button" class="seg-btn" data-val="true">
                     Hidden
                   </button>
+                </div>
+              </div>
+
+              <div class="additional-options-block">
+                <button
+                  type="button"
+                  id="btn-solo-additional-options"
+                  class="additional-options-toggle"
+                  aria-expanded="false"
+                  aria-controls="solo-additional-options-body"
+                >
+                  <span class="additional-toggle-left">
+                    <span class="icon-slot" data-icon="sliders" data-icon-size="13"></span>
+                    <span>Additional Options</span>
+                  </span>
+                  <span class="additional-toggle-right">
+                    <span id="solo-additional-summary" class="meta-pill">All 4 Runners</span>
+                    <span class="icon-slot caret-slot" data-icon="chevronDown" data-icon-size="13"></span>
+                  </span>
+                </button>
+                <div id="solo-additional-options-body" class="additional-options-body hidden">
+                  <div class="runner-filter-head">
+                    <span class="runner-filter-label">Runner Types Allowed</span>
+                    <span id="solo-runners-pool-count" class="runner-pool-count">58 matching maps</span>
+                  </div>
+                  <div class="runner-filter-grid" id="solo-runners-group" data-runner-filter="solo">
+                    <button type="button" class="runner-filter-chip active" data-runner="SCOUT" aria-pressed="true">
+                      <span class="icon-slot" data-icon="scout" data-icon-size="14"></span>
+                      <span>Citadel Scout</span>
+                    </button>
+                    <button type="button" class="runner-filter-chip active" data-runner="OUTRIDER" aria-pressed="true">
+                      <span class="icon-slot" data-icon="outrider" data-icon-size="14"></span>
+                      <span>Royal Outrider</span>
+                    </button>
+                    <button type="button" class="runner-filter-chip active" data-runner="JUGGERNAUT" aria-pressed="true">
+                      <span class="icon-slot" data-icon="juggernaut" data-icon-size="14"></span>
+                      <span>Iron Juggernaut</span>
+                    </button>
+                    <button type="button" class="runner-filter-chip active" data-runner="HERALD" aria-pressed="true">
+                      <span class="icon-slot" data-icon="herald" data-icon-size="14"></span>
+                      <span>Wind Herald</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1402,50 +1572,93 @@
 
                 <div class="config-row">
                   <label class="config-label">Rounds</label>
-                  <div
-                    class="segmented-control"
-                    id="cfg-rounds-group"
-                    data-setting="totalRounds"
-                  >
-                    <button type="button" class="seg-btn" data-val="3">
-                      3 Rounds
-                    </button>
-                    <button type="button" class="seg-btn" data-val="5">
-                      5 Rounds
-                    </button>
-                    <button type="button" class="seg-btn active" data-val="8">
-                      8 Rounds
-                    </button>
+                  <div class="config-control-combo">
+                    <div
+                      class="segmented-control"
+                      id="cfg-rounds-group"
+                      data-setting="totalRounds"
+                    >
+                      <button type="button" class="seg-btn" data-val="3">
+                        3
+                      </button>
+                      <button type="button" class="seg-btn" data-val="5">
+                        5
+                      </button>
+                      <button type="button" class="seg-btn active" data-val="8">
+                        8
+                      </button>
+                      <button
+                        type="button"
+                        class="seg-btn"
+                        data-val="999"
+                        title="Endless Rounds (∞)"
+                      >
+                        ∞
+                      </button>
+                    </div>
+                    <div class="cfg-custom-input-wrap" title="Custom round count (1–100)">
+                      <input
+                        id="cfg-rounds-custom"
+                        class="cfg-custom-num"
+                        type="number"
+                        min="1"
+                        max="100"
+                        step="1"
+                        inputmode="numeric"
+                        placeholder="Custom"
+                        aria-label="Custom number of rounds (1 to 100)"
+                      />
+                    </div>
                   </div>
                 </div>
 
                 <div class="config-row">
                   <label class="config-label">Build Timer</label>
-                  <div
-                    class="segmented-control"
-                    id="cfg-buildtime-group"
-                    data-setting="buildTimeSeconds"
-                  >
-                    <button
-                      type="button"
-                      class="seg-btn active"
-                      data-val="0"
-                      title="Round default (90s to 120s)"
+                  <div class="config-control-combo">
+                    <div
+                      class="segmented-control"
+                      id="cfg-buildtime-group"
+                      data-setting="buildTimeSeconds"
                     >
-                      Default
-                    </button>
-                    <button type="button" class="seg-btn" data-val="45">
-                      45s
-                    </button>
-                    <button type="button" class="seg-btn" data-val="60">
-                      60s
-                    </button>
-                    <button type="button" class="seg-btn" data-val="120">
-                      120s
-                    </button>
-                    <button type="button" class="seg-btn" data-val="999">
-                      ∞
-                    </button>
+                      <button
+                        type="button"
+                        class="seg-btn active"
+                        data-val="0"
+                        title="Map default (90s to 125s)"
+                      >
+                        Default
+                      </button>
+                      <button type="button" class="seg-btn" data-val="45">
+                        45s
+                      </button>
+                      <button type="button" class="seg-btn" data-val="60">
+                        60s
+                      </button>
+                      <button type="button" class="seg-btn" data-val="120">
+                        120s
+                      </button>
+                      <button
+                        type="button"
+                        class="seg-btn"
+                        data-val="999"
+                        title="Unlimited build time (∞)"
+                      >
+                        ∞
+                      </button>
+                    </div>
+                    <div class="cfg-custom-input-wrap" title="Custom build timer in seconds (15–600s)">
+                      <input
+                        id="cfg-buildtime-custom"
+                        class="cfg-custom-num"
+                        type="number"
+                        min="15"
+                        max="600"
+                        step="5"
+                        inputmode="numeric"
+                        placeholder="Sec"
+                        aria-label="Custom build timer in seconds (15 to 600)"
+                      />
+                    </div>
                   </div>
                 </div>
 
@@ -1540,6 +1753,49 @@
                     <button type="button" class="seg-btn" data-val="true">
                       Hidden
                     </button>
+                  </div>
+                </div>
+
+                <div class="additional-options-block">
+                  <button
+                    type="button"
+                    id="btn-cfg-additional-options"
+                    class="additional-options-toggle"
+                    aria-expanded="false"
+                    aria-controls="cfg-additional-options-body"
+                  >
+                    <span class="additional-toggle-left">
+                      <span class="icon-slot" data-icon="sliders" data-icon-size="13"></span>
+                      <span>Additional Options</span>
+                    </span>
+                    <span class="additional-toggle-right">
+                      <span id="cfg-additional-summary" class="meta-pill">All 4 Runners</span>
+                      <span class="icon-slot caret-slot" data-icon="chevronDown" data-icon-size="13"></span>
+                    </span>
+                  </button>
+                  <div id="cfg-additional-options-body" class="additional-options-body hidden">
+                    <div class="runner-filter-head">
+                      <span class="runner-filter-label">Runner Types Allowed</span>
+                      <span id="cfg-runners-pool-count" class="runner-pool-count">58 matching maps</span>
+                    </div>
+                    <div class="runner-filter-grid" id="cfg-runners-group" data-runner-filter="cfg">
+                      <button type="button" class="runner-filter-chip active" data-runner="SCOUT" aria-pressed="true">
+                        <span class="icon-slot" data-icon="scout" data-icon-size="14"></span>
+                        <span>Citadel Scout</span>
+                      </button>
+                      <button type="button" class="runner-filter-chip active" data-runner="OUTRIDER" aria-pressed="true">
+                        <span class="icon-slot" data-icon="outrider" data-icon-size="14"></span>
+                        <span>Royal Outrider</span>
+                      </button>
+                      <button type="button" class="runner-filter-chip active" data-runner="JUGGERNAUT" aria-pressed="true">
+                        <span class="icon-slot" data-icon="juggernaut" data-icon-size="14"></span>
+                        <span>Iron Juggernaut</span>
+                      </button>
+                      <button type="button" class="runner-filter-chip active" data-runner="HERALD" aria-pressed="true">
+                        <span class="icon-slot" data-icon="herald" data-icon-size="14"></span>
+                        <span>Wind Herald</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1742,50 +1998,88 @@
                     </div>
                     <div class="config-row">
                       <label class="config-label">Rounds</label>
-                      <div
-                        class="segmented-control"
-                        id="lobby-cfg-rounds-group"
-                      >
-                        <button type="button" class="seg-btn" data-val="3">
-                          3
-                        </button>
-                        <button type="button" class="seg-btn" data-val="5">
-                          5
-                        </button>
-                        <button
-                          type="button"
-                          class="seg-btn active"
-                          data-val="8"
+                      <div class="config-control-combo">
+                        <div
+                          class="segmented-control"
+                          id="lobby-cfg-rounds-group"
                         >
-                          8
-                        </button>
+                          <button type="button" class="seg-btn" data-val="3">
+                            3
+                          </button>
+                          <button type="button" class="seg-btn" data-val="5">
+                            5
+                          </button>
+                          <button
+                            type="button"
+                            class="seg-btn active"
+                            data-val="8"
+                          >
+                            8
+                          </button>
+                          <button
+                            type="button"
+                            class="seg-btn"
+                            data-val="999"
+                            title="Endless Rounds (∞)"
+                          >
+                            ∞
+                          </button>
+                        </div>
+                        <div class="cfg-custom-input-wrap" title="Custom round count (1–100)">
+                          <input
+                            id="lobby-cfg-rounds-custom"
+                            class="cfg-custom-num"
+                            type="number"
+                            min="1"
+                            max="100"
+                            step="1"
+                            inputmode="numeric"
+                            placeholder="Custom"
+                            aria-label="Custom number of rounds (1 to 100)"
+                          />
+                        </div>
                       </div>
                     </div>
                     <div class="config-row">
                       <label class="config-label">Timer</label>
-                      <div
-                        class="segmented-control"
-                        id="lobby-cfg-buildtime-group"
-                      >
-                        <button
-                          type="button"
-                          class="seg-btn active"
-                          data-val="0"
+                      <div class="config-control-combo">
+                        <div
+                          class="segmented-control"
+                          id="lobby-cfg-buildtime-group"
                         >
-                          Default
-                        </button>
-                        <button type="button" class="seg-btn" data-val="45">
-                          45s
-                        </button>
-                        <button type="button" class="seg-btn" data-val="60">
-                          60s
-                        </button>
-                        <button type="button" class="seg-btn" data-val="120">
-                          120s
-                        </button>
-                        <button type="button" class="seg-btn" data-val="999">
-                          ∞
-                        </button>
+                          <button
+                            type="button"
+                            class="seg-btn active"
+                            data-val="0"
+                          >
+                            Default
+                          </button>
+                          <button type="button" class="seg-btn" data-val="45">
+                            45s
+                          </button>
+                          <button type="button" class="seg-btn" data-val="60">
+                            60s
+                          </button>
+                          <button type="button" class="seg-btn" data-val="120">
+                            120s
+                          </button>
+                          <button type="button" class="seg-btn" data-val="999">
+                            ∞
+                          </button>
+                        </div>
+                        <div class="cfg-custom-input-wrap" title="Custom timer in seconds (15–600s)">
+                          <input
+                            id="lobby-cfg-buildtime-custom"
+                            class="cfg-custom-num"
+                            type="number"
+                            min="15"
+                            max="600"
+                            step="5"
+                            inputmode="numeric"
+                            placeholder="Sec"
+                            aria-label="Custom build timer in seconds (15 to 600)"
+                          />
+                        </div>
                       </div>
                     </div>
                     <div class="config-row">
@@ -1847,6 +2141,49 @@
                         <button type="button" class="seg-btn" data-val="true">
                           Hidden
                         </button>
+                      </div>
+                    </div>
+
+                    <div class="additional-options-block">
+                      <button
+                        type="button"
+                        id="btn-lobby-additional-options"
+                        class="additional-options-toggle"
+                        aria-expanded="false"
+                        aria-controls="lobby-additional-options-body"
+                      >
+                        <span class="additional-toggle-left">
+                          <span class="icon-slot" data-icon="sliders" data-icon-size="13"></span>
+                          <span>Additional Options</span>
+                        </span>
+                        <span class="additional-toggle-right">
+                          <span id="lobby-additional-summary" class="meta-pill">All 4 Runners</span>
+                          <span class="icon-slot caret-slot" data-icon="chevronDown" data-icon-size="13"></span>
+                        </span>
+                      </button>
+                      <div id="lobby-additional-options-body" class="additional-options-body hidden">
+                        <div class="runner-filter-head">
+                          <span class="runner-filter-label">Runner Types Allowed</span>
+                          <span id="lobby-runners-pool-count" class="runner-pool-count">58 matching maps</span>
+                        </div>
+                        <div class="runner-filter-grid" id="lobby-cfg-runners-group" data-runner-filter="lobby">
+                          <button type="button" class="runner-filter-chip active" data-runner="SCOUT" aria-pressed="true">
+                            <span class="icon-slot" data-icon="scout" data-icon-size="14"></span>
+                            <span>Citadel Scout</span>
+                          </button>
+                          <button type="button" class="runner-filter-chip active" data-runner="OUTRIDER" aria-pressed="true">
+                            <span class="icon-slot" data-icon="outrider" data-icon-size="14"></span>
+                            <span>Royal Outrider</span>
+                          </button>
+                          <button type="button" class="runner-filter-chip active" data-runner="JUGGERNAUT" aria-pressed="true">
+                            <span class="icon-slot" data-icon="juggernaut" data-icon-size="14"></span>
+                            <span>Iron Juggernaut</span>
+                          </button>
+                          <button type="button" class="runner-filter-chip active" data-runner="HERALD" aria-pressed="true">
+                            <span class="icon-slot" data-icon="herald" data-icon-size="14"></span>
+                            <span>Wind Herald</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -2038,6 +2375,25 @@
 
           <!-- Single-Source Guide Content (Also Cloned Into In-Game ? Help Modal) -->
           <div id="codex-guide-content" class="guide-content-wrap htp-scroll-body">
+            <!-- 0. Interactive Guided Tutorial CTA -->
+            <div class="htp-tutorial-cta-card">
+              <div class="htp-tutorial-cta-copy">
+                <div class="htp-hero-badge">HANDS-ON LESSON · 2 MIN</div>
+                <h3>Try the Interactive Guided Tutorial</h3>
+                <p>
+                  Learn by building directly on a live 3D island! We highlight exact glowing squares so you practice Overcharging Spires with Crimson Keeps, folding an S-curve switchback, reclaiming walls for free, and running your maze.
+                </p>
+              </div>
+              <button
+                type="button"
+                id="btn-start-tutorial"
+                class="dock-ready-btn btn-launch-tutorial"
+              >
+                <span class="icon-slot" data-icon="play" data-icon-size="15"></span>
+                <span>Play Guided Tutorial</span>
+              </button>
+            </div>
+
             <!-- 1. The Big Idea -->
             <div class="htp-hero-callout">
               <div class="htp-hero-badge">THE BIG IDEA</div>
@@ -2501,7 +2857,7 @@
             </button>
             <div class="subscreen-title-group">
               <h2>All-Time Leaderboard</h2>
-              <p>Best round survival records and career point leaders.</p>
+              <p>Best human survival records by map and career leaders (bots excluded).</p>
             </div>
           </header>
 

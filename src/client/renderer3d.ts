@@ -1646,6 +1646,15 @@ export class Arena3DRenderer {
   private lastHoverValid = false;
   private cachedHoverPreview: CachedHoverPreview | null = null;
 
+  // Guided Tutorial 3D Target Beacons
+  private tutorialBeaconGroup!: THREE.Group;
+  private tutorialPlaceTargets: GridPoint[] = [];
+  private tutorialRemoveTarget: GridPoint | null = null;
+  private tutorialPlacePadMat!: THREE.MeshBasicMaterial;
+  private tutorialPlaceRimMat!: THREE.MeshBasicMaterial;
+  private tutorialRemoveMat!: THREE.MeshBasicMaterial;
+  private tutorialBeaconBobs: THREE.Object3D[] = [];
+
   private ghostGroup: THREE.Group;
   private ghostTurretGroup: THREE.Group;
   private ghostConnGroup: THREE.Group;
@@ -2681,6 +2690,34 @@ export class Arena3DRenderer {
 
     this.scene.add(this.ghostGroup);
 
+    // 3. Guided Tutorial Pulsing Target Beacons
+    this.tutorialBeaconGroup = new THREE.Group();
+    this.tutorialBeaconGroup.visible = false;
+    this.tutorialPlacePadMat = new THREE.MeshBasicMaterial({
+      color: '#fbbf24',
+      transparent: true,
+      opacity: 0.34,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    this.tutorialPlaceRimMat = new THREE.MeshBasicMaterial({
+      color: '#fef08a',
+      transparent: true,
+      opacity: 0.92,
+      depthWrite: false,
+    });
+    this.tutorialRemoveMat = new THREE.MeshBasicMaterial({
+      color: '#fb7185',
+      transparent: true,
+      opacity: 0.9,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    this.protectedMats.add(this.tutorialPlacePadMat);
+    this.protectedMats.add(this.tutorialPlaceRimMat);
+    this.protectedMats.add(this.tutorialRemoveMat);
+    this.scene.add(this.tutorialBeaconGroup);
+
     if (typeof window.matchMedia === 'function') {
       const rmQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
       this.prefersReducedMotion = rmQuery.matches;
@@ -3119,6 +3156,128 @@ export class Arena3DRenderer {
     this.camGoalTarget.x -= rightDelta * cosA + forwardDelta * sinA;
     this.camGoalTarget.z -= -rightDelta * sinA + forwardDelta * cosA;
     this.clampCameraTarget();
+  }
+
+  /**
+   * Renders pulsing 3D gold target pads + hovering chevrons for Guided Tutorial
+   * placement targets, and a coral-red highlight frame over any guided removal target.
+   */
+  public setTutorialTargets(
+    placeTargets: ReadonlyArray<GridPoint>,
+    removeTarget: GridPoint | null = null
+  ): void {
+    this.tutorialPlaceTargets = placeTargets.map((p) => ({ x: p.x, y: p.y }));
+    this.tutorialRemoveTarget = removeTarget
+      ? { x: removeTarget.x, y: removeTarget.y }
+      : null;
+
+    this.disposeSubtree(this.tutorialBeaconGroup);
+    this.tutorialBeaconGroup.clear();
+    this.tutorialBeaconBobs = [];
+
+    const hasAny =
+      this.tutorialPlaceTargets.length > 0 || this.tutorialRemoveTarget !== null;
+    this.tutorialBeaconGroup.visible = hasAny;
+    if (!hasAny) return;
+
+    const localIsland = this.localPlayerId
+      ? this.islands.get(this.localPlayerId)
+      : undefined;
+    const ox = localIsland ? localIsland.offsetX : 0;
+    const oz = localIsland ? localIsland.offsetZ : 0;
+
+    const padGeo = new THREE.PlaneGeometry(1.88, 1.88);
+    padGeo.rotateX(-Math.PI / 2);
+    const barHGeo = new THREE.BoxGeometry(1.94, 0.08, 0.14);
+    const barVGeo = new THREE.BoxGeometry(0.14, 0.08, 1.94);
+    const coneGeo = new THREE.ConeGeometry(0.28, 0.48, 4);
+    coneGeo.rotateX(Math.PI);
+
+    for (const pt of this.tutorialPlaceTargets) {
+      const marker = new THREE.Group();
+      marker.position.set(ox + pt.x + 1.0, 0, oz + pt.y + 1.0);
+
+      const pad = new THREE.Mesh(padGeo.clone(), this.tutorialPlacePadMat);
+      pad.position.y = 0.042;
+      pad.renderOrder = 11;
+      marker.add(pad);
+
+      for (const zOff of [-0.9, 0.9]) {
+        const edge = new THREE.Mesh(barHGeo.clone(), this.tutorialPlaceRimMat);
+        edge.position.set(0, 0.06, zOff);
+        edge.renderOrder = 12;
+        marker.add(edge);
+      }
+      for (const xOff of [-0.9, 0.9]) {
+        const edge = new THREE.Mesh(barVGeo.clone(), this.tutorialPlaceRimMat);
+        edge.position.set(xOff, 0.06, 0);
+        edge.renderOrder = 12;
+        marker.add(edge);
+      }
+
+      const pointer = new THREE.Mesh(coneGeo.clone(), this.tutorialPlaceRimMat);
+      pointer.position.set(0, 1.05, 0);
+      pointer.userData.baseY = 1.05;
+      pointer.renderOrder = 13;
+      marker.add(pointer);
+      this.tutorialBeaconBobs.push(pointer);
+
+      this.tutorialBeaconGroup.add(marker);
+    }
+
+    if (this.tutorialRemoveTarget) {
+      const rt = this.tutorialRemoveTarget;
+      const rmGroup = new THREE.Group();
+      rmGroup.position.set(ox + rt.x + 1.0, 0, oz + rt.y + 1.0);
+
+      for (const yLvl of [0.08, 1.24]) {
+        for (const zOff of [-0.96, 0.96]) {
+          const edge = new THREE.Mesh(barHGeo.clone(), this.tutorialRemoveMat);
+          edge.position.set(0, yLvl, zOff);
+          edge.renderOrder = 13;
+          rmGroup.add(edge);
+        }
+        for (const xOff of [-0.96, 0.96]) {
+          const edge = new THREE.Mesh(barVGeo.clone(), this.tutorialRemoveMat);
+          edge.position.set(xOff, yLvl, 0);
+          edge.renderOrder = 13;
+          rmGroup.add(edge);
+        }
+      }
+
+      const pointer = new THREE.Mesh(coneGeo.clone(), this.tutorialRemoveMat);
+      pointer.position.set(0, 1.85, 0);
+      pointer.userData.baseY = 1.85;
+      pointer.renderOrder = 14;
+      rmGroup.add(pointer);
+      this.tutorialBeaconBobs.push(pointer);
+
+      this.tutorialBeaconGroup.add(rmGroup);
+    }
+
+    padGeo.dispose();
+    barHGeo.dispose();
+    barVGeo.dispose();
+    coneGeo.dispose();
+  }
+
+  /** Projects a 2x2 grid coordinate on the local island to client viewport pixels. */
+  public projectCellToScreen(
+    x: number,
+    y: number
+  ): { x: number; y: number } | null {
+    const localIsland = this.localPlayerId
+      ? this.islands.get(this.localPlayerId)
+      : undefined;
+    const ox = localIsland ? localIsland.offsetX : 0;
+    const oz = localIsland ? localIsland.offsetZ : 0;
+    this._tmpProj.set(ox + x + 1.0, 0.1, oz + y + 1.0);
+    this._tmpProj.project(this.camera);
+    if (this._tmpProj.z > 1) return null;
+    return {
+      x: this.viewportLeft + (this._tmpProj.x * 0.5 + 0.5) * this.viewportW,
+      y: this.viewportTop + (-this._tmpProj.y * 0.5 + 0.5) * this.viewportH,
+    };
   }
 
   public focusOnPlayerIsland(playerId: string, snapImmediate = false): void {
@@ -4820,14 +4979,46 @@ export class Arena3DRenderer {
       }
     }
 
-    // 4. Smart 2x2 Obstacle-Aware Flush Snap (raw unclamped coords)
-    const smart = resolveSmart2x2Placement(
-      round,
-      localPlayer.towers,
-      planeHit.rawRelX,
-      planeHit.rawRelZ,
-      { mode: 'touch', availableGold: localPlayer.gold }
-    );
+    // 4. Smart 2x2 Obstacle-Aware Flush Snap (with Guided Tutorial target magnetism)
+    let touchTutorialTarget: GridPoint | null = null;
+    if (this.tutorialPlaceTargets.length > 0) {
+      let bestDist = 2.0;
+      for (const pt of this.tutorialPlaceTargets) {
+        const dist = Math.hypot(
+          planeHit.rawRelX - (pt.x + 1),
+          planeHit.rawRelZ - (pt.y + 1)
+        );
+        if (dist < bestDist) {
+          bestDist = dist;
+          touchTutorialTarget = pt;
+        }
+      }
+    }
+    const smart = touchTutorialTarget
+      ? (() => {
+          const val = validateTowerPlacement(
+            round,
+            localPlayer.towers,
+            touchTutorialTarget.x,
+            touchTutorialTarget.y
+          );
+          return {
+            x: touchTutorialTarget.x,
+            y: touchTutorialTarget.y,
+            snapped: true,
+            valid: val.valid,
+            reason: val.reason,
+            reasonCode: val.reasonCode,
+            pathResult: val.pathResult,
+          };
+        })()
+      : resolveSmart2x2Placement(
+          round,
+          localPlayer.towers,
+          planeHit.rawRelX,
+          planeHit.rawRelZ,
+          { mode: 'touch', availableGold: localPlayer.gold }
+        );
 
     // Also confirm if smart-snap resolved back onto the same valid pendingTouchCell >= 180ms after aim
     if (
@@ -8463,15 +8654,24 @@ export class Arena3DRenderer {
     }
 
     // 2. Check if cursor is directly over a Spire, Keep, Gate, or Runner -> Inspect instead of flashing red 'Occupied'!
-    const inspected = this.isShiftPainting
-      ? null
-      : this.detectInspectedWorldFeature(
-          focusedIsland,
-          focusedPlayer,
-          round,
-          planeHit.rawRelX,
-          planeHit.rawRelZ
-        );
+    // Skip inspect if cursor is directly inside a glowing Guided Tutorial target square so placement never stalls.
+    const overTutorialPlaceTarget =
+      this._activeTool === 'BLOCK' &&
+      this.tutorialPlaceTargets.some(
+        (pt) =>
+          Math.abs(planeHit.rawRelX - (pt.x + 1)) <= 1.15 &&
+          Math.abs(planeHit.rawRelZ - (pt.y + 1)) <= 1.15
+      );
+    const inspected =
+      this.isShiftPainting || overTutorialPlaceTarget
+        ? null
+        : this.detectInspectedWorldFeature(
+            focusedIsland,
+            focusedPlayer,
+            round,
+            planeHit.rawRelX,
+            planeHit.rawRelZ
+          );
     this.lastHoverInspected = inspected;
     if (inspected) {
       this.cachedHoverPreview = null;
@@ -8545,7 +8745,39 @@ export class Arena3DRenderer {
     const qZ = Math.round(planeHit.rawRelZ * 10);
     const snapKey = `${this.lastLocalEvalSig}|${focusedPlayer.gold}|${this.isShiftPainting ? 0 : 1}|${qX},${qZ}`;
     let smart: ReturnType<typeof resolveSmart2x2Placement>;
-    if (this.smartSnapCache && this.smartSnapCache.key === snapKey) {
+    // Magnetic snap onto Guided Tutorial target squares so beginners never fight sub-cell placement
+    let snappedTutorialTarget: GridPoint | null = null;
+    if (this.tutorialPlaceTargets.length > 0) {
+      let bestDist = 1.65;
+      for (const pt of this.tutorialPlaceTargets) {
+        const dist = Math.hypot(
+          planeHit.rawRelX - (pt.x + 1),
+          planeHit.rawRelZ - (pt.y + 1)
+        );
+        if (dist < bestDist) {
+          bestDist = dist;
+          snappedTutorialTarget = pt;
+        }
+      }
+    }
+
+    if (snappedTutorialTarget) {
+      const val = validateTowerPlacement(
+        round,
+        focusedPlayer.towers,
+        snappedTutorialTarget.x,
+        snappedTutorialTarget.y
+      );
+      smart = {
+        x: snappedTutorialTarget.x,
+        y: snappedTutorialTarget.y,
+        snapped: true,
+        valid: val.valid,
+        reason: val.reason,
+        reasonCode: val.reasonCode,
+        pathResult: val.pathResult,
+      };
+    } else if (this.smartSnapCache && this.smartSnapCache.key === snapKey) {
       smart = this.smartSnapCache.result;
     } else {
       smart = resolveSmart2x2Placement(
@@ -9899,6 +10131,22 @@ export class Arena3DRenderer {
         island.runner.pelvis.position.y =
           0.45 + Math.sin(uTimeVal * 2.6) * 0.035 * motionScale;
         island.runner.statusRing.visible = false;
+      }
+
+      if (
+        this.tutorialBeaconGroup.visible &&
+        island.playerId === this.localPlayerId
+      ) {
+        const pulse = 0.5 + 0.5 * Math.sin(uTimeVal * 4.2);
+        this.tutorialPlacePadMat.opacity = 0.24 + pulse * 0.22;
+        this.tutorialPlaceRimMat.opacity = 0.72 + pulse * 0.26;
+        this.tutorialRemoveMat.opacity = 0.62 + pulse * 0.34;
+        for (let b = 0; b < this.tutorialBeaconBobs.length; b++) {
+          const obj = this.tutorialBeaconBobs[b];
+          const baseY = (obj.userData.baseY as number) || 0.45;
+          obj.position.y =
+            baseY + Math.sin(uTimeVal * 3.8 + b * 0.9) * 0.14 * motionScale;
+        }
       }
 
       // Island Header Badge: shown ONLY in Overview mode (Peek Mode uses clean top-center #peek-identity-pill!)

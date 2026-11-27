@@ -7,21 +7,38 @@ import {
   DEFAULT_MATCH_ROUNDS,
   generateRandomRoundLayout,
   getMapById,
+  getMapsMatchingRunners,
+  isInfiniteBuildTime,
+  isInfiniteRounds,
+  normalizeAllowedRunners,
   ROUNDS,
 } from '../shared/rounds.js';
 import { MazeRunnerSimulator, SIM_DT } from '../shared/simulation.js';
 import {
+  TUTORIAL_ROUND_CONFIG,
+  TUTORIAL_STEPS,
+  TutorialStepDef,
+} from '../shared/tutorial.js';
+import {
   ActiveBuildTool,
+  ALL_RUNNER_ARCHETYPES,
   ClientToServerMessage,
   DailyMazePayload,
   getEffectiveSpireStats,
   GridPoint,
+  INFINITE_BUILD_TIME,
+  INFINITE_ROUNDS,
   LeaderboardPayload,
   LobbyRoomSummary,
+  MAX_CUSTOM_BUILD_SECONDS,
+  MAX_CUSTOM_ROUNDS,
+  MIN_CUSTOM_BUILD_SECONDS,
+  MIN_CUSTOM_ROUNDS,
   PlayerState,
   RoomSettings,
   RoomState,
   RUNNER_ARCHETYPES,
+  RunnerArchetype,
   RunnerSimState,
   ServerToClientMessage,
   SimEvent,
@@ -207,6 +224,79 @@ function formatBotSkillLabel(
   return 'Normal';
 }
 
+function formatRoundsCompact(totalRounds?: number): string {
+  return isInfiniteRounds(totalRounds)
+    ? '∞'
+    : String(totalRounds || DEFAULT_MATCH_ROUNDS);
+}
+
+function formatRoundsSummary(totalRounds?: number): string {
+  return isInfiniteRounds(totalRounds)
+    ? 'Endless (∞)'
+    : String(totalRounds || DEFAULT_MATCH_ROUNDS);
+}
+
+function formatBuildTimerLabel(sec?: number): string {
+  if (isInfiniteBuildTime(sec)) return 'Unlimited (∞)';
+  if (sec && sec > 0) return `${sec}s`;
+  return 'Default (90–125s)';
+}
+
+function formatRunnerFilterSummary(allowed?: RunnerArchetype[]): string {
+  const list = normalizeAllowedRunners(allowed);
+  if (list.length >= ALL_RUNNER_ARCHETYPES.length) {
+    return `All ${ALL_RUNNER_ARCHETYPES.length} Runners`;
+  }
+  if (list.length === 1) {
+    return RUNNER_ARCHETYPES[list[0]].name;
+  }
+  return `${list.length}/${ALL_RUNNER_ARCHETYPES.length} Runners`;
+}
+
+function formatRunnerFilterRuleValue(allowed?: RunnerArchetype[]): string {
+  const list = normalizeAllowedRunners(allowed);
+  if (list.length >= ALL_RUNNER_ARCHETYPES.length) {
+    return `All (${ALL_RUNNER_ARCHETYPES.length})`;
+  }
+  return list
+    .map((k) =>
+      RUNNER_ARCHETYPES[k].name.replace(/^(Citadel|Royal|Iron|Wind)\s+/i, '')
+    )
+    .join(', ');
+}
+
+interface RunnerFilterContext {
+  toggleBtnId: string;
+  bodyId: string;
+  summaryId: string;
+  groupId: string;
+  poolCountId: string;
+}
+
+const RUNNER_FILTER_CONTEXTS: Record<'solo' | 'cfg' | 'lobby', RunnerFilterContext> = {
+  solo: {
+    toggleBtnId: 'btn-solo-additional-options',
+    bodyId: 'solo-additional-options-body',
+    summaryId: 'solo-additional-summary',
+    groupId: 'solo-runners-group',
+    poolCountId: 'solo-runners-pool-count',
+  },
+  cfg: {
+    toggleBtnId: 'btn-cfg-additional-options',
+    bodyId: 'cfg-additional-options-body',
+    summaryId: 'cfg-additional-summary',
+    groupId: 'cfg-runners-group',
+    poolCountId: 'cfg-runners-pool-count',
+  },
+  lobby: {
+    toggleBtnId: 'btn-lobby-additional-options',
+    bodyId: 'lobby-additional-options-body',
+    summaryId: 'lobby-additional-summary',
+    groupId: 'lobby-cfg-runners-group',
+    poolCountId: 'lobby-runners-pool-count',
+  },
+};
+
 function formatDailyRankLabel(
   rank: number,
   total: number,
@@ -300,6 +390,12 @@ class MazingContestClient {
   private nudgeHoldDelayTimer: number | null = null;
   private nudgeHoldInterval: number | null = null;
 
+  private tutorialActive = false;
+  private tutorialStepIndex = 0;
+  private tutorialWallSeq = 0;
+  private tutorialRunFinishTimer: number | null = null;
+  private tutorialRunCompletionShown = false;
+
   constructor() {
     this.hydrateSingleSourceGuide();
     hydrateStaticIcons();
@@ -363,6 +459,8 @@ class MazingContestClient {
     const target = document.getElementById('help-guide-content');
     if (source && target) {
       target.innerHTML = source.innerHTML;
+      // Avoid duplicate DOM IDs inside the in-game Quick Guide modal clone
+      target.querySelector('#btn-start-tutorial')?.removeAttribute('id');
     }
   }
 
@@ -380,6 +478,9 @@ class MazingContestClient {
           document.body.dataset.input = nextMode;
           if (nextMode === 'mouse' && this.renderer3d?.activeTool === 'PAN') {
             this.selectTool('BLOCK');
+          }
+          if (this.tutorialActive) {
+            this.syncTutorialStepUI(false);
           }
           this.scheduleHudSafeInsetsSync();
         }
@@ -544,9 +645,17 @@ class MazingContestClient {
     );
   }
 
+  private isTutorialCompleteOpen(): boolean {
+    const modal = document.getElementById('tutorial-complete-modal');
+    return Boolean(modal && !modal.classList.contains('hidden'));
+  }
+
   private syncModalOpenState() {
     const blocking =
-      this.isHubOpen() || this.isHelpOpen() || this.isResultsBlocking();
+      this.isHubOpen() ||
+      this.isHelpOpen() ||
+      this.isResultsBlocking() ||
+      this.isTutorialCompleteOpen();
     this.renderer3d.modalOpen = blocking;
     if (blocking) {
       this.hideCursorPill();
@@ -767,6 +876,7 @@ class MazingContestClient {
       }
 
       if (msg.type === 'WELCOME') {
+        this.cleanupTutorialVisuals();
         this.wsSuperseded = false;
         this.updateWsStatusPill(null);
         this.localPlayerId = msg.playerId;
@@ -797,6 +907,7 @@ class MazingContestClient {
         }
         this.syncConfigFormFromSettings(msg.state.settings);
       } else if (msg.type === 'ROOM_STATE') {
+        if (this.tutorialActive) return;
         this.roomCode = msg.state.roomCode;
         this.syncUrlRoomCode(
           msg.state.mode === 'ONLINE' ? this.roomCode : null
@@ -805,6 +916,7 @@ class MazingContestClient {
       } else if (msg.type === 'LEFT_ROOM') {
         this.handleLeftRoomCleanup();
       } else if (msg.type === 'TIMER_TICK') {
+        if (this.tutorialActive) return;
         if (this.roomState) {
           this.roomState.phaseTimeRemaining = msg.phaseTimeRemaining;
           if (typeof msg.buildTimerPaused === 'boolean') {
@@ -1492,6 +1604,39 @@ class MazingContestClient {
 
     this.renderer3d.updateRunners(stateMap, allEvents);
     this.updateLiveRunScoreboard();
+
+    // Detect Guided Tutorial live run finish and present completion summary
+    if (
+      this.tutorialActive &&
+      this.roomState.phase === 'RUN' &&
+      !this.tutorialRunCompletionShown
+    ) {
+      const localSim = this.localPlayerId
+        ? this.simulators.get(this.localPlayerId)
+        : undefined;
+      if (localSim?.state.finished) {
+        this.tutorialRunCompletionShown = true;
+        const finishTime = localSim.state.finishTimeSeconds;
+        const claps = localSim.state.clapsTaken;
+        const evalRes = this.renderer3d.getLocalMazeEval();
+        const overcharged = evalRes?.overchargedSpires ?? 2;
+        const parSecs = this.roomState.roundConfig.parTimeSeconds;
+        const beatPar = finishTime >= parSecs;
+        if (this.tutorialRunFinishTimer !== null) {
+          window.clearTimeout(this.tutorialRunFinishTimer);
+        }
+        this.tutorialRunFinishTimer = window.setTimeout(() => {
+          this.tutorialRunFinishTimer = null;
+          this.showTutorialCompleteModal(
+            finishTime,
+            parSecs,
+            beatPar,
+            claps,
+            overcharged
+          );
+        }, 650);
+      }
+    }
   }
 
   // ==========================================================================
@@ -1500,6 +1645,10 @@ class MazingContestClient {
 
   private handleOptimisticPlaceTower(x: number, y: number) {
     if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    if (this.tutorialActive) {
+      this.handleTutorialPlaceTower(x, y);
+      return;
+    }
     if (!this.ensureConnectedForAction()) return;
     const me = this.getLocalPlayer();
     if (!me) return;
@@ -1580,6 +1729,10 @@ class MazingContestClient {
     y?: number
   ) {
     if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    if (this.tutorialActive) {
+      this.handleTutorialSellTower(towerId, x, y);
+      return;
+    }
     if (!this.ensureConnectedForAction()) return;
     const me = this.getLocalPlayer();
     if (!me) return;
@@ -1643,6 +1796,7 @@ class MazingContestClient {
   }
 
   private performUndo() {
+    if (this.tutorialActive) return;
     if (
       !this.roomState ||
       this.roomState.phase !== 'BUILD' ||
@@ -1800,6 +1954,7 @@ class MazingContestClient {
   }
 
   private performRedo() {
+    if (this.tutorialActive) return;
     if (
       !this.roomState ||
       this.roomState.phase !== 'BUILD' ||
@@ -1994,14 +2149,21 @@ class MazingContestClient {
       'btn-clear-maze'
     ) as HTMLButtonElement | null;
     if (clearBtn) {
-      clearBtn.disabled = !me || me.towers.length === 0;
+      clearBtn.disabled = this.tutorialActive || !me || me.towers.length === 0;
     }
 
     const rerollBtn = document.getElementById(
       'btn-reroll-map'
     ) as HTMLButtonElement | null;
     if (rerollBtn) {
-      rerollBtn.disabled = !this.canControlRoomRules();
+      rerollBtn.disabled = this.tutorialActive || !this.canControlRoomRules();
+    }
+
+    const sampleBtn = document.getElementById(
+      'btn-demo-layout'
+    ) as HTMLButtonElement | null;
+    if (sampleBtn) {
+      sampleBtn.disabled = this.tutorialActive;
     }
   }
 
@@ -2140,7 +2302,7 @@ class MazingContestClient {
       .getElementById('btn-touch-confirm')
       ?.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (!this.ensureConnectedForAction()) return;
+        if (!this.tutorialActive && !this.ensureConnectedForAction()) return;
         const confirmBtn = e.currentTarget as HTMLButtonElement | null;
         if (
           this.renderer3d.activeTool === 'SELL' &&
@@ -2801,7 +2963,10 @@ class MazingContestClient {
         // ignore
       }
       this.syncAllNameInputs();
-      if (this.roomState) {
+      if (this.tutorialActive) {
+        const me = this.getLocalPlayer();
+        if (me) me.name = clean;
+      } else if (this.roomState) {
         this.send({ type: 'SET_NAME', playerName: clean });
       }
       this.send({
@@ -2867,6 +3032,11 @@ class MazingContestClient {
   }
 
   private handleLeftRoomCleanup() {
+    if (this.tutorialActive) {
+      this.roomCode = null;
+      this.syncUrlRoomCode(null);
+      return;
+    }
     this.roomState = null;
     this.localPlayerId = null;
     this.roomCode = null;
@@ -2893,6 +3063,512 @@ class MazingContestClient {
       dailyClientId: this.dailyClientId,
       playerName: this.playerName,
     });
+  }
+
+  // ==========================================================================
+  // GUIDED INTERACTIVE TUTORIAL CONTROLLER (LOCAL CLIENT-ONLY MODE)
+  // ==========================================================================
+
+  private getCurrentTutorialStep(): TutorialStepDef {
+    const idx = Math.max(
+      0,
+      Math.min(TUTORIAL_STEPS.length - 1, this.tutorialStepIndex)
+    );
+    return TUTORIAL_STEPS[idx];
+  }
+
+  private getRemainingTutorialPlaceTargets(
+    step: TutorialStepDef,
+    towers: ReadonlyArray<{ x: number; y: number }>
+  ): GridPoint[] {
+    if (step.kind !== 'PLACE') return [];
+    return step.targets.filter(
+      (pt) => !towers.some((t) => t.x === pt.x && t.y === pt.y)
+    );
+  }
+
+  private cleanupTutorialVisuals() {
+    if (this.tutorialRunFinishTimer !== null) {
+      window.clearTimeout(this.tutorialRunFinishTimer);
+      this.tutorialRunFinishTimer = null;
+    }
+    this.tutorialActive = false;
+    this.tutorialRunCompletionShown = false;
+    this.renderer3d.setTutorialTargets([], null);
+    document.getElementById('tutorial-coach-panel')?.classList.add('hidden');
+    document.getElementById('tutorial-complete-modal')?.classList.add('hidden');
+  }
+
+  private exitGuidedTutorial(targetScreen: MenuScreen = 'home') {
+    this.cleanupTutorialVisuals();
+    this.roomState = null;
+    this.localPlayerId = null;
+    this.roomCode = null;
+    this.runPhaseActive = false;
+    this.simulators.clear();
+    this.undoStack = [];
+    this.redoStack = [];
+    this.pendingMutations = [];
+    this.hidePlanningBanner();
+    this.dismissRoundBrief();
+    this.dismissAllTransientOverlays();
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
+    this.hideCursorPill();
+    document.getElementById('results-modal')?.classList.add('hidden');
+    document.getElementById('hud-bottom-dock')?.classList.add('dock-hidden');
+    document.getElementById('hud-run-dock')?.classList.add('hidden');
+    document.getElementById('spectator-bar')?.classList.add('hidden');
+    document.body.dataset.phase = 'LOBBY';
+    document.body.dataset.mode = 'ONLINE';
+    this.renderMenuBackdropIsland();
+    this.openMenuScreen(targetScreen);
+    this.syncModalOpenState();
+    this.scheduleHudSafeInsetsSync();
+  }
+
+  private startGuidedTutorial() {
+    if (this.roomState && !this.tutorialActive) {
+      this.send({ type: 'LEAVE_ROOM' });
+    }
+    this.cleanupTutorialVisuals();
+
+    this.tutorialActive = true;
+    this.tutorialStepIndex = 0;
+    this.tutorialWallSeq = 0;
+    this.tutorialRunCompletionShown = false;
+    this.roomCode = null;
+    this.syncUrlRoomCode(null);
+    this.runPhaseActive = false;
+    this.simulators.clear();
+    this.undoStack = [];
+    this.redoStack = [];
+    this.pendingMutations = [];
+
+    const roundConfig = {
+      ...TUTORIAL_ROUND_CONFIG,
+      spawn: { ...TUTORIAL_ROUND_CONFIG.spawn },
+      exit: { ...TUTORIAL_ROUND_CONFIG.exit },
+      checkpoints: TUTORIAL_ROUND_CONFIG.checkpoints.map((c) => ({ ...c })),
+      obstacles: TUTORIAL_ROUND_CONFIG.obstacles.map((o) => ({ ...o })),
+      preplacedSpires: TUTORIAL_ROUND_CONFIG.preplacedSpires.map((s) => ({
+        ...s,
+      })),
+      frostMires: [],
+      hasteRifts: [],
+    };
+
+    const localPlayer: PlayerState = {
+      id: 'tutorial_local',
+      name: this.playerName,
+      color: '#38bdf8',
+      isBot: false,
+      isHost: true,
+      ready: false,
+      gold: roundConfig.startingGold,
+      towers: [],
+      pathDistance: 24,
+      totalScore: 0,
+      lastRoundTime: null,
+      lastRoundPoints: 0,
+      bestMazeTime: 0,
+      roundHistory: [],
+    };
+
+    const tutorialState: RoomState = {
+      roomCode: 'TUTORIAL',
+      mode: 'TUTORIAL',
+      phase: 'BUILD',
+      settings: {
+        roomName: 'Guided Tutorial',
+        isPublic: false,
+        totalRounds: 1,
+        buildTimeSeconds: INFINITE_BUILD_TIME,
+        goldMultiplier: 1,
+        botCount: 0,
+        botDifficulty: 'ARCHITECT',
+        fogOfWar: false,
+        allowedRunners: ['SCOUT'],
+      },
+      currentRoundIndex: 0,
+      roundsCompleted: 0,
+      roundConfig,
+      phaseTimeRemaining: 0,
+      simSpeedMultiplier: 1,
+      players: [localPlayer],
+      chat: [],
+    };
+
+    this.localPlayerId = localPlayer.id;
+    this.roomState = tutorialState;
+    document.body.dataset.phase = 'BUILD';
+    document.body.dataset.mode = 'TUTORIAL';
+
+    document.getElementById('help-modal')?.classList.add('hidden');
+    document.getElementById('results-modal')?.classList.add('hidden');
+    document.getElementById('tutorial-complete-modal')?.classList.add('hidden');
+    document.getElementById('home-hub-modal')?.classList.add('hidden');
+    document.body.dataset.inMenu = 'false';
+
+    this.hidePlanningBanner();
+    this.dismissRoundBrief();
+    this.dismissAllTransientOverlays();
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
+    this.hideCursorPill();
+
+    document.getElementById('hud-bottom-dock')?.classList.remove('dock-hidden');
+    document.getElementById('hud-run-dock')?.classList.add('hidden');
+    document.getElementById('spectator-bar')?.classList.add('hidden');
+
+    this.selectTool('BLOCK');
+    this.renderer3d.syncRoomState(tutorialState, localPlayer.id);
+    this.renderer3d.resetToMyIsland();
+
+    this.syncTutorialStepUI(false);
+    this.syncModalOpenState();
+    this.syncSpectatorStateDOM();
+    this.updateUndoAndToolAvailability();
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+    this.scheduleHudSafeInsetsSync();
+  }
+
+  private syncTutorialStepUI(checkAdvance: boolean) {
+    if (!this.tutorialActive || !this.roomState) return;
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    if (checkAdvance) {
+      while (this.tutorialStepIndex < TUTORIAL_STEPS.length - 1) {
+        const cur = TUTORIAL_STEPS[this.tutorialStepIndex];
+        if (cur.kind === 'PLACE') {
+          const rem = this.getRemainingTutorialPlaceTargets(cur, me.towers);
+          if (rem.length === 0) {
+            this.tutorialStepIndex++;
+            soundEngine.playCheckpoint();
+            soundEngine.haptic('ready');
+            const nextStep = TUTORIAL_STEPS[this.tutorialStepIndex];
+            if (nextStep.kind === 'REMOVE') {
+              this.showToast(
+                `Step ${cur.stepNumber} complete! Now reclaim the pulsing red wall.`,
+                true
+              );
+            } else {
+              this.showToast(
+                `Step ${cur.stepNumber} complete! Next: ${nextStep.title}`,
+                true
+              );
+            }
+            continue;
+          }
+          break;
+        } else if (cur.kind === 'REMOVE') {
+          const rt = cur.removeTarget;
+          const stillPresent = rt
+            ? me.towers.some((t) => t.x === rt.x && t.y === rt.y)
+            : false;
+          if (!stillPresent) {
+            this.tutorialStepIndex++;
+            this.selectTool('BLOCK');
+            soundEngine.playCheckpoint();
+            soundEngine.haptic('ready');
+            this.showToast(
+              'Wall reclaimed (+1 free refund)! Press Start to run your maze!',
+              true
+            );
+            continue;
+          }
+          break;
+        }
+        break;
+      }
+    }
+
+    const step = this.getCurrentTutorialStep();
+    const remainingPlace = this.getRemainingTutorialPlaceTargets(
+      step,
+      me.towers
+    );
+    const activeRemove =
+      step.kind === 'REMOVE' &&
+      step.removeTarget &&
+      me.towers.some(
+        (t) => t.x === step.removeTarget!.x && t.y === step.removeTarget!.y
+      )
+        ? step.removeTarget
+        : null;
+
+    if (this.roomState.phase === 'BUILD') {
+      this.renderer3d.setTutorialTargets(remainingPlace, activeRemove);
+    } else {
+      this.renderer3d.setTutorialTargets([], null);
+    }
+
+    const panel = document.getElementById('tutorial-coach-panel');
+    if (!panel) return;
+    panel.classList.toggle('hidden', this.roomState.phase !== 'BUILD');
+    panel.dataset.tutorialStep = String(step.stepNumber);
+    panel.dataset.tutorialKind = step.kind;
+
+    const badgeEl = document.getElementById('tutorial-step-badge');
+    if (badgeEl) {
+      badgeEl.textContent = `STEP ${step.stepNumber} OF ${TUTORIAL_STEPS.length}`;
+    }
+
+    const dotsEl = document.getElementById('tutorial-step-dots');
+    if (dotsEl) {
+      dotsEl.innerHTML = TUTORIAL_STEPS.map((_, idx) => {
+        const cls =
+          idx < this.tutorialStepIndex
+            ? 'tutorial-step-dot done'
+            : idx === this.tutorialStepIndex
+            ? 'tutorial-step-dot current'
+            : 'tutorial-step-dot';
+        return `<span class="${cls}"></span>`;
+      }).join('');
+    }
+
+    const titleEl = document.getElementById('tutorial-step-title');
+    if (titleEl) titleEl.textContent = step.title;
+
+    const copyEl = document.getElementById('tutorial-step-copy');
+    if (copyEl) {
+      const useTouch =
+        document.body.dataset.input === 'touch' && Boolean(step.touchInstruction);
+      copyEl.textContent = useTouch ? step.touchInstruction! : step.instruction;
+    }
+
+    const progressEl = document.getElementById('tutorial-step-progress');
+    const tipEl = document.getElementById('tutorial-step-tip');
+    if (step.kind === 'PLACE') {
+      const placed = step.targets.length - remainingPlace.length;
+      if (progressEl) {
+        progressEl.textContent = `${placed} / ${step.targets.length} placed`;
+      }
+      if (tipEl) {
+        tipEl.textContent = 'Glowing gold squares snap your wall automatically';
+      }
+    } else if (step.kind === 'REMOVE') {
+      if (progressEl) {
+        progressEl.textContent = activeRemove ? '0 / 1 removed' : '1 / 1 removed';
+      }
+      if (tipEl) {
+        tipEl.textContent =
+          document.body.dataset.input === 'touch'
+            ? 'Tap the pulsing red wall, then tap Remove'
+            : 'Right-click the red wall, or click Remove (X) then click it';
+      }
+    } else {
+      if (progressEl) {
+        progressEl.textContent = 'Ready to launch!';
+      }
+      if (tipEl) {
+        tipEl.textContent =
+          'Optional: add bonus walls, then press Start (Space)';
+      }
+    }
+  }
+
+  private handleTutorialPlaceTower(x: number, y: number) {
+    if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    const step = this.getCurrentTutorialStep();
+    if (step.kind === 'PLACE') {
+      const remaining = this.getRemainingTutorialPlaceTargets(step, me.towers);
+      const isAllowedTarget = remaining.some((pt) => pt.x === x && pt.y === y);
+      if (!isAllowedTarget) {
+        soundEngine.playError();
+        soundEngine.haptic('error');
+        this.showToast('Place your wall on one of the glowing gold squares!');
+        return;
+      }
+    } else if (step.kind === 'REMOVE') {
+      soundEngine.playError();
+      soundEngine.haptic('error');
+      this.showToast('Remove the pulsing red wall first (Right-Click or X).');
+      return;
+    } else if (!step.allowFreeBuild) {
+      return;
+    }
+
+    const wallCost = TOWER_SPECS.BLOCK.goldCost;
+    if (me.gold < wallCost) {
+      soundEngine.playError();
+      soundEngine.haptic('error');
+      this.showToast('No walls left. Press Start to launch your runner!');
+      return;
+    }
+
+    const validation = validateTowerPlacement(
+      this.roomState.roundConfig,
+      me.towers,
+      x,
+      y
+    );
+    if (!validation.valid || !validation.pathResult) {
+      soundEngine.playError();
+      soundEngine.haptic('error');
+      this.showToast(validation.reason || 'Blocked');
+      return;
+    }
+
+    const prevOvercharge =
+      this.renderer3d.getLocalMazeEval()?.overchargedSpires ??
+      computeCitadelCircuitry(this.roomState.roundConfig, me.towers)
+        .overchargedSpires;
+
+    me.towers.push({
+      id: `tut_${++this.tutorialWallSeq}`,
+      type: 'BLOCK',
+      x,
+      y,
+      createdAt: Date.now(),
+    });
+    me.gold = Math.max(0, me.gold - wallCost);
+    me.pathDistance = Number(validation.pathResult.totalDistance.toFixed(1));
+    me.ready = false;
+
+    this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+    const nextOvercharge =
+      this.renderer3d.getLocalMazeEval()?.overchargedSpires ?? prevOvercharge;
+    const gainedOvercharge = Math.max(0, nextOvercharge - prevOvercharge);
+
+    soundEngine.playBuild('BLOCK', gainedOvercharge);
+    soundEngine.haptic('build');
+
+    this.syncTutorialStepUI(true);
+    this.updateUndoAndToolAvailability();
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+  }
+
+  private handleTutorialSellTower(towerId: string, x?: number, y?: number) {
+    if (!this.roomState || this.roomState.phase !== 'BUILD') return;
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    const idx = me.towers.findIndex(
+      (t) =>
+        t.id === towerId ||
+        (x !== undefined && y !== undefined && t.x === x && t.y === y)
+    );
+    if (idx === -1) return;
+    const targetTower = me.towers[idx];
+
+    const step = this.getCurrentTutorialStep();
+    if (step.kind === 'PLACE') {
+      soundEngine.playError();
+      soundEngine.haptic('error');
+      this.showToast(
+        'Keep your guided walls in place — build on the glowing gold squares!'
+      );
+      return;
+    }
+    if (step.kind === 'REMOVE') {
+      const rt = step.removeTarget;
+      if (!rt || targetTower.x !== rt.x || targetTower.y !== rt.y) {
+        soundEngine.playError();
+        soundEngine.haptic('error');
+        this.showToast('Remove the pulsing red wall to continue!');
+        return;
+      }
+    }
+
+    me.towers.splice(idx, 1);
+    me.gold += TOWER_SPECS.BLOCK.goldCost;
+    me.ready = false;
+
+    this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+    const evalRes = this.renderer3d.getLocalMazeEval();
+    if (evalRes) {
+      me.pathDistance = Number(evalRes.distance.toFixed(1));
+    }
+
+    soundEngine.playSell();
+    soundEngine.haptic('sell');
+
+    this.syncTutorialStepUI(true);
+    this.updateUndoAndToolAvailability();
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+  }
+
+  private startTutorialRunPhase() {
+    if (!this.tutorialActive || !this.roomState) return;
+    const me = this.getLocalPlayer();
+    if (!me) return;
+
+    this.renderer3d.setTutorialTargets([], null);
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
+    this.hideCursorPill();
+    this.hideTransientPopovers();
+    document.getElementById('tutorial-coach-panel')?.classList.add('hidden');
+
+    me.ready = true;
+    this.roomState.phase = 'RUN';
+    this.roomState.simSpeedMultiplier = 1;
+    this.tutorialRunCompletionShown = false;
+    document.body.dataset.phase = 'RUN';
+
+    document.getElementById('hud-bottom-dock')?.classList.add('dock-hidden');
+    document.getElementById('hud-run-dock')?.classList.remove('hidden');
+
+    this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+    this.startClientRunPhase(this.roomState);
+    this.updateTopBarAndResources();
+    this.updateScoreboardDOM();
+    this.scheduleHudSafeInsetsSync();
+  }
+
+  private showTutorialCompleteModal(
+    finishTime: number,
+    parSecs: number,
+    beatPar: boolean,
+    claps: number,
+    overcharged: number
+  ) {
+    if (!this.tutorialActive) return;
+    const modal = document.getElementById('tutorial-complete-modal');
+    const subEl = document.getElementById('tutorial-complete-sub');
+    const statsEl = document.getElementById('tutorial-complete-stats');
+    if (!modal) return;
+
+    if (subEl) {
+      subEl.textContent = beatPar
+        ? `You survived ${finishTime.toFixed(
+            2
+          )}s and crushed the ${formatParTarget(
+            parSecs
+          )} Par target with Overcharged Spires!`
+        : `You survived ${finishTime.toFixed(
+            2
+          )}s and mastered walls, Overcharged Spires, and switchbacks!`;
+    }
+    if (statsEl) {
+      statsEl.innerHTML = `
+        <div class="daily-result-stat hero-time-stat${beatPar ? ' beat-par' : ''}">
+          <span class="daily-stat-label">Survival Time</span>
+          <strong>${finishTime.toFixed(2)}s</strong>
+        </div>
+        <div class="daily-result-stat">
+          <span class="daily-stat-label">Spire Hits</span>
+          <strong>${claps}</strong>
+        </div>
+        <div class="daily-result-stat">
+          <span class="daily-stat-label">Overcharged Spires</span>
+          <strong>${overcharged} ◆</strong>
+        </div>
+      `;
+    }
+
+    document.getElementById('hud-run-dock')?.classList.add('hidden');
+    modal.classList.remove('hidden');
+    soundEngine.playParAchieved();
+    this.syncModalOpenState();
   }
 
   private syncAudioMuteButtons() {
@@ -2991,7 +3667,7 @@ class MazingContestClient {
   }
 
   private toggleOverviewOrReturnHome() {
-    if (this.roomState?.mode === 'DAILY') return;
+    if (this.roomState?.mode === 'DAILY' || this.tutorialActive) return;
     this.renderer3d.cancelTouchGhost();
     this.hideTouchPrecisionTray();
     this.hideCursorPill();
@@ -3175,9 +3851,13 @@ class MazingContestClient {
     document.getElementById('home-hub-modal')?.classList.add('hidden');
     document.body.dataset.inMenu = 'false';
     this.syncModalOpenState();
-    this.send({ type: 'CLIENT_ARENA_ACTIVE', active: true });
-    if (this.pendingRoundBrief) {
-      this.triggerRoundBriefBanner();
+    if (this.tutorialActive) {
+      this.syncTutorialStepUI(false);
+    } else {
+      this.send({ type: 'CLIENT_ARENA_ACTIVE', active: true });
+      if (this.pendingRoundBrief) {
+        this.triggerRoundBriefBanner();
+      }
     }
     this.scheduleHudSafeInsetsSync();
   }
@@ -3211,14 +3891,22 @@ class MazingContestClient {
 
     bar.classList.remove('hidden');
     const modeLabel =
-      this.roomState.mode === 'DAILY'
+      this.roomState.mode === 'TUTORIAL'
+        ? 'Guided Tutorial'
+        : this.roomState.mode === 'DAILY'
         ? `Daily Maze #${this.roomState.dailyPuzzleNumber || 1}`
         : this.roomState.mode === 'SOLO'
         ? 'Solo Match'
         : `Room ${this.roomState.roomCode}`;
 
     let statusDetail = '';
-    if (this.roomState.phase === 'LOBBY') {
+    if (this.roomState.mode === 'TUTORIAL') {
+      const step = this.getCurrentTutorialStep();
+      statusDetail =
+        this.roomState.phase === 'RUN'
+          ? 'Running Maze'
+          : `Step ${step.stepNumber} of ${TUTORIAL_STEPS.length}`;
+    } else if (this.roomState.phase === 'LOBBY') {
       statusDetail = 'Waiting in Lobby';
     } else if (this.roomState.phase === 'PLANNING') {
       statusDetail = `Planning (${Math.max(
@@ -3238,7 +3926,11 @@ class MazingContestClient {
     )}`;
     if (resumeBtn) {
       const label =
-        this.roomState.phase === 'LOBBY' ? 'Return to Lobby' : 'Resume Match';
+        this.roomState.mode === 'TUTORIAL'
+          ? 'Resume Tutorial'
+          : this.roomState.phase === 'LOBBY'
+          ? 'Return to Lobby'
+          : 'Resume Match';
       resumeBtn.innerHTML = `${icon('play', 14)}<span>${label}</span>`;
     }
   }
@@ -3480,6 +4172,7 @@ class MazingContestClient {
           ?.addEventListener('click', () => {
             if (!this.ensureConnectedForAction()) return;
             soundEngine.playUiClick();
+            this.cleanupTutorialVisuals();
             this.pendingJoinToast = null;
             this.send({
               type: 'START_DAILY',
@@ -3738,16 +4431,21 @@ class MazingContestClient {
 
     if (rulesSummary) {
       const s = state.settings;
-      const timerLabel =
-        s.buildTimeSeconds === 999
-          ? 'Unlimited (∞)'
-          : s.buildTimeSeconds > 0
-          ? `${s.buildTimeSeconds}s`
-          : 'Default (90–120s)';
+      const timerLabel = formatBuildTimerLabel(s.buildTimeSeconds);
+      const roundsLabel = formatRoundsSummary(s.totalRounds);
+      const matchingMapsCount = getMapsMatchingRunners(s.allowedRunners).length;
+      const runnersLabel = formatRunnerFilterRuleValue(s.allowedRunners);
       rulesSummary.innerHTML = `
-        <div class="lobby-rule-chip"><span class="rule-k">Rounds</span><strong>${s.totalRounds}</strong></div>
-        <div class="lobby-rule-chip"><span class="rule-k">Maps</span><strong>Randomized (${ROUNDS.length})</strong></div>
-        <div class="lobby-rule-chip"><span class="rule-k">Build Timer</span><strong>${timerLabel}</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Rounds</span><strong>${escapeHtml(
+          roundsLabel
+        )}</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Maps</span><strong>Randomized (${matchingMapsCount})</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Runners</span><strong>${escapeHtml(
+          runnersLabel
+        )}</strong></div>
+        <div class="lobby-rule-chip"><span class="rule-k">Build Timer</span><strong>${escapeHtml(
+          timerLabel
+        )}</strong></div>
         <div class="lobby-rule-chip"><span class="rule-k">Wall Supply</span><strong>${formatWallSupplyLabel(
           s.goldMultiplier
         )}</strong></div>
@@ -3761,32 +4459,9 @@ class MazingContestClient {
       `;
     }
 
-    const setLobbySeg = (groupId: string, val: string) => {
-      document
-        .querySelectorAll<HTMLButtonElement>(`#${groupId} .seg-btn`)
-        .forEach((b) => b.classList.toggle('active', b.dataset.val === val));
-    };
-    setLobbySeg(
-      'lobby-cfg-public-group',
-      String(Boolean(state.settings.isPublic))
-    );
-    setLobbySeg(
-      'lobby-cfg-rounds-group',
-      String(state.settings.totalRounds || 8)
-    );
-    setLobbySeg(
-      'lobby-cfg-buildtime-group',
-      String(state.settings.buildTimeSeconds || 0)
-    );
-    setLobbySeg(
-      'lobby-cfg-gold-group',
-      String(state.settings.goldMultiplier || 1)
-    );
-    setLobbySeg(
-      'lobby-cfg-botdiff-group',
-      state.settings.botDifficulty || 'ARCHITECT'
-    );
-    setLobbySeg('lobby-cfg-fog-group', String(Boolean(state.settings.fogOfWar)));
+    if (!this.lobbyRulesEditorOpen) {
+      this.syncLobbyRulesEditorFromSettings(state.settings);
+    }
 
     const connectedHumans = state.players.filter(
       (p) => !p.isBot && p.connected !== false
@@ -3994,6 +4669,11 @@ class MazingContestClient {
     leaveHomeBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
       if (!this.roomState) return;
+      if (this.tutorialActive) {
+        soundEngine.playUiClick();
+        this.exitGuidedTutorial('home');
+        return;
+      }
       const isDailyActive =
         this.roomState.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
       this.armDestructiveButton(
@@ -4007,6 +4687,51 @@ class MazingContestClient {
         }
       );
     });
+
+    // Guided Tutorial Launch Buttons (How to Play screen + Quick Guide modal) & Tutorial Controls
+    document
+      .querySelectorAll<HTMLButtonElement>('.btn-launch-tutorial')
+      .forEach((btn) => {
+        btn.addEventListener('click', () => {
+          soundEngine.playUiClick();
+          this.startGuidedTutorial();
+        });
+      });
+
+    document
+      .getElementById('btn-tutorial-focus')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.renderer3d.resetToMyIsland();
+      });
+
+    document
+      .getElementById('btn-tutorial-exit')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.exitGuidedTutorial('home');
+      });
+
+    document
+      .getElementById('btn-tutorial-replay')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.startGuidedTutorial();
+      });
+
+    document
+      .getElementById('btn-tutorial-home')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.exitGuidedTutorial('home');
+      });
+
+    document
+      .getElementById('btn-tutorial-play-solo')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.exitGuidedTutorial('solo-setup');
+      });
 
     document
       .querySelectorAll<HTMLButtonElement>('#hub-play-subtabs .subtab-pill')
@@ -4118,12 +4843,63 @@ class MazingContestClient {
     );
     wireSegmented('#lobby-rules-editor .segmented-control');
 
+    // Wire manual custom number inputs paired with preset segmented buttons (Solo, Online Host, Waiting Lobby)
+    this.wirePresetWithCustomNumber(
+      'solo-rounds-group',
+      'solo-rounds-custom',
+      MIN_CUSTOM_ROUNDS,
+      MAX_CUSTOM_ROUNDS,
+      '3'
+    );
+    this.wirePresetWithCustomNumber(
+      'solo-buildtime-group',
+      'solo-buildtime-custom',
+      MIN_CUSTOM_BUILD_SECONDS,
+      MAX_CUSTOM_BUILD_SECONDS,
+      '0'
+    );
+    this.wirePresetWithCustomNumber(
+      'cfg-rounds-group',
+      'cfg-rounds-custom',
+      MIN_CUSTOM_ROUNDS,
+      MAX_CUSTOM_ROUNDS,
+      '8'
+    );
+    this.wirePresetWithCustomNumber(
+      'cfg-buildtime-group',
+      'cfg-buildtime-custom',
+      MIN_CUSTOM_BUILD_SECONDS,
+      MAX_CUSTOM_BUILD_SECONDS,
+      '0'
+    );
+    this.wirePresetWithCustomNumber(
+      'lobby-cfg-rounds-group',
+      'lobby-cfg-rounds-custom',
+      MIN_CUSTOM_ROUNDS,
+      MAX_CUSTOM_ROUNDS,
+      '8'
+    );
+    this.wirePresetWithCustomNumber(
+      'lobby-cfg-buildtime-group',
+      'lobby-cfg-buildtime-custom',
+      MIN_CUSTOM_BUILD_SECONDS,
+      MAX_CUSTOM_BUILD_SECONDS,
+      '0'
+    );
+
+    // Wire Additional Options collapsible panels & Runner Type Filter chips
+    this.wireAdditionalOptions(RUNNER_FILTER_CONTEXTS.solo);
+    this.wireAdditionalOptions(RUNNER_FILTER_CONTEXTS.cfg);
+    this.wireAdditionalOptions(RUNNER_FILTER_CONTEXTS.lobby);
+
     const startSoloBtn = document.getElementById('btn-start-solo-match');
     startSoloBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
       if (!this.ensureConnectedForAction()) return;
       const hasActiveMatch = Boolean(
-        this.roomState && this.roomState.phase !== 'GAME_OVER'
+        !this.tutorialActive &&
+          this.roomState &&
+          this.roomState.phase !== 'GAME_OVER'
       );
       const isDailyActive =
         this.roomState?.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
@@ -4134,6 +4910,7 @@ class MazingContestClient {
         'play',
         () => {
           soundEngine.playUiClick();
+          this.cleanupTutorialVisuals();
           const settings = this.readSoloFormSettings();
           this.pendingJoinToast = null;
           this.send({
@@ -4162,11 +4939,14 @@ class MazingContestClient {
         return;
       }
       const hasActiveMatch = Boolean(
-        this.roomState && this.roomState.phase !== 'GAME_OVER'
+        !this.tutorialActive &&
+          this.roomState &&
+          this.roomState.phase !== 'GAME_OVER'
       );
       const isDailyActive =
         this.roomState?.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
       const doJoin = () => {
+        this.cleanupTutorialVisuals();
         this.pendingJoinToast = `Joined lobby ${code}`;
         this.send({
           type: 'JOIN_ROOM',
@@ -4224,7 +5004,9 @@ class MazingContestClient {
       e.stopPropagation();
       if (!this.ensureConnectedForAction()) return;
       const hasActiveMatch = Boolean(
-        this.roomState && this.roomState.phase !== 'GAME_OVER'
+        !this.tutorialActive &&
+          this.roomState &&
+          this.roomState.phase !== 'GAME_OVER'
       );
       const isDailyActive =
         this.roomState?.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
@@ -4235,6 +5017,7 @@ class MazingContestClient {
         'plus',
         () => {
           soundEngine.playUiClick();
+          this.cleanupTutorialVisuals();
           const settings = this.readConfigFormSettings();
           const customCode = `RM${Math.floor(1000 + Math.random() * 8999)}`;
           this.pendingJoinToast = null;
@@ -4321,6 +5104,9 @@ class MazingContestClient {
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
         this.lobbyRulesEditorOpen = !this.lobbyRulesEditorOpen;
+        if (this.lobbyRulesEditorOpen && this.roomState) {
+          this.syncLobbyRulesEditorFromSettings(this.roomState.settings);
+        }
         document
           .getElementById('lobby-rules-editor')
           ?.classList.toggle('hidden', !this.lobbyRulesEditorOpen);
@@ -4334,18 +5120,36 @@ class MazingContestClient {
         const getSeg = (id: string, fb: string) =>
           document.querySelector<HTMLButtonElement>(`#${id} .seg-btn.active`)
             ?.dataset.val ?? fb;
+        const totalRounds = this.readPresetOrCustomNumber(
+          'lobby-cfg-rounds-group',
+          'lobby-cfg-rounds-custom',
+          DEFAULT_MATCH_ROUNDS,
+          MIN_CUSTOM_ROUNDS,
+          MAX_CUSTOM_ROUNDS
+        );
+        const buildTimeSeconds = this.readPresetOrCustomNumber(
+          'lobby-cfg-buildtime-group',
+          'lobby-cfg-buildtime-custom',
+          0,
+          MIN_CUSTOM_BUILD_SECONDS,
+          MAX_CUSTOM_BUILD_SECONDS
+        );
+        const allowedRunners = this.readAllowedRunners(
+          RUNNER_FILTER_CONTEXTS.lobby.groupId
+        );
         this.send({
           type: 'UPDATE_SETTINGS',
           settings: {
             isPublic: getSeg('lobby-cfg-public-group', 'true') === 'true',
-            totalRounds: Number(getSeg('lobby-cfg-rounds-group', '8')),
-            buildTimeSeconds: Number(getSeg('lobby-cfg-buildtime-group', '0')),
+            totalRounds,
+            buildTimeSeconds,
             goldMultiplier: Number(getSeg('lobby-cfg-gold-group', '1')),
             botDifficulty: getSeg('lobby-cfg-botdiff-group', 'ARCHITECT') as
               | 'NOVICE'
               | 'ARCHITECT'
               | 'GRANDMASTER',
             fogOfWar: getSeg('lobby-cfg-fog-group', 'false') === 'true',
+            allowedRunners,
           },
         });
         this.lobbyRulesEditorOpen = false;
@@ -4386,6 +5190,243 @@ class MazingContestClient {
       });
   }
 
+  private wirePresetWithCustomNumber(
+    groupId: string,
+    inputId: string,
+    min: number,
+    max: number,
+    fallbackVal: string
+  ) {
+    const group = document.getElementById(groupId);
+    const input = document.getElementById(inputId) as HTMLInputElement | null;
+    if (!group || !input) return;
+
+    const activateFallback = () => {
+      const target =
+        group.querySelector<HTMLButtonElement>(
+          `.seg-btn[data-val="${fallbackVal}"]`
+        ) || group.querySelector<HTMLButtonElement>('.seg-btn');
+      if (target) {
+        group
+          .querySelectorAll<HTMLButtonElement>('.seg-btn')
+          .forEach((b) => b.classList.remove('active'));
+        target.classList.add('active');
+      }
+    };
+
+    group.querySelectorAll<HTMLButtonElement>('.seg-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        input.value = '';
+        input.classList.remove('active');
+      });
+    });
+
+    input.addEventListener('input', () => {
+      const raw = input.value.trim();
+      if (!raw) {
+        input.classList.remove('active');
+        if (!group.querySelector('.seg-btn.active')) {
+          activateFallback();
+        }
+        return;
+      }
+      group
+        .querySelectorAll<HTMLButtonElement>('.seg-btn')
+        .forEach((b) => b.classList.remove('active'));
+      input.classList.add('active');
+    });
+
+    input.addEventListener('blur', () => {
+      const raw = input.value.trim();
+      if (!raw) {
+        input.classList.remove('active');
+        if (!group.querySelector('.seg-btn.active')) {
+          activateFallback();
+        }
+        return;
+      }
+      const parsed = Math.round(Number(raw));
+      if (!Number.isFinite(parsed)) {
+        input.value = '';
+        input.classList.remove('active');
+        activateFallback();
+        return;
+      }
+      const clamped = Math.max(min, Math.min(max, parsed));
+      input.value = String(clamped);
+      group
+        .querySelectorAll<HTMLButtonElement>('.seg-btn')
+        .forEach((b) => b.classList.remove('active'));
+      input.classList.add('active');
+    });
+  }
+
+  private readPresetOrCustomNumber(
+    groupId: string,
+    inputId: string,
+    fallback: number,
+    min: number,
+    max: number
+  ): number {
+    const input = document.getElementById(inputId) as HTMLInputElement | null;
+    const raw = input?.value.trim() ?? '';
+    if (raw !== '') {
+      const parsed = Math.round(Number(raw));
+      if (Number.isFinite(parsed)) {
+        return Math.max(min, Math.min(max, parsed));
+      }
+    }
+    const active = document.querySelector<HTMLButtonElement>(
+      `#${groupId} .seg-btn.active`
+    );
+    const val = Number(active?.dataset.val);
+    return Number.isFinite(val) ? val : fallback;
+  }
+
+  private syncPresetOrCustomNumber(
+    groupId: string,
+    inputId: string,
+    value: number
+  ) {
+    const group = document.getElementById(groupId);
+    const input = document.getElementById(inputId) as HTMLInputElement | null;
+    if (!group) return;
+
+    const buttons = Array.from(
+      group.querySelectorAll<HTMLButtonElement>('.seg-btn')
+    );
+    const match = buttons.find((b) => Number(b.dataset.val) === value);
+    if (match) {
+      buttons.forEach((b) => b.classList.toggle('active', b === match));
+      if (input) {
+        input.value = '';
+        input.classList.remove('active');
+      }
+    } else {
+      buttons.forEach((b) => b.classList.remove('active'));
+      if (input) {
+        input.value = String(value);
+        input.classList.add('active');
+      }
+    }
+  }
+
+  private wireAdditionalOptions(ctx: RunnerFilterContext) {
+    const toggleBtn = document.getElementById(ctx.toggleBtnId);
+    const body = document.getElementById(ctx.bodyId);
+    const group = document.getElementById(ctx.groupId);
+
+    toggleBtn?.addEventListener('click', () => {
+      if (!body) return;
+      soundEngine.playUiClick();
+      const willOpen = body.classList.contains('hidden');
+      body.classList.toggle('hidden', !willOpen);
+      toggleBtn.setAttribute('aria-expanded', String(willOpen));
+    });
+
+    group
+      ?.querySelectorAll<HTMLButtonElement>('.runner-filter-chip')
+      .forEach((chip) => {
+        chip.addEventListener('click', () => {
+          const isActive = chip.classList.contains('active');
+          const activeCount = group.querySelectorAll(
+            '.runner-filter-chip.active'
+          ).length;
+          if (isActive && activeCount <= 1) {
+            soundEngine.playError();
+            soundEngine.haptic('error');
+            this.showToast('Keep at least 1 runner type enabled.');
+            return;
+          }
+          soundEngine.playUiClick();
+          const next = !isActive;
+          chip.classList.toggle('active', next);
+          chip.setAttribute('aria-pressed', String(next));
+          this.updateRunnerFilterMeta(ctx);
+        });
+      });
+
+    this.updateRunnerFilterMeta(ctx);
+  }
+
+  private readAllowedRunners(groupId: string): RunnerArchetype[] {
+    const group = document.getElementById(groupId);
+    if (!group) return [...ALL_RUNNER_ARCHETYPES];
+    const selected: RunnerArchetype[] = [];
+    group
+      .querySelectorAll<HTMLButtonElement>('.runner-filter-chip.active')
+      .forEach((chip) => {
+        const key = chip.dataset.runner as RunnerArchetype | undefined;
+        if (key && ALL_RUNNER_ARCHETYPES.includes(key)) {
+          selected.push(key);
+        }
+      });
+    return normalizeAllowedRunners(selected);
+  }
+
+  private syncAllowedRunners(
+    ctx: RunnerFilterContext,
+    allowed?: RunnerArchetype[]
+  ) {
+    const group = document.getElementById(ctx.groupId);
+    if (!group) return;
+    const set = new Set(normalizeAllowedRunners(allowed));
+    group
+      .querySelectorAll<HTMLButtonElement>('.runner-filter-chip')
+      .forEach((chip) => {
+        const key = chip.dataset.runner as RunnerArchetype | undefined;
+        const on = Boolean(key && set.has(key));
+        chip.classList.toggle('active', on);
+        chip.setAttribute('aria-pressed', String(on));
+      });
+    this.updateRunnerFilterMeta(ctx);
+  }
+
+  private updateRunnerFilterMeta(ctx: RunnerFilterContext) {
+    const selected = this.readAllowedRunners(ctx.groupId);
+    const matchingCount = getMapsMatchingRunners(selected).length;
+    const summaryEl = document.getElementById(ctx.summaryId);
+    if (summaryEl) {
+      summaryEl.textContent = formatRunnerFilterSummary(selected);
+    }
+    const poolEl = document.getElementById(ctx.poolCountId);
+    if (poolEl) {
+      poolEl.textContent = `${matchingCount} matching ${
+        matchingCount === 1 ? 'map' : 'maps'
+      }`;
+    }
+  }
+
+  private syncLobbyRulesEditorFromSettings(settings: RoomSettings) {
+    const setLobbySeg = (groupId: string, val: string) => {
+      document
+        .querySelectorAll<HTMLButtonElement>(`#${groupId} .seg-btn`)
+        .forEach((b) => b.classList.toggle('active', b.dataset.val === val));
+    };
+    setLobbySeg('lobby-cfg-public-group', String(Boolean(settings.isPublic)));
+    this.syncPresetOrCustomNumber(
+      'lobby-cfg-rounds-group',
+      'lobby-cfg-rounds-custom',
+      settings.totalRounds || DEFAULT_MATCH_ROUNDS
+    );
+    this.syncPresetOrCustomNumber(
+      'lobby-cfg-buildtime-group',
+      'lobby-cfg-buildtime-custom',
+      settings.buildTimeSeconds || 0
+    );
+    setLobbySeg('lobby-cfg-gold-group', String(settings.goldMultiplier || 1));
+    setLobbySeg(
+      'lobby-cfg-botdiff-group',
+      settings.botDifficulty || 'ARCHITECT'
+    );
+    setLobbySeg('lobby-cfg-fog-group', String(Boolean(settings.fogOfWar)));
+    this.syncAllowedRunners(
+      RUNNER_FILTER_CONTEXTS.lobby,
+      settings.allowedRunners
+    );
+  }
+
   private readSoloFormSettings(): RoomSettings {
     const getSegVal = (groupId: string, fallback: string) => {
       const active = document.querySelector<HTMLButtonElement>(
@@ -4396,8 +5437,20 @@ class MazingContestClient {
     return {
       roomName: `${this.playerName}'s Island`,
       isPublic: false,
-      totalRounds: Number(getSegVal('solo-rounds-group', '8')),
-      buildTimeSeconds: Number(getSegVal('solo-buildtime-group', '0')),
+      totalRounds: this.readPresetOrCustomNumber(
+        'solo-rounds-group',
+        'solo-rounds-custom',
+        3,
+        MIN_CUSTOM_ROUNDS,
+        MAX_CUSTOM_ROUNDS
+      ),
+      buildTimeSeconds: this.readPresetOrCustomNumber(
+        'solo-buildtime-group',
+        'solo-buildtime-custom',
+        0,
+        MIN_CUSTOM_BUILD_SECONDS,
+        MAX_CUSTOM_BUILD_SECONDS
+      ),
       goldMultiplier: Number(getSegVal('solo-gold-group', '1')),
       botCount: Number(getSegVal('solo-botcount-group', '3')),
       botDifficulty: getSegVal('solo-botdiff-group', 'ARCHITECT') as
@@ -4405,6 +5458,7 @@ class MazingContestClient {
         | 'ARCHITECT'
         | 'GRANDMASTER',
       fogOfWar: getSegVal('solo-fog-group', 'false') === 'true',
+      allowedRunners: this.readAllowedRunners(RUNNER_FILTER_CONTEXTS.solo.groupId),
     };
   }
 
@@ -4440,8 +5494,20 @@ class MazingContestClient {
     return {
       roomName,
       isPublic: getSegVal('cfg-public-group', 'true') === 'true',
-      totalRounds: Number(getSegVal('cfg-rounds-group', '8')),
-      buildTimeSeconds: Number(getSegVal('cfg-buildtime-group', '0')),
+      totalRounds: this.readPresetOrCustomNumber(
+        'cfg-rounds-group',
+        'cfg-rounds-custom',
+        DEFAULT_MATCH_ROUNDS,
+        MIN_CUSTOM_ROUNDS,
+        MAX_CUSTOM_ROUNDS
+      ),
+      buildTimeSeconds: this.readPresetOrCustomNumber(
+        'cfg-buildtime-group',
+        'cfg-buildtime-custom',
+        0,
+        MIN_CUSTOM_BUILD_SECONDS,
+        MAX_CUSTOM_BUILD_SECONDS
+      ),
       goldMultiplier: Number(getSegVal('cfg-gold-group', '1')),
       botCount: Number(getSegVal('cfg-botcount-group', '0')),
       botDifficulty: getSegVal('cfg-botdiff-group', 'ARCHITECT') as
@@ -4449,6 +5515,7 @@ class MazingContestClient {
         | 'ARCHITECT'
         | 'GRANDMASTER',
       fogOfWar: getSegVal('cfg-fog-group', 'false') === 'true',
+      allowedRunners: this.readAllowedRunners(RUNNER_FILTER_CONTEXTS.cfg.groupId),
     };
   }
 
@@ -4511,6 +5578,7 @@ class MazingContestClient {
         r.maxPlayers,
         r.settings.buildTimeSeconds,
         r.settings.fogOfWar,
+        r.settings.allowedRunners,
       ])
     )}`;
     if (lobbySig === this.lastLobbySignature) return;
@@ -4560,28 +5628,36 @@ class MazingContestClient {
       const card = document.createElement('div');
       card.className = `lobby-card${isCurrent ? ' current-room' : ''}`;
 
+      const roundsCompact = formatRoundsCompact(r.totalRounds);
       const phaseText =
         r.phase === 'LOBBY'
           ? 'In Lobby'
           : r.phase === 'PLANNING'
-          ? `Planning R${r.currentRound}/${r.totalRounds}`
+          ? `Planning R${r.currentRound}/${roundsCompact}`
           : r.phase === 'BUILD'
-          ? `Build R${r.currentRound}/${r.totalRounds}`
+          ? `Build R${r.currentRound}/${roundsCompact}`
           : r.phase === 'RUN'
-          ? `Run R${r.currentRound}/${r.totalRounds}`
+          ? `Run R${r.currentRound}/${roundsCompact}`
           : 'Standings';
 
-      const paceDesc =
-        r.settings.buildTimeSeconds === 999
-          ? '∞ Timer'
-          : r.settings.buildTimeSeconds > 0
-          ? `${r.settings.buildTimeSeconds}s`
-          : 'Default';
+      const paceDesc = isInfiniteBuildTime(r.settings.buildTimeSeconds)
+        ? '∞ Timer'
+        : r.settings.buildTimeSeconds > 0
+        ? `${r.settings.buildTimeSeconds}s`
+        : 'Default';
 
+      const roundsDesc = isInfiniteRounds(r.totalRounds)
+        ? '∞ Rounds'
+        : `${r.totalRounds} Rounds`;
+      const allowedRunners = normalizeAllowedRunners(r.settings.allowedRunners);
+      const runnerSuffix =
+        allowedRunners.length < ALL_RUNNER_ARCHETYPES.length
+          ? ` · ${formatRunnerFilterSummary(allowedRunners)}`
+          : '';
       const hiddenSuffix = r.settings.fogOfWar ? ' · Hidden Mazes' : '';
-      const subtitleText = `Host: ${escapeHtml(r.hostName)} · ${
-        r.totalRounds
-      } Rounds · ${paceDesc}${hiddenSuffix}`;
+      const subtitleText = `Host: ${escapeHtml(
+        r.hostName
+      )} · ${roundsDesc} · ${paceDesc}${escapeHtml(runnerSuffix)}${hiddenSuffix}`;
       const botsLabel = `${r.botCount} ${r.botCount === 1 ? 'Bot' : 'Bots'}`;
 
       card.innerHTML = `
@@ -4634,7 +5710,9 @@ class MazingContestClient {
         }
         if (!this.ensureConnectedForAction()) return;
         const hasActiveMatch = Boolean(
-          this.roomState && this.roomState.phase !== 'GAME_OVER'
+          !this.tutorialActive &&
+            this.roomState &&
+            this.roomState.phase !== 'GAME_OVER'
         );
         const isDailyActive =
           this.roomState?.mode === 'DAILY' &&
@@ -4645,6 +5723,7 @@ class MazingContestClient {
           isDailyActive ? 'End Daily?' : 'Leave Match?',
           'arrowRight',
           () => {
+            this.cleanupTutorialVisuals();
             this.pendingJoinToast = `Joined ${r.roomName} (${r.roomCode})`;
             this.send({
               type: 'JOIN_ROOM',
@@ -4671,11 +5750,15 @@ class MazingContestClient {
 
     const populateOptions = () => {
       select.innerHTML = '';
+      const recordsByMap =
+        this.leaderboard?.mapRecords || this.leaderboard?.roundRecords || {};
       for (const r of ROUNDS) {
         const mapId = r.mapId ?? r.roundNumber;
         const arch = RUNNER_ARCHETYPES[r.runnerType || 'SCOUT'];
-        const hasRecs =
-          (this.leaderboard?.roundRecords?.[mapId]?.length || 0) > 0;
+        const humanRecs = (recordsByMap[mapId] || []).filter(
+          (rec) => !rec.isBot
+        );
+        const hasRecs = humanRecs.length > 0;
         const opt = document.createElement('option');
         opt.value = String(mapId);
         opt.textContent = `#${mapId} · ${r.title} (${arch.name.replace(
@@ -4771,11 +5854,13 @@ class MazingContestClient {
         </div>
       `;
 
-      const records = this.leaderboard.roundRecords[mapId] || [];
+      const recordsByMap =
+        this.leaderboard.mapRecords || this.leaderboard.roundRecords || {};
+      const records = (recordsByMap[mapId] || []).filter((rec) => !rec.isBot);
       if (records.length === 0) {
-        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No survival records yet for Map #${mapId} (${escapeHtml(
+        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No human survival records yet for Map #${mapId} (${escapeHtml(
           roundCfg.title
-        )}). Complete a run to set the first record.</div>`;
+        )}). Complete a run on this map to claim #1!</div>`;
         return;
       }
 
@@ -4850,9 +5935,11 @@ class MazingContestClient {
         <div class="meta-pill">All-Time</div>
       `;
 
-      const champs = this.leaderboard.champions || [];
+      const champs = (this.leaderboard.champions || []).filter(
+        (c) => !(c as { isBot?: boolean }).isBot
+      );
       if (champs.length === 0) {
-        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">Complete a full match to claim the top spot on the leaderboard.</div>`;
+        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No human career records yet. Complete a run to claim #1 on the leaderboard!</div>`;
         return;
       }
 
@@ -4863,7 +5950,7 @@ class MazingContestClient {
         <div>Player</div>
         <div>Points</div>
         <div class="lb-synergies">Highlights</div>
-        <div class="lb-meta-right">Best Run</div>
+        <div class="lb-meta-right">Best Map Run</div>
       `;
       tableWrap.appendChild(head);
 
@@ -4878,7 +5965,9 @@ class MazingContestClient {
             ? getMedalBadge((idx + 1) as 1 | 2 | 3, 22)
             : `<span>#${idx + 1}</span>`;
         const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
-        const bestMap = getMapById(c.bestRoundNumber);
+        const bestMapId = c.bestMapId || c.bestRoundNumber || 1;
+        const bestMap = getMapById(bestMapId);
+        const bestTitle = c.bestMapTitle || bestMap.title;
 
         row.innerHTML = `
           <div class="lb-rank">${rankBadge}</div>
@@ -4899,10 +5988,14 @@ class MazingContestClient {
             <span class="stat-chip">${icon('starFilled', 11)} ${
           c.parStarsEarned
         } Par</span>
-            <span class="stat-chip">${c.roundsPlayed} Rounds</span>
+            <span class="stat-chip">${c.roundsPlayed} ${
+          c.roundsPlayed === 1 ? 'Map' : 'Maps'
+        }</span>
           </div>
-          <div class="lb-meta-right" title="${escapeHtml(bestMap.title)}">
-            ${c.bestSurvivalTime.toFixed(1)}s · #${c.bestRoundNumber}
+          <div class="lb-meta-right" title="Map #${bestMapId} · ${escapeHtml(
+          bestTitle
+        )}">
+            ${c.bestSurvivalTime.toFixed(1)}s · Map #${bestMapId}
           </div>
         `;
         tableWrap.appendChild(row);
@@ -4991,6 +6084,7 @@ class MazingContestClient {
     const roundPickerBtn = document.getElementById('btn-round-picker')!;
     roundPickerBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (this.tutorialActive) return;
       soundEngine.playUiClick();
       const willOpen = roundDropdown.classList.contains('hidden');
       this.dismissAllTransientOverlays();
@@ -5226,8 +6320,8 @@ class MazingContestClient {
         return;
       }
 
-      // Suppress arena hotkeys while Guide modal is open
-      if (this.isHelpOpen()) {
+      // Suppress arena hotkeys while Guide or Tutorial Complete modal is open
+      if (this.isHelpOpen() || this.isTutorialCompleteOpen()) {
         if (e.key.toUpperCase() === 'M') {
           soundEngine.toggleMuted();
           this.syncAudioMuteButtons();
@@ -5317,13 +6411,19 @@ class MazingContestClient {
       .querySelectorAll<HTMLButtonElement>('.speed-btn')
       .forEach((btn) => {
         btn.addEventListener('click', () => {
+          const spd = Number(btn.dataset.speed) as 1 | 2 | 4;
+          if (this.tutorialActive && this.roomState) {
+            soundEngine.playUiClick();
+            this.roomState.simSpeedMultiplier = spd;
+            this.updateTopBarAndResources();
+            return;
+          }
           if (!this.ensureConnectedForAction()) return;
           if (!this.canControlRoomRules()) {
             this.showToast('Only the room host can change run speed.');
             return;
           }
           soundEngine.playUiClick();
-          const spd = Number(btn.dataset.speed) as 1 | 2 | 4;
           this.send({ type: 'SET_SIM_SPEED', speed: spd });
         });
       });
@@ -5332,6 +6432,7 @@ class MazingContestClient {
     const clearMazeBtn = document.getElementById('btn-clear-maze');
     clearMazeBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (this.tutorialActive) return;
       if (!this.ensureConnectedForAction()) return;
       const me = this.getLocalPlayer();
       if (!me || me.towers.length === 0 || this.roomState?.phase !== 'BUILD') {
@@ -5385,6 +6486,7 @@ class MazingContestClient {
     const rerollBtn = document.getElementById('btn-reroll-map');
     rerollBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (this.tutorialActive) return;
       if (!this.ensureConnectedForAction()) return;
       if (!this.canControlRoomRules()) {
         this.showToast('Only the room host can generate a new map.');
@@ -5410,6 +6512,7 @@ class MazingContestClient {
     const sampleBtn = document.getElementById('btn-demo-layout');
     sampleBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (this.tutorialActive) return;
       if (!this.ensureConnectedForAction()) return;
       const me = this.getLocalPlayer();
       if (!me || this.roomState?.phase !== 'BUILD') return;
@@ -5462,6 +6565,22 @@ class MazingContestClient {
     const readyBtn = document.getElementById('btn-ready-lock');
     readyBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (this.tutorialActive) {
+        if (this.roomState?.phase !== 'BUILD') return;
+        const step = this.getCurrentTutorialStep();
+        if (step.kind !== 'RUN') {
+          soundEngine.playError();
+          soundEngine.haptic('error');
+          this.showToast(
+            `Finish Step ${step.stepNumber} first before starting the run!`
+          );
+          return;
+        }
+        soundEngine.playReady(true);
+        soundEngine.haptic('ready');
+        this.startTutorialRunPhase();
+        return;
+      }
       if (!this.ensureConnectedForAction()) return;
       const me = this.getLocalPlayer();
       if (!me || this.roomState?.phase !== 'BUILD') return;
@@ -5711,12 +6830,15 @@ class MazingContestClient {
       1;
     const totalMatchRounds =
       this.roomState?.settings?.totalRounds || DEFAULT_MATCH_ROUNDS;
+    const isEndless = isInfiniteRounds(totalMatchRounds);
 
     const matchTabBtn = document.querySelector<HTMLButtonElement>(
       '#round-switcher-tabs .round-tab-btn[data-round-tab="match"]'
     );
     if (matchTabBtn) {
-      matchTabBtn.textContent = `Match (${totalMatchRounds})`;
+      matchTabBtn.textContent = isEndless
+        ? 'Match (∞)'
+        : `Match (${totalMatchRounds})`;
     }
     const catalogTabBtn = document.querySelector<HTMLButtonElement>(
       '#round-switcher-tabs .round-tab-btn[data-round-tab="catalog"]'
@@ -5733,10 +6855,13 @@ class MazingContestClient {
     };
 
     if (this.roundSwitcherTab === 'match') {
+      const fallbackCount = isEndless
+        ? DEFAULT_MATCH_ROUNDS
+        : Math.min(totalMatchRounds, ROUNDS.length);
       const matchIds =
         this.roomState?.matchMapIds && this.roomState.matchMapIds.length > 0
           ? this.roomState.matchMapIds
-          : ROUNDS.slice(0, totalMatchRounds).map(
+          : ROUNDS.slice(0, fallbackCount).map(
               (r) => r.mapId ?? r.roundNumber
             );
 
@@ -5880,13 +7005,21 @@ class MazingContestClient {
     const mapId = round.mapId ?? round.roundNumber;
 
     const isDaily = this.roomState.mode === 'DAILY';
-    document.getElementById('round-code-label')!.textContent = isDaily
+    const isTutorial = this.roomState.mode === 'TUTORIAL';
+    const roundsCompact = formatRoundsCompact(totalRounds);
+    document.getElementById('round-code-label')!.textContent = isTutorial
+      ? 'TUTORIAL'
+      : isDaily
       ? `DAILY #${this.roomState.dailyPuzzleNumber || 1}`
-      : `R${round.roundNumber}/${totalRounds}`;
-    document.getElementById('round-subtitle')!.textContent = isDaily
+      : `R${round.roundNumber}/${roundsCompact}`;
+    document.getElementById('round-subtitle')!.textContent = isTutorial
+      ? 'Guided Training'
+      : isDaily
       ? round.title.replace(/^Daily #\d+\s*·\s*/i, '')
       : round.title;
-    document.getElementById('btn-round-picker')!.title = isDaily
+    document.getElementById('btn-round-picker')!.title = isTutorial
+      ? 'Guided Interactive Tutorial'
+      : isDaily
       ? `${round.title} · ${arch.name} (${arch.traitSummary})`
       : `Round ${round.roundNumber} · Map #${mapId}/${ROUNDS.length}: ${round.title} · ${arch.name} (${arch.traitSummary})`;
 
@@ -6115,7 +7248,7 @@ class MazingContestClient {
     const clockCluster = timerEl.closest('.phase-clock-cluster');
     if (
       this.roomState.phase === 'BUILD' &&
-      this.roomState.settings?.buildTimeSeconds === 999
+      isInfiniteBuildTime(this.roomState.settings?.buildTimeSeconds)
     ) {
       timerEl.textContent = '∞';
       timerEl.classList.remove('timer-warn', 'timer-urgent');
@@ -6645,8 +7778,11 @@ class MazingContestClient {
       }
     }
 
+    const isEndless = isInfiniteRounds(totalRounds);
     progressEl.textContent = isGameOver
-      ? `Final · ${totalRounds} Rounds`
+      ? `Final · ${roundsDone} Rounds`
+      : isEndless
+      ? `Round ${roundsDone} · Endless (∞)`
       : `Round ${roundsDone} of ${totalRounds}`;
 
     if (state.newRecordHolders && state.newRecordHolders.length > 0) {
@@ -6663,7 +7799,7 @@ class MazingContestClient {
 
     if (isGameOver) {
       titleEl.textContent = 'Match Complete';
-      subEl.textContent = `Final career standings across ${totalRounds} rounds.`;
+      subEl.textContent = `Final career standings across ${roundsDone} rounds.`;
       this.updateResultsCountdownDOM();
 
       const overallRanked = [...state.players].sort(
