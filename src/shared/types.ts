@@ -223,13 +223,44 @@ export interface WaygatePair {
   exit: GridPoint;  // 2x2 pad top-left
 }
 
+export type MapLayoutPattern =
+  | 'CLASSIC'
+  | 'CENTER_SPINE'
+  | 'TWIN_FLANKS'
+  | 'DIAMOND_COURT'
+  | 'DIAGONAL_CASCADE'
+  | 'CITADEL_RING'
+  | 'WEST_GAUNTLET'
+  | 'EAST_GAUNTLET'
+  | 'NORTH_SOUTH_BASTIONS';
+
+export type MapKeepStyle =
+  | 'DEFAULT'
+  | 'BASTION_HEAVY'
+  | 'PERIMETER'
+  | 'CENTRAL';
+
+export type WaystoneLayoutStyle =
+  | 'DEFAULT'
+  | 'CENTER'
+  | 'WEST_FLANK'
+  | 'EAST_FLANK'
+  | 'DUAL_CROSS'
+  | 'DUAL_REBOUND'
+  | 'DUAL_VERTICAL';
+
 export interface RoundConfig {
   roundNumber: number;
+  mapId?: number;
   title: string;
   subtitle: string;
   hint: string;
   seed?: number;
   runnerType?: RunnerArchetype;
+  spireTypes?: SpireType[];
+  layoutPattern?: MapLayoutPattern;
+  keepStyle?: MapKeepStyle;
+  waystoneStyle?: WaystoneLayoutStyle;
   gridWidth: number;
   gridHeight: number;
   buildTimeSeconds: number;
@@ -511,6 +542,7 @@ export interface RoomState {
   settings: RoomSettings;
   currentRoundIndex: number;
   roundsCompleted?: number;
+  matchMapIds?: number[];
   roundConfig: RoundConfig;
   phaseTimeRemaining: number;
   runElapsed?: number;
@@ -580,7 +612,7 @@ export type ClientToServerMessage =
   | { type: 'START_GAME'; roundIndex?: number }
   | { type: 'NEXT_ROUND' }
   | { type: 'RESTART_MATCH' }
-  | { type: 'JUMP_TO_ROUND'; roundIndex: number }
+  | { type: 'JUMP_TO_ROUND'; roundIndex?: number; mapId?: number }
   | { type: 'SET_SIM_SPEED'; speed: 1 | 2 | 4 }
   | { type: 'UPDATE_SETTINGS'; settings: Partial<RoomSettings> }
   | { type: 'ADD_BOT'; difficulty?: 'NOVICE' | 'ARCHITECT' | 'GRANDMASTER' }

@@ -67,14 +67,16 @@ const HEAVY_CPU_ACTIONS = new Set([
 ]);
 
 // Non-bot Guild Pacesetter fallback (synced 1:1 with server/data/leaderboard.json)
-function createSeededLeaderboard(ROUNDS) {
+function createSeededLeaderboard(ROUNDS, classicCount = 8) {
   const now = Date.now();
   /** @type {Record<number, any[]>} */
   const roundRecords = {};
   const seedRoomCodes = ['CIT204', 'VALE09', 'STONE7', 'HIGH12', 'GUILD1'];
+  const seededMaps = ROUNDS.slice(0, classicCount);
 
-  for (const r of ROUNDS) {
-    roundRecords[r.roundNumber] = GUILD_PACESETTERS.map((pace, idx) => {
+  for (const r of seededMaps) {
+    const mapKey = r.mapId || r.roundNumber;
+    roundRecords[mapKey] = GUILD_PACESETTERS.map((pace, idx) => {
       const survivalTimeSeconds = Number(
         (r.parTimeSeconds * pace.mult).toFixed(2)
       );
@@ -85,8 +87,8 @@ function createSeededLeaderboard(ROUNDS) {
         ).toFixed(1)
       );
       return {
-        id: `seed_r${r.roundNumber}_${idx}`,
-        roundNumber: r.roundNumber,
+        id: `seed_r${mapKey}_${idx}`,
+        roundNumber: mapKey,
         roundTitle: r.title,
         runnerType: r.runnerType || 'SCOUT',
         playerName: pace.name,
@@ -95,30 +97,31 @@ function createSeededLeaderboard(ROUNDS) {
         survivalTimeSeconds,
         parTimeSeconds: r.parTimeSeconds,
         beatPar: survivalTimeSeconds >= r.parTimeSeconds,
-        clapsTaken: pace.claps + r.roundNumber * 2,
+        clapsTaken: Math.min(28, pace.claps + mapKey * 2),
         overchargedSpires: Math.min(
           r.spireCount * 3,
-          pace.overcharge + Math.floor(r.roundNumber / 2)
+          pace.overcharge + Math.floor(mapKey / 2)
         ),
-        linkedKeeps: Math.min(r.obstacleCount, pace.keeps + Math.floor(r.roundNumber / 3)),
+        linkedKeeps: Math.min(r.obstacleCount, pace.keeps + Math.floor(mapKey / 3)),
         pathDistance,
         goldMultiplier: 1.0,
-        roomCode: seedRoomCodes[(r.roundNumber + idx) % seedRoomCodes.length],
-        timestamp: now - (r.roundNumber * 2 + idx + 1) * 3600_000 * 3,
+        roomCode: seedRoomCodes[(mapKey + idx) % seedRoomCodes.length],
+        timestamp: now - (mapKey * 2 + idx + 1) * 3600_000 * 3,
       };
     });
   }
 
-  const topRound = ROUNDS[Math.max(0, ROUNDS.length - 1)];
-  const topRNum = topRound.roundNumber;
+  const topRound = seededMaps[Math.max(0, seededMaps.length - 1)] || ROUNDS[0];
+  const topRNum = topRound.mapId || topRound.roundNumber;
   const champions = GUILD_PACESETTERS.map((pace, idx) => {
     let bestSurvival = 0;
     let bestRoundNum = topRNum;
-    for (const r of ROUNDS) {
-      const rec = roundRecords[r.roundNumber]?.[idx];
+    for (const r of seededMaps) {
+      const mapKey = r.mapId || r.roundNumber;
+      const rec = roundRecords[mapKey]?.[idx];
       if (rec && rec.survivalTimeSeconds > bestSurvival) {
         bestSurvival = rec.survivalTimeSeconds;
-        bestRoundNum = r.roundNumber;
+        bestRoundNum = mapKey;
       }
     }
     return {
@@ -220,6 +223,10 @@ async function startServer() {
   const roundsMod = await vite.ssrLoadModule('/src/shared/rounds.ts');
   const {
     ROUNDS,
+    CLASSIC_ROUND_COUNT = 8,
+    DEFAULT_MATCH_ROUNDS = 8,
+    getMapById,
+    createShuffledMapDeck,
     generateRandomRoundLayout,
     generateDailyRoundConfig,
     getDailyDateKeyUtc,
@@ -254,7 +261,7 @@ async function startServer() {
   await storage.init();
 
   let leaderboard = await storage.loadLeaderboard(
-    createSeededLeaderboard(ROUNDS)
+    createSeededLeaderboard(ROUNDS, CLASSIC_ROUND_COUNT)
   );
 
   function saveLeaderboard() {
@@ -531,7 +538,7 @@ async function startServer() {
   function normalizeRoomSettings(partial = {}, fallbackCode = 'ARENA1') {
     const validTotalRounds = [3, 5, 8].includes(Number(partial.totalRounds))
       ? Number(partial.totalRounds)
-      : ROUNDS.length;
+      : DEFAULT_MATCH_ROUNDS;
     const validBuildTime = [0, 30, 45, 60, 80, 90, 120, 999].includes(
       Number(partial.buildTimeSeconds)
     )
@@ -644,6 +651,35 @@ async function startServer() {
     }
   }
 
+  function getMapIndexForRoundSlot(room, slotIndex) {
+    if (!Array.isArray(room._mapDeck) || room._mapDeck.length === 0) {
+      room._mapDeck = createShuffledMapDeck();
+    }
+    const safeSlot = Math.max(0, Math.floor(Number(slotIndex) || 0));
+    return room._mapDeck[safeSlot % room._mapDeck.length] ?? 0;
+  }
+
+  function getBaseMapForRoom(room) {
+    if (room?.roundConfig?.mapId && typeof getMapById === 'function') {
+      return getMapById(room.roundConfig.mapId);
+    }
+    const idx = getMapIndexForRoundSlot(room, room?.currentRoundIndex || 0);
+    return ROUNDS[idx] || ROUNDS[0];
+  }
+
+  function reshuffleRoomMapDeck(room, avoidCurrentMatch = true) {
+    if (!room || room.mode === 'DAILY') return;
+    const totalMatchRounds = Math.max(
+      1,
+      Number(room.settings?.totalRounds) || DEFAULT_MATCH_ROUNDS
+    );
+    const playedIndices =
+      avoidCurrentMatch && Array.isArray(room._mapDeck)
+        ? room._mapDeck.slice(0, totalMatchRounds)
+        : [];
+    room._mapDeck = createShuffledMapDeck(playedIndices);
+  }
+
   function createRoom(roomCode, customSettings, options = {}) {
     const mode =
       options.mode === 'DAILY' || options.mode === 'SOLO'
@@ -675,18 +711,38 @@ async function startServer() {
       code
     );
 
-    const round0 =
-      mode === 'DAILY' && options.dailyRoundConfig
-        ? cloneRoundConfig(options.dailyRoundConfig)
-        : generateRandomRoundLayout(ROUNDS[0]);
+    const mapDeck = mode === 'DAILY' ? [0] : createShuffledMapDeck();
+    const firstBaseMap = ROUNDS[mapDeck[0]] || ROUNDS[0];
+
+    let round0;
+    if (mode === 'DAILY' && options.dailyRoundConfig) {
+      round0 = cloneRoundConfig(options.dailyRoundConfig);
+    } else {
+      round0 = generateRandomRoundLayout(firstBaseMap);
+      round0.roundNumber = 1;
+      round0.mapId = firstBaseMap.mapId ?? firstBaseMap.roundNumber;
+      const goldMult = Number(settings.goldMultiplier) || 1.0;
+      round0.startingGold = Math.max(
+        25,
+        Math.round((firstBaseMap.startingGold * goldMult) / 5) * 5
+      );
+      round0.parTimeSeconds = computeEffectivePar(
+        firstBaseMap.parTimeSeconds,
+        goldMult
+      );
+      round0.buildTimeSeconds = computeRoundBuildSeconds(
+        firstBaseMap,
+        settings
+      );
+    }
 
     const usedColors = new Set([PLAYER_COLORS[0]]);
     const usedNames = new Set();
     const initialBots = [];
     for (let i = 0; i < settings.botCount; i++) {
-      initialBots.push(
-        createBotPlayer(i, usedColors, settings.botDifficulty, usedNames)
-      );
+      const bot = createBotPlayer(i, usedColors, settings.botDifficulty, usedNames);
+      bot.gold = round0.startingGold;
+      initialBots.push(bot);
     }
 
     const room = {
@@ -695,6 +751,7 @@ async function startServer() {
       dailyDateKey: options.dailyDateKey,
       dailyPuzzleNumber: options.dailyPuzzleNumber,
       _dailyClientId: options.dailyClientId,
+      _mapDeck: mapDeck,
       phase: startInLobby ? 'LOBBY' : 'PLANNING',
       settings,
       currentRoundIndex: 0,
@@ -710,10 +767,10 @@ async function startServer() {
           senderName: '',
           senderColor: '#38bdf8',
           text: startInLobby
-            ? `Lobby ${code} created. Share the room code and click Ready when set.`
+            ? `Lobby ${code} created (${settings.totalRounds} randomized maps). Share the room code and click Ready when set.`
             : mode === 'DAILY'
             ? `Daily Maze #${options.dailyPuzzleNumber || 1} — 5s planning, then 120s to build your best maze.`
-            : `Match started. Plan your route during the 5s countdown, then build!`,
+            : `Match started with ${settings.totalRounds} randomized maps. Plan your route during the 5s countdown, then build!`,
           timestamp: Date.now(),
           isSystem: true,
         },
@@ -864,6 +921,12 @@ async function startServer() {
       settings: room.settings,
       currentRoundIndex: room.currentRoundIndex,
       roundsCompleted: room.roundsCompleted || 0,
+      matchMapIds:
+        room.mode === 'DAILY'
+          ? [room.roundConfig.mapId || 1]
+          : (room._mapDeck || [])
+              .slice(0, room.settings.totalRounds || DEFAULT_MATCH_ROUNDS)
+              .map((idx) => ROUNDS[idx]?.mapId ?? idx + 1),
       roundConfig: room.roundConfig,
       phaseTimeRemaining: Math.max(0, Math.ceil(room.phaseTimeRemaining)),
       runElapsed:
@@ -1014,9 +1077,13 @@ async function startServer() {
     options = {}
   ) {
     const isDaily = room.mode === 'DAILY';
+    const totalMatchRounds = Math.max(
+      1,
+      Number(room.settings?.totalRounds) || DEFAULT_MATCH_ROUNDS
+    );
     const clampedIdx = isDaily
       ? 0
-      : Math.max(0, Math.min(ROUNDS.length - 1, Number(roundIndex) || 0));
+      : Math.max(0, Math.min(totalMatchRounds - 1, Number(roundIndex) || 0));
 
     let round;
     if (isDaily) {
@@ -1028,8 +1095,11 @@ async function startServer() {
       round = cloneRoundConfig(dailyInfo.roundConfig);
       round.buildTimeSeconds = DAILY_BUILD_TIME_SECONDS || 120;
     } else {
-      const baseRound = ROUNDS[clampedIdx];
+      const mapIdx = getMapIndexForRoundSlot(room, clampedIdx);
+      const baseRound = ROUNDS[mapIdx] || ROUNDS[0];
       round = generateRandomRoundLayout(baseRound);
+      round.roundNumber = clampedIdx + 1;
+      round.mapId = baseRound.mapId ?? baseRound.roundNumber;
 
       const goldMult = Number(room.settings.goldMultiplier) || 1.0;
       round.startingGold = Math.max(
@@ -1099,7 +1169,7 @@ async function startServer() {
         room,
         isDaily
           ? `${round.title} · ${wallsCount} walls · 120s build · Par ${formatParLabel(round.parTimeSeconds)}`
-          : `Round ${round.roundNumber}: ${round.title} · ${wallsCount} walls · Par ${formatParLabel(round.parTimeSeconds)}`
+          : `Round ${round.roundNumber}/${totalMatchRounds}: ${round.title} (Map #${round.mapId || round.roundNumber}) · ${wallsCount} walls · Par ${formatParLabel(round.parTimeSeconds)}`
       );
       broadcastRoomState(room, true);
     }
@@ -1151,7 +1221,7 @@ async function startServer() {
 
   function recordRoundToLeaderboard(room, rankedPlayers) {
     const round = room.roundConfig;
-    const rNum = round.roundNumber;
+    const rNum = round.mapId || round.roundNumber;
     if (!leaderboard.roundRecords[rNum]) {
       leaderboard.roundRecords[rNum] = [];
     }
@@ -1439,7 +1509,7 @@ async function startServer() {
     if (newRecordHolders.length > 0) {
       addSystemChat(
         room,
-        `New Top 5 Leaderboard record on Round ${room.roundConfig.roundNumber}: ${newRecordHolders.join(', ')}.`
+        `New Top 5 Leaderboard record on ${room.roundConfig.title}: ${newRecordHolders.join(', ')}.`
       );
     }
 
@@ -1883,11 +1953,12 @@ async function startServer() {
       room.phase === 'GAME_OVER' ||
       (room.roundsCompleted || 0) >= room.settings.totalRounds
     ) {
+      reshuffleRoomMapDeck(room, true);
       resetMatchStandingFields(room);
       room._roundTouched = true;
       prepareRoundForRoom(room, 0, true);
     } else {
-      const nextIdx = (room.currentRoundIndex + 1) % ROUNDS.length;
+      const nextIdx = room.currentRoundIndex + 1;
       prepareRoundForRoom(room, nextIdx, true);
     }
   }
@@ -2793,6 +2864,28 @@ async function startServer() {
           currentRoom._rerollsThisRound =
             (currentRoom._rerollsThisRound || 0) + 1;
           markArenaTouched(currentRoom, currentPlayer);
+          // Swap in a fresh unused random map from the 58-map pool for this round slot
+          if (Array.isArray(currentRoom._mapDeck) && currentRoom._mapDeck.length > 1) {
+            const totalMatchRounds = Math.max(
+              1,
+              Number(currentRoom.settings?.totalRounds) || DEFAULT_MATCH_ROUNDS
+            );
+            const reserveStart = Math.min(
+              currentRoom._mapDeck.length - 1,
+              totalMatchRounds
+            );
+            const reserveSpan = currentRoom._mapDeck.length - reserveStart;
+            const pickOffset =
+              reserveSpan > 0
+                ? reserveStart + Math.floor(Math.random() * reserveSpan)
+                : (currentRoom.currentRoundIndex + 1) % currentRoom._mapDeck.length;
+            const slotIdx = currentRoom.currentRoundIndex % currentRoom._mapDeck.length;
+            if (pickOffset !== slotIdx) {
+              const tmp = currentRoom._mapDeck[slotIdx];
+              currentRoom._mapDeck[slotIdx] = currentRoom._mapDeck[pickOffset];
+              currentRoom._mapDeck[pickOffset] = tmp;
+            }
+          }
           prepareRoundForRoom(currentRoom, currentRoom.currentRoundIndex, true, {
             preserveRerollCount: true,
           });
@@ -2941,11 +3034,12 @@ async function startServer() {
             return;
           }
 
+          reshuffleRoomMapDeck(currentRoom, true);
           resetMatchStandingFields(currentRoom);
           markArenaTouched(currentRoom, currentPlayer);
           addSystemChat(
             currentRoom,
-            `${currentPlayer.name} restarted the match from Round 1.`
+            `${currentPlayer.name} restarted the match with fresh randomized maps.`
           );
           prepareRoundForRoom(currentRoom, 0, true);
           break;
@@ -2973,7 +3067,21 @@ async function startServer() {
             );
             return;
           }
-          if (
+          if (Number.isInteger(msg.mapId)) {
+            const targetMapIdx = ROUNDS.findIndex(
+              (r) => (r.mapId ?? r.roundNumber) === msg.mapId
+            );
+            if (targetMapIdx !== -1) {
+              // Pin selected map to Round 1 and shuffle all remaining maps behind it
+              const rest = createShuffledMapDeck([targetMapIdx]).filter(
+                (idx) => idx !== targetMapIdx
+              );
+              currentRoom._mapDeck = [targetMapIdx, ...rest];
+              resetMatchStandingFields(currentRoom);
+              markArenaTouched(currentRoom, currentPlayer);
+              prepareRoundForRoom(currentRoom, 0, true);
+            }
+          } else if (
             typeof msg.roundIndex === 'number' &&
             !Number.isNaN(msg.roundIndex)
           ) {
@@ -3043,7 +3151,7 @@ async function startServer() {
 
           // Update round startingGold & Par BEFORE syncRoomBots so bots regenerate at most ONCE
           if (isBuildPhase) {
-            const baseRound = ROUNDS[currentRoom.currentRoundIndex];
+            const baseRound = getBaseMapForRoom(currentRoom);
             if (goldChanged) {
               const newGold = Math.max(
                 25,

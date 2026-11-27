@@ -208,8 +208,34 @@
             <div class="popover-divider"></div>
 
             <div class="dropdown-header" id="round-switcher-header">
-              <span>Switch Round</span>
+              <div class="round-switcher-tabs" id="round-switcher-tabs">
+                <button
+                  type="button"
+                  class="round-tab-btn active"
+                  data-round-tab="match"
+                >
+                  Match
+                </button>
+                <button
+                  type="button"
+                  class="round-tab-btn"
+                  data-round-tab="catalog"
+                >
+                  All 58 Maps
+                </button>
+              </div>
               <span class="dropdown-subtle-note">Host · Resets current walls</span>
+            </div>
+            <div id="round-map-search-wrap" class="round-map-search-wrap hidden">
+              <input
+                id="round-map-search"
+                type="search"
+                class="round-map-search"
+                placeholder="Search 58 maps (name, runner, waystone)…"
+                aria-label="Filter maps"
+                autocomplete="off"
+                spellcheck="false"
+              />
             </div>
             <div id="round-pills" class="round-pills-grid"></div>
           </div>
@@ -1148,7 +1174,7 @@
 
             <div class="solo-setup-footer">
               <p class="setup-note">
-                Every round begins with a <strong>5-second planning timer</strong> so you can check the map before building.
+                Every match draws <strong>randomized maps from 58 arenas</strong>, with a <strong>5-second planning timer</strong> before every round.
               </p>
               <button
                 type="button"
@@ -2084,7 +2110,7 @@
                     <h4>Gold Waystone (Checkpoint)</h4>
                   </div>
                   <p>
-                    A mandatory pit-stop! On rounds with a Gold Waystone, the runner <strong>must touch it first</strong> before heading to the Bottom Gate.
+                    A mandatory pit-stop! On maps with 1 or 2 Gold Waystones, the runner <strong>must touch each one in order</strong> before heading to the South Shrine.
                   </p>
                 </div>
               </div>
@@ -2392,7 +2418,7 @@
                 class="seg-btn active"
                 data-lb-mode="rounds"
               >
-                Round Records
+                Map Records
               </button>
               <button
                 type="button"
@@ -2403,7 +2429,31 @@
               </button>
             </div>
 
-            <div id="leaderboard-round-pills" class="lb-round-pills"></div>
+            <div id="leaderboard-map-picker" class="lb-map-picker">
+              <button
+                type="button"
+                id="btn-lb-prev-map"
+                class="lb-map-step-btn"
+                title="Previous Map"
+                aria-label="Previous Map"
+              >
+                <span class="icon-slot" data-icon="arrowLeft" data-icon-size="14"></span>
+              </button>
+              <select
+                id="leaderboard-map-select"
+                class="lb-map-select"
+                aria-label="Select Map Leaderboard"
+              ></select>
+              <button
+                type="button"
+                id="btn-lb-next-map"
+                class="lb-map-step-btn"
+                title="Next Map"
+                aria-label="Next Map"
+              >
+                <span class="icon-slot" data-icon="arrowRight" data-icon-size="14"></span>
+              </button>
+            </div>
           </div>
 
           <div id="leaderboard-round-meta" class="leaderboard-round-meta"></div>

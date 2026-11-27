@@ -5045,7 +5045,7 @@ export class Arena3DRenderer {
     const wgStr = round.waygate
       ? `${round.waygate.entry.x},${round.waygate.entry.y}>${round.waygate.exit.x},${round.waygate.exit.y}`
       : '';
-    return `${round.roundNumber}|${round.seed ?? 0}|${round.spawn.x},${round.spawn.y}|${round.exit.x},${round.exit.y}|${round.runnerType || 'SCOUT'}|${sStr}|${oStr}|cp:${cpStr}|wg:${wgStr}`;
+    return `${round.roundNumber}|m${round.mapId ?? round.roundNumber}|${round.seed ?? 0}|${round.spawn.x},${round.spawn.y}|${round.exit.x},${round.exit.y}|${round.runnerType || 'SCOUT'}|${sStr}|${oStr}|cp:${cpStr}|wg:${wgStr}`;
   }
 
   /** Re-lays out island offsets when the Overview column count flips (portrait <-> landscape). */

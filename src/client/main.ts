@@ -4,7 +4,9 @@ import {
 } from '../shared/pathfinding.js';
 import {
   computeEffectivePar,
+  DEFAULT_MATCH_ROUNDS,
   generateRandomRoundLayout,
+  getMapById,
   ROUNDS,
 } from '../shared/rounds.js';
 import { MazeRunnerSimulator, SIM_DT } from '../shared/simulation.js';
@@ -223,6 +225,9 @@ class MazingContestClient {
   private activeMenuScreen: MenuScreen = 'home';
   private leaderboardMode: 'rounds' | 'champions' = 'rounds';
   private selectedLeaderboardRound = 1;
+  private roundSwitcherTab: 'match' | 'catalog' = 'match';
+  private roundMapSearchQuery = '';
+  private lastMatchMapSignature = '';
   private dailyCountdownInterval: number | null = null;
   private lastPlanningTickSec = -1;
   private lobbyRulesEditorOpen = false;
@@ -1117,8 +1122,8 @@ class MazingContestClient {
     document.body.dataset.mode = state.mode || 'ONLINE';
 
     const undoSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
-      state.roundConfig.seed ?? ''
-    }`;
+      state.roundConfig.mapId ?? ''
+    }|${state.roundConfig.seed ?? ''}`;
     if (state.phase !== 'BUILD' || undoSig !== this.lastUndoRoundSignature) {
       this.undoStack = [];
       this.redoStack = [];
@@ -1197,8 +1202,8 @@ class MazingContestClient {
         this.renderer3d.resetToMyIsland();
       }
       const briefSig = `${state.roomCode}|${state.roundConfig.roundNumber}|${
-        state.roundConfig.seed ?? ''
-      }`;
+        state.roundConfig.mapId ?? ''
+      }|${state.roundConfig.seed ?? ''}`;
       if (briefSig !== this.lastBriefRoundSignature) {
         this.lastBriefRoundSignature = briefSig;
         this.triggerRoundBriefBanner();
@@ -2744,7 +2749,11 @@ class MazingContestClient {
 
   private renderMenuBackdropIsland() {
     if (this.roomState) return;
-    const previewRound = generateRandomRoundLayout(ROUNDS[0], 20261126);
+    const randomMap =
+      ROUNDS[Math.floor(Math.random() * ROUNDS.length)] || ROUNDS[0];
+    const previewRound = generateRandomRoundLayout(randomMap);
+    previewRound.roundNumber = 1;
+    previewRound.mapId = randomMap.mapId ?? randomMap.roundNumber;
     const previewState: RoomState = {
       roomCode: 'PREVIEW',
       mode: 'SOLO',
@@ -3523,6 +3532,7 @@ class MazingContestClient {
           : 'Round Default (90s–120s)';
       rulesSummary.innerHTML = `
         <div class="lobby-rule-chip"><strong>Rounds:</strong> ${s.totalRounds}</div>
+        <div class="lobby-rule-chip"><strong>Maps:</strong> Randomized (${ROUNDS.length} pool)</div>
         <div class="lobby-rule-chip"><strong>Build Timer:</strong> ${timerLabel}</div>
         <div class="lobby-rule-chip"><strong>Wall Supply:</strong> ${formatWallSupplyLabel(
           s.goldMultiplier
@@ -3691,6 +3701,7 @@ class MazingContestClient {
         soundEngine.playUiClick();
         if (this.roomState) {
           this.selectedLeaderboardRound =
+            this.roomState.roundConfig.mapId ||
             this.roomState.roundConfig.roundNumber;
           this.leaderboardMode = 'rounds';
         }
@@ -4322,34 +4333,72 @@ class MazingContestClient {
   }
 
   private renderLeaderboardRoundPills() {
-    const container = document.getElementById('leaderboard-round-pills');
-    if (!container) return;
-    container.innerHTML = '';
+    const select = document.getElementById(
+      'leaderboard-map-select'
+    ) as HTMLSelectElement | null;
+    if (!select) return;
 
-    for (const r of ROUNDS) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      const arch = RUNNER_ARCHETYPES[r.runnerType || 'SCOUT'];
-      btn.className = `lb-round-pill${
-        r.roundNumber === this.selectedLeaderboardRound ? ' active' : ''
-      }`;
-      btn.dataset.rnum = String(r.roundNumber);
-      btn.innerHTML = `<span>R${r.roundNumber}</span>${getRunnerIcon(
-        r.runnerType || 'SCOUT',
-        13
-      )}`;
-      btn.title = `Round ${r.roundNumber}: ${r.title} (${arch.name})`;
-      btn.addEventListener('click', () => {
+    const prevMapBtn = document.getElementById('btn-lb-prev-map');
+    const nextMapBtn = document.getElementById('btn-lb-next-map');
+
+    const populateOptions = () => {
+      select.innerHTML = '';
+      for (const r of ROUNDS) {
+        const mapId = r.mapId ?? r.roundNumber;
+        const arch = RUNNER_ARCHETYPES[r.runnerType || 'SCOUT'];
+        const hasRecs =
+          (this.leaderboard?.roundRecords?.[mapId]?.length || 0) > 0;
+        const opt = document.createElement('option');
+        opt.value = String(mapId);
+        opt.textContent = `#${mapId} · ${r.title} (${arch.name.replace(
+          /^(Citadel|Royal|Iron|Wind)\s+/i,
+          ''
+        )})${hasRecs ? ' ★' : ''}`;
+        select.appendChild(opt);
+      }
+      select.value = String(this.selectedLeaderboardRound);
+    };
+
+    populateOptions();
+
+    if (!select.dataset.wired) {
+      select.dataset.wired = 'true';
+      select.addEventListener('change', () => {
         soundEngine.playUiClick();
-        this.selectedLeaderboardRound = r.roundNumber;
+        const nextId = Number(select.value) || 1;
+        this.selectedLeaderboardRound = nextId;
         this.renderLeaderboard();
       });
-      container.appendChild(btn);
+
+      prevMapBtn?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        const curIdx = ROUNDS.findIndex(
+          (r) => (r.mapId ?? r.roundNumber) === this.selectedLeaderboardRound
+        );
+        const nextIdx = (curIdx <= 0 ? ROUNDS.length - 1 : curIdx - 1);
+        this.selectedLeaderboardRound =
+          ROUNDS[nextIdx].mapId ?? ROUNDS[nextIdx].roundNumber;
+        this.renderLeaderboard();
+      });
+
+      nextMapBtn?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        const curIdx = ROUNDS.findIndex(
+          (r) => (r.mapId ?? r.roundNumber) === this.selectedLeaderboardRound
+        );
+        const nextIdx = (curIdx + 1) % ROUNDS.length;
+        this.selectedLeaderboardRound =
+          ROUNDS[nextIdx].mapId ?? ROUNDS[nextIdx].roundNumber;
+        this.renderLeaderboard();
+      });
     }
   }
 
   private renderLeaderboard() {
-    const pillsWrap = document.getElementById('leaderboard-round-pills');
+    const pickerWrap = document.getElementById('leaderboard-map-picker');
+    const mapSelect = document.getElementById(
+      'leaderboard-map-select'
+    ) as HTMLSelectElement | null;
     const metaEl = document.getElementById('leaderboard-round-meta');
     const tableWrap = document.getElementById('leaderboard-table-wrap');
     if (!tableWrap || !metaEl) return;
@@ -4361,14 +4410,10 @@ class MazingContestClient {
         btn.classList.toggle('active', btn.dataset.lbMode === this.leaderboardMode);
       });
 
-    pillsWrap
-      ?.querySelectorAll<HTMLButtonElement>('.lb-round-pill')
-      .forEach((btn) => {
-        btn.classList.toggle(
-          'active',
-          Number(btn.dataset.rnum) === this.selectedLeaderboardRound
-        );
-      });
+    if (mapSelect) {
+      this.renderLeaderboardRoundPills();
+      mapSelect.value = String(this.selectedLeaderboardRound);
+    }
 
     if (!this.leaderboard) {
       tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">Loading leaderboard...</div>`;
@@ -4379,17 +4424,14 @@ class MazingContestClient {
     const myLower = this.playerName.trim().toLowerCase();
 
     if (this.leaderboardMode === 'rounds') {
-      pillsWrap?.classList.remove('hidden');
-      const roundCfg =
-        ROUNDS.find((r) => r.roundNumber === this.selectedLeaderboardRound) ||
-        ROUNDS[0];
+      pickerWrap?.classList.remove('hidden');
+      const roundCfg = getMapById(this.selectedLeaderboardRound);
+      const mapId = roundCfg.mapId ?? roundCfg.roundNumber;
       const arch = RUNNER_ARCHETYPES[roundCfg.runnerType || 'SCOUT'];
 
       metaEl.innerHTML = `
         <div class="lb-meta-main">
-          <strong>Round ${roundCfg.roundNumber} · ${escapeHtml(
-        roundCfg.title
-      )}</strong>
+          <strong>Map #${mapId} · ${escapeHtml(roundCfg.title)}</strong>
           <span class="lb-meta-trait">${getRunnerIcon(
             roundCfg.runnerType || 'SCOUT',
             14
@@ -4401,10 +4443,11 @@ class MazingContestClient {
         </div>
       `;
 
-      const records =
-        this.leaderboard.roundRecords[this.selectedLeaderboardRound] || [];
+      const records = this.leaderboard.roundRecords[mapId] || [];
       if (records.length === 0) {
-        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No survival records yet for Round ${this.selectedLeaderboardRound}. Complete a run to set the first record.</div>`;
+        tableWrap.innerHTML = `<div style="color:var(--text-secondary);font-size:12.5px;padding:14px">No survival records yet for Map #${mapId} (${escapeHtml(
+          roundCfg.title
+        )}). Complete a run to set the first record.</div>`;
         return;
       }
 
@@ -4469,7 +4512,7 @@ class MazingContestClient {
         tableWrap.appendChild(row);
       });
     } else {
-      pillsWrap?.classList.add('hidden');
+      pickerWrap?.classList.add('hidden');
       metaEl.innerHTML = `
         <div class="lb-meta-main">
           ${icon('crown', 16)}
@@ -4507,6 +4550,7 @@ class MazingContestClient {
             ? getMedalBadge((idx + 1) as 1 | 2 | 3, 22)
             : `<span>#${idx + 1}</span>`;
         const youBadge = isMe ? `<span class="you-badge">You</span>` : '';
+        const bestMap = getMapById(c.bestRoundNumber);
 
         row.innerHTML = `
           <div class="lb-rank">${rankBadge}</div>
@@ -4529,8 +4573,8 @@ class MazingContestClient {
         } Par</span>
             <span class="stat-chip">${c.roundsPlayed} Rounds</span>
           </div>
-          <div class="lb-meta-right">
-            ${c.bestSurvivalTime.toFixed(1)}s · R${c.bestRoundNumber}
+          <div class="lb-meta-right" title="${escapeHtml(bestMap.title)}">
+            ${c.bestSurvivalTime.toFixed(1)}s · #${c.bestRoundNumber}
           </div>
         `;
         tableWrap.appendChild(row);
@@ -4620,7 +4664,39 @@ class MazingContestClient {
         roundDropdown.classList.remove('hidden');
         roundPickerBtn.classList.add('active');
         roundPickerBtn.setAttribute('aria-expanded', 'true');
+        this.renderRoundSelectorPills();
       }
+    });
+
+    document
+      .querySelectorAll<HTMLButtonElement>('#round-switcher-tabs .round-tab-btn')
+      .forEach((tabBtn) => {
+        tabBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          soundEngine.playUiClick();
+          const nextTab =
+            tabBtn.dataset.roundTab === 'catalog' ? 'catalog' : 'match';
+          this.roundSwitcherTab = nextTab;
+          document
+            .querySelectorAll<HTMLButtonElement>(
+              '#round-switcher-tabs .round-tab-btn'
+            )
+            .forEach((b) =>
+              b.classList.toggle('active', b.dataset.roundTab === nextTab)
+            );
+          document
+            .getElementById('round-map-search-wrap')
+            ?.classList.toggle('hidden', nextTab !== 'catalog');
+          this.renderRoundSelectorPills();
+        });
+      });
+
+    const roundSearchInput = document.getElementById(
+      'round-map-search'
+    ) as HTMLInputElement | null;
+    roundSearchInput?.addEventListener('input', () => {
+      this.roundMapSearchQuery = roundSearchInput.value.trim().toLowerCase();
+      this.renderRoundSelectorPills();
     });
 
     // Room & Chat Slide-Over Drawer / Mobile Sheet
@@ -5283,17 +5359,132 @@ class MazingContestClient {
   }
 
   private renderRoundSelectorPills() {
-    const container = document.getElementById('round-pills')!;
+    const container = document.getElementById('round-pills');
+    if (!container) return;
     container.innerHTML = '';
 
-    ROUNDS.forEach((r, idx) => {
+    const canSwitchRounds = this.canControlRoomRules();
+    const activeRoundIdx = this.roomState?.currentRoundIndex ?? 0;
+    const activeMapId =
+      this.roomState?.roundConfig?.mapId ??
+      this.roomState?.roundConfig?.roundNumber ??
+      1;
+    const totalMatchRounds =
+      this.roomState?.settings?.totalRounds || DEFAULT_MATCH_ROUNDS;
+
+    const matchTabBtn = document.querySelector<HTMLButtonElement>(
+      '#round-switcher-tabs .round-tab-btn[data-round-tab="match"]'
+    );
+    if (matchTabBtn) {
+      matchTabBtn.textContent = `Match (${totalMatchRounds})`;
+    }
+    const catalogTabBtn = document.querySelector<HTMLButtonElement>(
+      '#round-switcher-tabs .round-tab-btn[data-round-tab="catalog"]'
+    );
+    if (catalogTabBtn) {
+      catalogTabBtn.textContent = `All ${ROUNDS.length} Maps`;
+    }
+
+    const closeRoundDropdown = () => {
+      document.getElementById('round-dropdown')?.classList.add('hidden');
+      const pickerBtn = document.getElementById('btn-round-picker');
+      pickerBtn?.classList.remove('active');
+      pickerBtn?.setAttribute('aria-expanded', 'false');
+    };
+
+    if (this.roundSwitcherTab === 'match') {
+      const matchIds =
+        this.roomState?.matchMapIds && this.roomState.matchMapIds.length > 0
+          ? this.roomState.matchMapIds
+          : ROUNDS.slice(0, totalMatchRounds).map(
+              (r) => r.mapId ?? r.roundNumber
+            );
+
+      matchIds.forEach((mapId, idx) => {
+        const r = getMapById(mapId);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        const isActive = idx === activeRoundIdx;
+        btn.className = `round-pill-btn${isActive ? ' active' : ''}${
+          !canSwitchRounds && !isActive ? ' disabled' : ''
+        }`;
+        btn.dataset.roundIdx = String(idx);
+        btn.setAttribute('aria-disabled', String(!canSwitchRounds && !isActive));
+        const arch = RUNNER_ARCHETYPES[r.runnerType || 'SCOUT'];
+        btn.innerHTML = `
+          <span class="r-left">
+            <span class="r-num">R${idx + 1}</span>
+            <span class="r-title">${escapeHtml(r.title)}</span>
+          </span>
+          <span class="r-arch" title="${escapeHtml(arch.name)}">${getRunnerIcon(
+            r.runnerType || 'SCOUT',
+            14
+          )}</span>
+        `;
+        btn.title = `Round ${idx + 1} · Map #${mapId}: ${r.title} (${arch.name} · ${r.subtitle})`;
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (this.roomState?.currentRoundIndex === idx) {
+            closeRoundDropdown();
+            return;
+          }
+          if (!this.canControlRoomRules()) {
+            this.showToast('Only the room host can switch rounds.');
+            return;
+          }
+          const me = this.getLocalPlayer();
+          const hasWalls = Boolean(
+            this.roomState?.phase === 'BUILD' && me && me.towers.length > 0
+          );
+          this.armDestructiveButton(
+            btn,
+            hasWalls,
+            `Switch to R${idx + 1}?`,
+            'arrowRight',
+            () => {
+              this.send({ type: 'JUMP_TO_ROUND', roundIndex: idx });
+              closeRoundDropdown();
+            }
+          );
+        });
+        container.appendChild(btn);
+      });
+      return;
+    }
+
+    // All 58 Maps catalog browser
+    const query = this.roundMapSearchQuery;
+    const filtered = query
+      ? ROUNDS.filter((r) => {
+          const id = r.mapId ?? r.roundNumber;
+          const arch = RUNNER_ARCHETYPES[r.runnerType || 'SCOUT'];
+          const hay = `#${id} ${r.title} ${r.subtitle} ${arch.name}`.toLowerCase();
+          return hay.includes(query);
+        })
+      : ROUNDS;
+
+    if (filtered.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'round-pills-empty';
+      empty.textContent = 'No maps match that filter.';
+      container.appendChild(empty);
+      return;
+    }
+
+    filtered.forEach((r) => {
+      const mapId = r.mapId ?? r.roundNumber;
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'round-pill-btn';
+      const isActive = mapId === activeMapId;
+      btn.className = `round-pill-btn${isActive ? ' active' : ''}${
+        !canSwitchRounds && !isActive ? ' disabled' : ''
+      }`;
+      btn.dataset.mapId = String(mapId);
+      btn.setAttribute('aria-disabled', String(!canSwitchRounds && !isActive));
       const arch = RUNNER_ARCHETYPES[r.runnerType || 'SCOUT'];
       btn.innerHTML = `
         <span class="r-left">
-          <span class="r-num">R${r.roundNumber}</span>
+          <span class="r-num">#${mapId}</span>
           <span class="r-title">${escapeHtml(r.title)}</span>
         </span>
         <span class="r-arch" title="${escapeHtml(arch.name)}">${getRunnerIcon(
@@ -5301,15 +5492,18 @@ class MazingContestClient {
           14
         )}</span>
       `;
-      btn.title = `${r.title} (${arch.name}: ${arch.traitSummary})`;
+      btn.title = `Map #${mapId}: ${r.title} (${r.subtitle} · Par ${r.parTimeSeconds}s+)`;
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (this.roomState?.currentRoundIndex === idx) {
-          document.getElementById('round-dropdown')?.classList.add('hidden');
+        if (
+          (this.roomState?.roundConfig?.mapId ??
+            this.roomState?.roundConfig?.roundNumber) === mapId
+        ) {
+          closeRoundDropdown();
           return;
         }
         if (!this.canControlRoomRules()) {
-          this.showToast('Only the room host can switch rounds.');
+          this.showToast('Only the room host can switch maps.');
           return;
         }
         const me = this.getLocalPlayer();
@@ -5319,11 +5513,11 @@ class MazingContestClient {
         this.armDestructiveButton(
           btn,
           hasWalls,
-          `Switch to R${r.roundNumber}?`,
+          `Load #${mapId}?`,
           'arrowRight',
           () => {
-            this.send({ type: 'JUMP_TO_ROUND', roundIndex: idx });
-            document.getElementById('round-dropdown')?.classList.add('hidden');
+            this.send({ type: 'JUMP_TO_ROUND', mapId });
+            closeRoundDropdown();
           }
         );
       });
@@ -5340,8 +5534,10 @@ class MazingContestClient {
     const round = this.roomState.roundConfig;
     const archKey = round.runnerType || 'SCOUT';
     const arch = RUNNER_ARCHETYPES[archKey];
-    const totalRounds = this.roomState.settings?.totalRounds || ROUNDS.length;
+    const totalRounds =
+      this.roomState.settings?.totalRounds || DEFAULT_MATCH_ROUNDS;
     const effectivePar = round.parTimeSeconds;
+    const mapId = round.mapId ?? round.roundNumber;
 
     const isDaily = this.roomState.mode === 'DAILY';
     document.getElementById('round-code-label')!.textContent = isDaily
@@ -5352,7 +5548,7 @@ class MazingContestClient {
       : round.title;
     document.getElementById('btn-round-picker')!.title = isDaily
       ? `${round.title} · ${arch.name} (${arch.traitSummary})`
-      : `Round ${round.roundNumber}: ${round.title} · ${arch.name} (${arch.traitSummary})`;
+      : `Round ${round.roundNumber} · Map #${mapId}/${ROUNDS.length}: ${round.title} · ${arch.name} (${arch.traitSummary})`;
 
     const runnerBadge = document.getElementById('round-runner-badge');
     if (runnerBadge) {
@@ -5363,7 +5559,9 @@ class MazingContestClient {
     // Populate Round Inspect Header inside #round-dropdown
     const inspectTitle = document.getElementById('round-inspect-title');
     if (inspectTitle) {
-      inspectTitle.textContent = `Round ${round.roundNumber} · ${round.title}`;
+      inspectTitle.textContent = isDaily
+        ? round.title
+        : `Round ${round.roundNumber} · ${round.title} (Map #${mapId})`;
     }
     const inspectRunner = document.getElementById('round-inspect-runner');
     if (inspectRunner) {
@@ -5515,18 +5713,28 @@ class MazingContestClient {
     }
 
     const canSwitchRounds = this.canControlRoomRules();
-    document
-      .querySelectorAll<HTMLButtonElement>('.round-pill-btn')
-      .forEach((btn, idx) => {
-        const isActive = idx === this.roomState?.currentRoundIndex;
-        btn.classList.toggle('active', isActive);
-        // Guests can inspect rounds but only the host can switch them
-        btn.classList.toggle('disabled', !canSwitchRounds && !isActive);
-        btn.setAttribute(
-          'aria-disabled',
-          String(!canSwitchRounds && !isActive)
-        );
-      });
+    const matchSig = `${(this.roomState.matchMapIds || []).join(',')}|${
+      this.roomState.currentRoundIndex
+    }|${mapId}|${canSwitchRounds}`;
+    if (matchSig !== this.lastMatchMapSignature) {
+      this.lastMatchMapSignature = matchSig;
+      this.renderRoundSelectorPills();
+    } else {
+      document
+        .querySelectorAll<HTMLButtonElement>('.round-pill-btn')
+        .forEach((btn) => {
+          const isActive =
+            this.roundSwitcherTab === 'match'
+              ? Number(btn.dataset.roundIdx) === this.roomState?.currentRoundIndex
+              : Number(btn.dataset.mapId) === mapId;
+          btn.classList.toggle('active', isActive);
+          btn.classList.toggle('disabled', !canSwitchRounds && !isActive);
+          btn.setAttribute(
+            'aria-disabled',
+            String(!canSwitchRounds && !isActive)
+          );
+        });
+    }
     const switcherNote = document.querySelector<HTMLElement>(
       '#round-switcher-header .dropdown-subtle-note'
     );
@@ -5858,7 +6066,7 @@ class MazingContestClient {
     const isDaily = state.mode === 'DAILY';
     const isGameOver = state.phase === 'GAME_OVER';
     const roundsDone = state.roundsCompleted || round.roundNumber;
-    const totalRounds = state.settings?.totalRounds || ROUNDS.length;
+    const totalRounds = state.settings?.totalRounds || DEFAULT_MATCH_ROUNDS;
     const parTarget =
       round.parTimeSeconds ||
       computeEffectivePar(28, state.settings?.goldMultiplier);
@@ -5995,9 +6203,9 @@ class MazingContestClient {
       recordCallout.innerHTML = `${icon(
         'trophy',
         15
-      )} <span>New Top-5 Leaderboard Record on Round ${
-        round.roundNumber
-      } by ${escapeHtml(state.newRecordHolders.join(', '))}</span>`;
+      )} <span>New Top-5 Leaderboard Record on ${escapeHtml(
+        round.title
+      )} by ${escapeHtml(state.newRecordHolders.join(', '))}</span>`;
     } else {
       recordCallout.classList.add('hidden');
     }
