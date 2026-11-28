@@ -283,6 +283,7 @@ async function startServer() {
     getDailyDateKeyUtc,
     getNextDailyResetUtcMs,
     DAILY_BUILD_TIME_SECONDS,
+    DAILY_MAX_ATTEMPTS = 2,
   } = roundsMod;
   const computeEffectivePar =
     typeof roundsMod.computeEffectivePar === 'function'
@@ -339,18 +340,84 @@ async function startServer() {
   /** @type {{ days: Record<string, any[]>; updatedAt: number }} */
   let dailyStore = await storage.loadDailyStore();
 
+  /** @type {{ puzzles: Record<string, { dateKey: string; puzzleNumber: number; roundConfig: any }>; updatedAt: number }} */
+  let dailyPuzzlesStore = await storage.loadDailyPuzzles();
+
   function saveDailyEntry(dateKey, entry) {
     void storage.saveDailyEntry(dateKey, entry, dailyStore);
   }
 
   /** @type {Map<string, { dateKey: string; puzzleNumber: number; roundConfig: any }>} */
   const dailyConfigCache = new Map();
+  /** @type {Map<string, Promise<{ dateKey: string; puzzleNumber: number; roundConfig: any }>>} */
+  const pendingDailyPuzzleLocks = new Map();
+
+  for (const [dk, savedPuzzle] of Object.entries(dailyPuzzlesStore.puzzles || {})) {
+    if (savedPuzzle && savedPuzzle.roundConfig) {
+      dailyConfigCache.set(dk, savedPuzzle);
+    }
+  }
+
+  async function ensureDailyPuzzleLocked(dateKey) {
+    const key = dateKey || getDailyDateKeyUtc();
+    if (dailyConfigCache.has(key)) {
+      return dailyConfigCache.get(key);
+    }
+    if (pendingDailyPuzzleLocks.has(key)) {
+      return pendingDailyPuzzleLocks.get(key);
+    }
+    const lockPromise = (async () => {
+      const existing = dailyPuzzlesStore.puzzles?.[key];
+      const seedCandidate =
+        existing && existing.roundConfig ? existing : generateDailyRoundConfig(key);
+      const canonical = await storage.getOrSaveDailyPuzzle(
+        key,
+        seedCandidate,
+        dailyPuzzlesStore
+      );
+      if (dailyConfigCache.size > 14) {
+        const oldestKey = dailyConfigCache.keys().next().value;
+        if (oldestKey && oldestKey !== key) dailyConfigCache.delete(oldestKey);
+      }
+      dailyConfigCache.set(key, canonical);
+      return canonical;
+    })().finally(() => {
+      pendingDailyPuzzleLocks.delete(key);
+    });
+    pendingDailyPuzzleLocks.set(key, lockPromise);
+    return lockPromise;
+  }
+
+  // Lock today's canonical Daily Maze immediately on startup so every user worldwide sees the exact same puzzle
+  await ensureDailyPuzzleLocked(getDailyDateKeyUtc());
+
+  // Proactively lock newly rolled UTC days in the background
+  setInterval(() => {
+    const todayKey = getDailyDateKeyUtc();
+    if (!dailyConfigCache.has(todayKey)) {
+      void ensureDailyPuzzleLocked(todayKey);
+    }
+  }, 30_000);
 
   function getCachedDailyConfig(dateKey) {
     const key = dateKey || getDailyDateKeyUtc();
     if (!dailyConfigCache.has(key)) {
-      if (dailyConfigCache.size > 4) dailyConfigCache.clear();
-      dailyConfigCache.set(key, generateDailyRoundConfig(key));
+      const existing = dailyPuzzlesStore.puzzles?.[key];
+      const generated =
+        existing && existing.roundConfig ? existing : generateDailyRoundConfig(key);
+      if (dailyConfigCache.size > 14) {
+        const oldestKey = dailyConfigCache.keys().next().value;
+        if (oldestKey && oldestKey !== key) dailyConfigCache.delete(oldestKey);
+      }
+      dailyConfigCache.set(key, generated);
+      void storage
+        .getOrSaveDailyPuzzle(key, generated, dailyPuzzlesStore)
+        .then((canonical) => {
+          if (canonical && canonical.roundConfig) {
+            dailyConfigCache.set(key, canonical);
+          }
+        })
+        .catch(() => {});
     }
     return dailyConfigCache.get(key);
   }
@@ -391,11 +458,46 @@ async function startServer() {
     return dailyStore.days[dateKey];
   }
 
-  function hasCompletedDaily(dateKey, dailyClientId) {
+  function getDailyEntryForClient(dateKey, dailyClientId) {
     const cid = sanitizeDailyClientId(dailyClientId);
-    if (!cid) return false;
+    if (!cid) return null;
     const entries = getDailyEntriesForDay(dateKey);
-    return entries.some((e) => e.clientId === cid);
+    return entries.find((e) => e.clientId === cid) || null;
+  }
+
+  function getDailyAttemptsUsed(dateKey, dailyClientId) {
+    const entry = getDailyEntryForClient(dateKey, dailyClientId);
+    if (!entry) return 0;
+    const arrCount = Array.isArray(entry.attempts) ? entry.attempts.length : 1;
+    return Math.max(arrCount, Math.floor(Number(entry.attemptsUsed) || 1));
+  }
+
+  function hasCompletedDaily(dateKey, dailyClientId) {
+    return getDailyAttemptsUsed(dateKey, dailyClientId) >= DAILY_MAX_ATTEMPTS;
+  }
+
+  function toPublicDailyEntry(e, rank) {
+    return {
+      id: e.id,
+      clientId: e.clientId,
+      playerName: e.playerName,
+      playerColor: e.playerColor,
+      survivalTimeSeconds: Number(Number(e.survivalTimeSeconds || 0).toFixed(2)),
+      parTimeSeconds: Number(e.parTimeSeconds || 28),
+      beatPar: Boolean(e.beatPar),
+      clapsTaken: Number(e.clapsTaken) || 0,
+      overchargedSpires: Number(e.overchargedSpires) || 0,
+      linkedKeeps: Number(e.linkedKeeps) || 0,
+      pathDistance: Number(Number(e.pathDistance || 0).toFixed(1)),
+      wallsUsed: Number(e.wallsUsed) || 0,
+      attemptsUsed: Math.max(
+        Array.isArray(e.attempts) ? e.attempts.length : 1,
+        Number(e.attemptsUsed) || 1
+      ),
+      bestAttemptNumber: Number(e.bestAttemptNumber) || 1,
+      timestamp: Number(e.timestamp) || Date.now(),
+      rank,
+    };
   }
 
   function buildDailyPayload(dailyClientId, playerName) {
@@ -404,21 +506,19 @@ async function startServer() {
     const entries = getDailyEntriesForDay(dateKey);
     entries.sort(compareDailyEntries);
 
-    const ranked = entries.map((e, idx) => ({
-      ...e,
-      rank: idx + 1,
-    }));
+    const rankedPublic = entries.map((e, idx) => toPublicDailyEntry(e, idx + 1));
 
     const cid = sanitizeDailyClientId(dailyClientId);
     const nameLower = String(playerName || '').trim().toLowerCase();
-    let myIdx = cid ? ranked.findIndex((e) => e.clientId === cid) : -1;
+    const myExactIdx = cid ? entries.findIndex((e) => e.clientId === cid) : -1;
+    let myIdx = myExactIdx;
     if (myIdx === -1 && nameLower) {
-      myIdx = ranked.findIndex(
+      myIdx = entries.findIndex(
         (e) => String(e.playerName || '').trim().toLowerCase() === nameLower
       );
     }
 
-    const totalParticipants = ranked.length;
+    const totalParticipants = rankedPublic.length;
     const myStanding =
       myIdx !== -1
         ? {
@@ -428,9 +528,59 @@ async function startServer() {
               1,
               Math.round(((myIdx + 1) / Math.max(1, totalParticipants)) * 100)
             ),
-            entry: ranked[myIdx],
+            entry: rankedPublic[myIdx],
           }
         : null;
+
+    const myExactEntry = myExactIdx !== -1 ? entries[myExactIdx] : null;
+    const rawMyAttempts =
+      myExactEntry && Array.isArray(myExactEntry.attempts)
+        ? myExactEntry.attempts
+        : myExactEntry
+        ? [
+            {
+              id: `${myExactEntry.id}_a1`,
+              attemptNumber: 1,
+              survivalTimeSeconds: myExactEntry.survivalTimeSeconds,
+              parTimeSeconds: myExactEntry.parTimeSeconds,
+              beatPar: Boolean(myExactEntry.beatPar),
+              clapsTaken: myExactEntry.clapsTaken || 0,
+              overchargedSpires: myExactEntry.overchargedSpires || 0,
+              linkedKeeps: myExactEntry.linkedKeeps || 0,
+              pathDistance: myExactEntry.pathDistance || 0,
+              wallsUsed: myExactEntry.wallsUsed || 0,
+              towers: [],
+              timestamp: myExactEntry.timestamp || Date.now(),
+            },
+          ]
+        : [];
+
+    const myAttempts = [...rawMyAttempts]
+      .sort((a, b) => (a.attemptNumber || 0) - (b.attemptNumber || 0))
+      .map((a) => ({
+        id: a.id,
+        attemptNumber: a.attemptNumber,
+        survivalTimeSeconds: Number(Number(a.survivalTimeSeconds || 0).toFixed(2)),
+        parTimeSeconds: Number(a.parTimeSeconds || roundConfig.parTimeSeconds),
+        beatPar: Boolean(a.beatPar),
+        clapsTaken: Number(a.clapsTaken) || 0,
+        overchargedSpires: Number(a.overchargedSpires) || 0,
+        linkedKeeps: Number(a.linkedKeeps) || 0,
+        pathDistance: Number(Number(a.pathDistance || 0).toFixed(1)),
+        wallsUsed: Number(a.wallsUsed) || 0,
+        towers: Array.isArray(a.towers)
+          ? a.towers.map((t) => ({ x: Math.floor(t.x), y: Math.floor(t.y) }))
+          : [],
+        timestamp: Number(a.timestamp) || Date.now(),
+      }));
+
+    const attemptsUsed = myExactEntry
+      ? Math.max(myAttempts.length, Math.floor(Number(myExactEntry.attemptsUsed) || 1))
+      : 0;
+    const attemptsRemaining = Math.max(0, DAILY_MAX_ATTEMPTS - attemptsUsed);
+    const bestAttemptNumber = myExactEntry
+      ? Number(myExactEntry.bestAttemptNumber) || 1
+      : null;
 
     return {
       dateKey,
@@ -439,12 +589,15 @@ async function startServer() {
       puzzle: {
         dateKey,
         puzzleNumber,
+        mapId: roundConfig.mapId ?? roundConfig.roundNumber,
+        seed: roundConfig.seed,
         title: roundConfig.title,
         subtitle: roundConfig.subtitle,
         hint: roundConfig.hint,
         runnerType: roundConfig.runnerType || 'SCOUT',
         parTimeSeconds: roundConfig.parTimeSeconds,
         buildTimeSeconds: DAILY_BUILD_TIME_SECONDS || 120,
+        maxAttempts: DAILY_MAX_ATTEMPTS,
         wallCount: Math.floor(
           roundConfig.startingGold / TOWER_SPECS.BLOCK.goldCost
         ),
@@ -452,23 +605,59 @@ async function startServer() {
         keepCount: roundConfig.obstacles.length,
         hasWaystone: (roundConfig.checkpoints?.length || 0) > 0,
       },
-      top10: ranked.slice(0, 10),
+      top10: rankedPublic.slice(0, 10),
       totalParticipants,
-      completedToday: cid ? entries.some((e) => e.clientId === cid) : false,
+      completedToday: attemptsUsed >= DAILY_MAX_ATTEMPTS,
+      attemptsUsed,
+      maxAttempts: DAILY_MAX_ATTEMPTS,
+      attemptsRemaining,
+      bestAttemptNumber,
       myStanding,
+      myAttempts,
+      ...(myAttempts.length > 0
+        ? { roundConfig: cloneRoundConfig(roundConfig) }
+        : {}),
       updatedAt: dailyStore.updatedAt,
     };
   }
 
   function recordDailyResult(dateKey, player, room) {
-    if (!player || player.isBot) return false;
+    if (!player || player.isBot || !room) return null;
+    if (room._dailyResultRecorded) return room._dailyLastAttemptOutcome || null;
     const cid = sanitizeDailyClientId(player._dailyClientId || player._sessionId);
-    if (!cid) return false;
+    if (!cid) return null;
 
     const entries = getDailyEntriesForDay(dateKey);
-    // Strict 1 official attempt per day
-    if (entries.some((e) => e.clientId === cid)) {
-      return false;
+    const existing = entries.find((e) => e.clientId === cid) || null;
+    const existingAttempts = existing
+      ? Array.isArray(existing.attempts) && existing.attempts.length > 0
+        ? existing.attempts
+        : [
+            {
+              id: `${existing.id}_a1`,
+              attemptNumber: 1,
+              survivalTimeSeconds: existing.survivalTimeSeconds,
+              parTimeSeconds: existing.parTimeSeconds,
+              beatPar: Boolean(existing.beatPar),
+              clapsTaken: existing.clapsTaken || 0,
+              overchargedSpires: existing.overchargedSpires || 0,
+              linkedKeeps: existing.linkedKeeps || 0,
+              pathDistance: existing.pathDistance || 0,
+              wallsUsed: existing.wallsUsed || 0,
+              towers: [],
+              timestamp: existing.timestamp || Date.now(),
+            },
+          ]
+      : [];
+
+    const prevAttemptsUsed = existing
+      ? Math.max(existingAttempts.length, Math.floor(Number(existing.attemptsUsed) || 1))
+      : 0;
+
+    // Enforce strict max attempts per day (best of 2 counts)
+    if (prevAttemptsUsed >= DAILY_MAX_ATTEMPTS) {
+      room._dailyResultRecorded = true;
+      return null;
     }
 
     const evalRes = evaluateMazeRunTime(room.roundConfig, player.towers || []);
@@ -479,13 +668,19 @@ async function startServer() {
       ).toFixed(2)
     );
     const parTime = room.roundConfig.parTimeSeconds;
-    const entry = {
-      id: `daily_${dateKey}_${Date.now().toString(36)}_${Math.random()
+    const now = Date.now();
+    const attemptNumber = prevAttemptsUsed + 1;
+    const cleanTowers = Array.isArray(player.towers)
+      ? player.towers
+          .map((t) => ({ x: Math.floor(Number(t.x)), y: Math.floor(Number(t.y)) }))
+          .filter((t) => Number.isFinite(t.x) && Number.isFinite(t.y))
+      : [];
+
+    const attempt = {
+      id: `datt_${dateKey}_a${attemptNumber}_${now.toString(36)}_${Math.random()
         .toString(36)
         .slice(2, 6)}`,
-      clientId: cid,
-      playerName: sanitizePlayerName(player.name),
-      playerColor: player.color || PLAYER_COLORS[0],
+      attemptNumber,
       survivalTimeSeconds: runTime,
       parTimeSeconds: parTime,
       beatPar: runTime >= parTime,
@@ -496,14 +691,100 @@ async function startServer() {
       pathDistance: Number(
         (player.pathDistance || evalRes.distance || 0).toFixed(1)
       ),
-      wallsUsed: Array.isArray(player.towers) ? player.towers.length : 0,
-      timestamp: Date.now(),
+      wallsUsed: cleanTowers.length,
+      towers: cleanTowers,
+      timestamp: now,
     };
 
-    entries.push(entry);
+    const nextAttempts = [...existingAttempts, attempt];
+    const prevBest =
+      existingAttempts.length > 0
+        ? [...existingAttempts].sort(compareDailyEntries)[0]
+        : null;
+    const bestAttempt = [...nextAttempts].sort(compareDailyEntries)[0];
+    const isNewBest =
+      !prevBest || compareDailyEntries(attempt, prevBest) < 0;
+
+    const cleanName = sanitizePlayerName(player.name);
+    const cleanColor = player.color || PLAYER_COLORS[0];
+
+    let targetEntry;
+    if (existing) {
+      existing.playerName = cleanName;
+      existing.playerColor = cleanColor;
+      existing.survivalTimeSeconds = bestAttempt.survivalTimeSeconds;
+      existing.parTimeSeconds = bestAttempt.parTimeSeconds;
+      existing.beatPar = Boolean(bestAttempt.beatPar);
+      existing.clapsTaken = bestAttempt.clapsTaken;
+      existing.overchargedSpires = bestAttempt.overchargedSpires;
+      existing.linkedKeeps = bestAttempt.linkedKeeps;
+      existing.pathDistance = bestAttempt.pathDistance;
+      existing.wallsUsed = bestAttempt.wallsUsed;
+      existing.attemptsUsed = nextAttempts.length;
+      existing.bestAttemptNumber = bestAttempt.attemptNumber;
+      existing.attempts = nextAttempts;
+      existing.timestamp = bestAttempt.timestamp;
+      targetEntry = existing;
+    } else {
+      targetEntry = {
+        id: `daily_${dateKey}_${now.toString(36)}_${Math.random()
+          .toString(36)
+          .slice(2, 6)}`,
+        clientId: cid,
+        playerName: cleanName,
+        playerColor: cleanColor,
+        survivalTimeSeconds: bestAttempt.survivalTimeSeconds,
+        parTimeSeconds: bestAttempt.parTimeSeconds,
+        beatPar: Boolean(bestAttempt.beatPar),
+        clapsTaken: bestAttempt.clapsTaken,
+        overchargedSpires: bestAttempt.overchargedSpires,
+        linkedKeeps: bestAttempt.linkedKeeps,
+        pathDistance: bestAttempt.pathDistance,
+        wallsUsed: bestAttempt.wallsUsed,
+        attemptsUsed: nextAttempts.length,
+        bestAttemptNumber: bestAttempt.attemptNumber,
+        attempts: nextAttempts,
+        timestamp: bestAttempt.timestamp,
+      };
+      entries.push(targetEntry);
+    }
+
     entries.sort(compareDailyEntries);
-    saveDailyEntry(dateKey, entry);
-    return true;
+    room._dailyResultRecorded = true;
+    room._dailyLastAttemptOutcome = {
+      attemptNumber,
+      attemptsUsed: nextAttempts.length,
+      attemptsRemaining: Math.max(0, DAILY_MAX_ATTEMPTS - nextAttempts.length),
+      isNewBest,
+      bestTimeSeconds: bestAttempt.survivalTimeSeconds,
+      bestAttemptNumber: bestAttempt.attemptNumber,
+    };
+    saveDailyEntry(dateKey, targetEntry);
+    return room._dailyLastAttemptOutcome;
+  }
+
+  function finalizeAbandonedDailyAttemptIfNeeded(room, player) {
+    if (
+      !room ||
+      !player ||
+      player.isBot ||
+      room.mode !== 'DAILY' ||
+      room._dailyResultRecorded ||
+      room.phase === 'GAME_OVER' ||
+      room.phase === 'LOBBY'
+    ) {
+      return false;
+    }
+    const recorded = recordDailyResult(
+      room.dailyDateKey || getDailyDateKeyUtc(),
+      player,
+      room
+    );
+    if (recorded) {
+      broadcastDailyLeaderboardToAll();
+      return true;
+    }
+    return false;
   }
 
   const wss = new WebSocketServer({
@@ -896,7 +1177,14 @@ async function startServer() {
       mode,
       dailyDateKey: options.dailyDateKey,
       dailyPuzzleNumber: options.dailyPuzzleNumber,
+      dailyAttemptNumber:
+        mode === 'DAILY'
+          ? Math.max(1, Math.min(DAILY_MAX_ATTEMPTS, Number(options.dailyAttemptNumber) || 1))
+          : undefined,
+      dailyMaxAttempts: mode === 'DAILY' ? DAILY_MAX_ATTEMPTS : undefined,
       _dailyClientId: options.dailyClientId,
+      _dailyResultRecorded: false,
+      _dailyLastAttemptOutcome: null,
       _mapDeck: mapDeck,
       phase: startInLobby ? 'LOBBY' : 'PLANNING',
       settings,
@@ -915,7 +1203,9 @@ async function startServer() {
           text: startInLobby
             ? `Lobby ${code} created (${roundsPhrase}). Share the room code and press Ready Up when set.`
             : mode === 'DAILY'
-            ? `Daily Maze #${options.dailyPuzzleNumber || 1} — 5s planning, then 120s to build your best maze.`
+            ? `Daily Maze #${options.dailyPuzzleNumber || 1} (Attempt ${
+                options.dailyAttemptNumber || 1
+              }/${DAILY_MAX_ATTEMPTS}) — 5s planning, then 120s to build. Best of ${DAILY_MAX_ATTEMPTS} attempts counts!`
             : `Match started with ${roundsPhrase}. Plan your route during the 5s countdown, then build!`,
           timestamp: Date.now(),
           isSystem: true,
@@ -1062,6 +1352,15 @@ async function startServer() {
       ...(room.dailyDateKey ? { dailyDateKey: room.dailyDateKey } : {}),
       ...(room.dailyPuzzleNumber
         ? { dailyPuzzleNumber: room.dailyPuzzleNumber }
+        : {}),
+      ...(room.dailyAttemptNumber
+        ? { dailyAttemptNumber: room.dailyAttemptNumber }
+        : {}),
+      ...(room.dailyMaxAttempts
+        ? { dailyMaxAttempts: room.dailyMaxAttempts }
+        : {}),
+      ...(room._dailyLastAttemptOutcome
+        ? { dailyLastAttemptOutcome: room._dailyLastAttemptOutcome }
         : {}),
       phase: room.phase,
       settings: room.settings,
@@ -1812,18 +2111,7 @@ async function startServer() {
     player._disconnectTimer = setTimeout(() => {
       player._disconnectTimer = null;
       if (player.connected === false) {
-        if (
-          room.mode === 'DAILY' &&
-          room.phase !== 'GAME_OVER' &&
-          room.phase !== 'LOBBY'
-        ) {
-          recordDailyResult(
-            room.dailyDateKey || getDailyDateKeyUtc(),
-            player,
-            room
-          );
-          broadcastDailyLeaderboardToAll();
-        }
+        finalizeAbandonedDailyAttemptIfNeeded(room, player);
         removePlayerImmediately(room, player, true);
       }
     }, RECONNECT_GRACE_MS);
@@ -1836,6 +2124,7 @@ async function startServer() {
       clientMap.delete(ws);
     }
     if (currentRoom && currentPlayer) {
+      finalizeAbandonedDailyAttemptIfNeeded(currentRoom, currentPlayer);
       removePlayerImmediately(currentRoom, currentPlayer, true);
     }
   }
@@ -1857,10 +2146,16 @@ async function startServer() {
 
     // 1. Check for existing session in this room (45s reconnect grace or duplicate tab)
     const existingPlayer = room.players.find(
-      (p) => !p.isBot && p._sessionId === sessionId
+      (p) =>
+        !p.isBot &&
+        (p._sessionId === sessionId ||
+          (room.mode === 'DAILY' &&
+            room._dailyClientId &&
+            p._dailyClientId === room._dailyClientId))
     );
 
     if (existingPlayer) {
+      existingPlayer._sessionId = sessionId;
       clearPlayerTimers(existingPlayer);
 
       // Supersede any stale/other-tab socket with 4001 so the older tab stops auto-reconnecting
@@ -2404,30 +2699,28 @@ async function startServer() {
           meta.playerName = sanitizePlayerName(msg.playerName);
         }
         socketMeta.set(ws, meta);
-        ws.send(
-          JSON.stringify({
-            type: 'DAILY_LEADERBOARD_DATA',
-            daily: buildDailyPayload(meta.dailyClientId, meta.playerName),
-          })
-        );
+        const sendDaily = () => {
+          if (ws.readyState !== 1) return;
+          ws.send(
+            JSON.stringify({
+              type: 'DAILY_LEADERBOARD_DATA',
+              daily: buildDailyPayload(meta.dailyClientId, meta.playerName),
+            })
+          );
+        };
+        const todayKey = getDailyDateKeyUtc();
+        if (dailyConfigCache.has(todayKey)) {
+          sendDaily();
+        } else {
+          void ensureDailyPuzzleLocked(todayKey).then(sendDaily).catch(sendDaily);
+        }
         return;
       }
 
       if (msg.type === 'LEAVE_ROOM') {
         if (currentRoom && currentPlayer) {
-          // Leaving an active Daily Maze before finishing locks in today's single attempt with the current maze
-          if (
-            currentRoom.mode === 'DAILY' &&
-            currentRoom.phase !== 'GAME_OVER' &&
-            currentRoom.phase !== 'LOBBY'
-          ) {
-            recordDailyResult(
-              currentRoom.dailyDateKey || getDailyDateKeyUtc(),
-              currentPlayer,
-              currentRoom
-            );
-            broadcastDailyLeaderboardToAll();
-          }
+          // Leaving an active Daily Maze before finishing locks in the current attempt
+          finalizeAbandonedDailyAttemptIfNeeded(currentRoom, currentPlayer);
           detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
           currentRoom = null;
           currentPlayer = null;
@@ -2568,87 +2861,99 @@ async function startServer() {
         }
         socketMeta.set(ws, meta);
 
-        // Enforce 1 attempt per day
-        if (hasCompletedDaily(dateKey, dailyClientId)) {
-          ws.send(
-            JSON.stringify({
-              type: 'DAILY_LEADERBOARD_DATA',
-              daily: buildDailyPayload(dailyClientId, msg.playerName),
-            })
-          );
-          ws.send(
-            JSON.stringify({
-              type: 'ERROR_TOAST',
-              message:
-                "You've already completed today's Daily Maze! Come back tomorrow.",
-            })
-          );
-          return;
-        }
+        const launchDaily = () => {
+          if (ws.readyState !== 1) return;
 
-        // Reconnect into an existing active Daily Maze room for this player if still running
-        let activeDailyRoom = null;
-        for (const r of rooms.values()) {
-          if (
-            r.mode === 'DAILY' &&
-            r.dailyDateKey === dateKey &&
-            r._dailyClientId &&
-            r._dailyClientId === dailyClientId &&
-            r.phase !== 'GAME_OVER'
-          ) {
-            activeDailyRoom = r;
-            break;
+          // Enforce 2 official attempts per day (best score logged on leaderboard)
+          const attemptsUsed = getDailyAttemptsUsed(dateKey, dailyClientId);
+          if (attemptsUsed >= DAILY_MAX_ATTEMPTS) {
+            ws.send(
+              JSON.stringify({
+                type: 'DAILY_LEADERBOARD_DATA',
+                daily: buildDailyPayload(dailyClientId, msg.playerName),
+              })
+            );
+            ws.send(
+              JSON.stringify({
+                type: 'ERROR_TOAST',
+                message: `You've used all ${DAILY_MAX_ATTEMPTS} attempts for today's Daily Maze! You can still re-view your mazes anytime today.`,
+              })
+            );
+            return;
           }
-        }
 
-        if (
-          currentRoom &&
-          currentPlayer &&
-          (!activeDailyRoom || currentRoom.roomCode !== activeDailyRoom.roomCode)
-        ) {
-          detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
-          currentRoom = null;
-          currentPlayer = null;
-        }
-
-        let room = activeDailyRoom;
-        if (!room) {
-          const dailyInfo = getCachedDailyConfig(dateKey);
-          const targetCode = generateUniqueRoomCode(
-            `DAY${Math.floor(100 + Math.random() * 899)}`
-          );
-          room = createRoom(
-            targetCode,
-            {
-              roomName: `Daily Maze #${dailyInfo.puzzleNumber}`,
-              isPublic: false,
-              totalRounds: 1,
-              buildTimeSeconds: DAILY_BUILD_TIME_SECONDS || 120,
-              goldMultiplier: 1.0,
-              botCount: 0,
-              fogOfWar: false,
-            },
-            {
-              mode: 'DAILY',
-              startInLobby: false,
-              dailyDateKey: dailyInfo.dateKey,
-              dailyPuzzleNumber: dailyInfo.puzzleNumber,
-              dailyRoundConfig: dailyInfo.roundConfig,
-              dailyClientId,
+          // Reconnect into an existing active Daily Maze room for this player if still running
+          let activeDailyRoom = null;
+          for (const r of rooms.values()) {
+            if (
+              r.mode === 'DAILY' &&
+              r.dailyDateKey === dateKey &&
+              r._dailyClientId &&
+              r._dailyClientId === dailyClientId &&
+              r.phase !== 'GAME_OVER'
+            ) {
+              activeDailyRoom = r;
+              break;
             }
-          );
-        }
+          }
 
-        const joined = joinOrReconnectPlayer(
-          ws,
-          room,
-          msg.playerName,
-          msg.sessionId
-        );
-        if (joined) {
-          joined._dailyClientId = dailyClientId;
-          currentRoom = room;
-          currentPlayer = joined;
+          if (
+            currentRoom &&
+            currentPlayer &&
+            (!activeDailyRoom || currentRoom.roomCode !== activeDailyRoom.roomCode)
+          ) {
+            detachSocketFromPreviousRoom(ws, currentRoom, currentPlayer);
+            currentRoom = null;
+            currentPlayer = null;
+          }
+
+          let room = activeDailyRoom;
+          if (!room) {
+            const dailyInfo = getCachedDailyConfig(dateKey);
+            const nextAttemptNumber = Math.min(DAILY_MAX_ATTEMPTS, attemptsUsed + 1);
+            const targetCode = generateUniqueRoomCode(
+              `DAY${Math.floor(100 + Math.random() * 899)}`
+            );
+            room = createRoom(
+              targetCode,
+              {
+                roomName: `Daily Maze #${dailyInfo.puzzleNumber}`,
+                isPublic: false,
+                totalRounds: 1,
+                buildTimeSeconds: DAILY_BUILD_TIME_SECONDS || 120,
+                goldMultiplier: 1.0,
+                botCount: 0,
+                fogOfWar: false,
+              },
+              {
+                mode: 'DAILY',
+                startInLobby: false,
+                dailyDateKey: dailyInfo.dateKey,
+                dailyPuzzleNumber: dailyInfo.puzzleNumber,
+                dailyAttemptNumber: nextAttemptNumber,
+                dailyRoundConfig: dailyInfo.roundConfig,
+                dailyClientId,
+              }
+            );
+          }
+
+          const joined = joinOrReconnectPlayer(
+            ws,
+            room,
+            msg.playerName,
+            msg.sessionId
+          );
+          if (joined) {
+            joined._dailyClientId = dailyClientId;
+            currentRoom = room;
+            currentPlayer = joined;
+          }
+        };
+
+        if (dailyConfigCache.has(dateKey)) {
+          launchDaily();
+        } else {
+          void ensureDailyPuzzleLocked(dateKey).then(launchDaily).catch(launchDaily);
         }
         return;
       }
@@ -3662,11 +3967,15 @@ async function startServer() {
     res.json(leaderboard);
   });
 
-  app.get('/api/daily', (req, res) => {
+  app.get('/api/daily', async (req, res) => {
     const clientId =
       typeof req.query?.clientId === 'string' ? req.query.clientId : '';
     const playerName =
       typeof req.query?.playerName === 'string' ? req.query.playerName : '';
+    const todayKey = getDailyDateKeyUtc();
+    if (!dailyConfigCache.has(todayKey)) {
+      await ensureDailyPuzzleLocked(todayKey).catch(() => {});
+    }
     res.json(buildDailyPayload(clientId, playerName));
   });
 

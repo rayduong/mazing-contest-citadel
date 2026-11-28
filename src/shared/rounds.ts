@@ -2396,6 +2396,7 @@ export function generateRandomRoundLayout(
 }
 
 export const DAILY_BUILD_TIME_SECONDS = 120;
+export const DAILY_MAX_ATTEMPTS = 2;
 const DAILY_EPOCH_UTC_MS = Date.UTC(2026, 10, 1); // 2026-11-01 UTC -> Daily #1
 
 export function getDailyDateKeyUtc(nowMs: number = Date.now()): string {

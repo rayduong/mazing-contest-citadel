@@ -2064,6 +2064,8 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
   );
   overflow-y: auto;
   overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   border-radius: 20px;
   padding: 20px 22px;
   display: flex;
@@ -2125,7 +2127,8 @@ body[data-spectating='true'][data-phase='BUILD'] .hud-bottom-dock {
 .modal-backdrop.peek-minimized #results-coaching-tip,
 .modal-backdrop.peek-minimized #results-stats-legend,
 .modal-backdrop.peek-minimized #btn-results-leaderboard,
-.modal-backdrop.peek-minimized #btn-results-share-daily {
+.modal-backdrop.peek-minimized #btn-results-share-daily,
+.modal-backdrop.peek-minimized #btn-results-daily-retry {
   display: none !important;
 }
 
@@ -3265,7 +3268,8 @@ body:has(#results-modal:not(.hidden):not(.peek-minimized)) #hud-top-bar {
 .leaderboard-table-wrap {
   flex: 1;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  overscroll-behavior: auto;
+  -webkit-overflow-scrolling: touch;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -4694,6 +4698,8 @@ body[data-mode='DAILY'] #round-dropdown .popover-divider {
   gap: 14px;
   padding: 20px 22px;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   flex: 1;
   min-height: 0;
 }
@@ -5868,17 +5874,29 @@ body[data-in-menu='true'] #toast-container {
     grid-template-columns: 1fr;
   }
 
-  /* Avoid nested scroll traps on mobile: let .menu-screen scroll smoothly as one feed */
+  /* Avoid nested scroll traps on mobile: let .menu-screen & .modal-card scroll smoothly as one feed */
+  .daily-layout-grid {
+    flex: 0 0 auto;
+    min-height: auto;
+  }
+
+  .daily-leaderboard-card {
+    overflow: visible;
+  }
+
   .daily-table-wrap,
+  #results-daily-top10,
   .htp-scroll-body,
   .settings-grid,
   #screen-online .hub-play-grid,
   #screen-online .lobby-browser-pane,
   #screen-online .match-config-pane,
+  #screen-leaderboard .leaderboard-table-wrap,
   #screen-leaderboard .lb-list {
     overflow: visible;
     max-height: none;
     flex: 0 0 auto;
+    overscroll-behavior: auto;
   }
 
   .daily-result-hero {
@@ -5932,7 +5950,7 @@ body[data-in-menu='true'] #toast-container {
     padding: calc(var(--safe-top) + 12px) calc(var(--safe-right) + 14px)
       calc(var(--safe-bottom) + 18px) calc(var(--safe-left) + 14px);
     gap: 12px;
-    overflow-x: hidden;
+    overflow-x: clip;
   }
 
   /* Centralised, zero-scroll mobile Home Screen */
@@ -5972,6 +5990,8 @@ body[data-in-menu='true'] #toast-container {
     row-gap: 4px;
     column-gap: 8px;
     padding: 10px 11px;
+    max-width: 100%;
+    min-width: 0;
   }
 
   .daily-lb-row .lb-synergies {
@@ -5980,8 +6000,12 @@ body[data-in-menu='true'] #toast-container {
     color: var(--text-muted);
   }
 
-  .daily-table-wrap {
-    overflow-x: hidden;
+  /* Keep .daily-table-wrap overflow: visible (never overflow-x: hidden which forces overflow-y: auto and traps mobile upward scroll!) */
+  .daily-table-wrap,
+  #results-daily-top10 {
+    overflow: visible;
+    max-height: none;
+    overscroll-behavior: auto;
   }
 
   .daily-challenge-card,
@@ -7711,6 +7735,338 @@ body[data-mode='TUTORIAL'] #round-brief-banner {
 
   .runner-filter-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ============================================================================
+   DAILY MAZE 2-ATTEMPT UI & 3D SAVED MAZE REVIEW MODE
+   ============================================================================ */
+
+.daily-progress-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 13px;
+  background: var(--surface-tint-gold);
+  border: 1px solid var(--border-tint-gold);
+}
+
+.daily-remaining-pill {
+  background: #ffffff;
+  color: var(--accent-gold-deep);
+  border-color: var(--border-tint-gold);
+}
+
+.daily-attempts-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.results-attempts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.daily-results-attempts-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.daily-attempt-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 11px;
+  background: rgba(255, 253, 249, 0.92);
+  border: 1px solid var(--surface-border);
+}
+
+.daily-attempt-row.is-best {
+  border-color: var(--border-tint-gold);
+  background: linear-gradient(
+    90deg,
+    rgba(254, 243, 199, 0.72) 0%,
+    rgba(255, 253, 249, 0.96) 100%
+  );
+}
+
+.daily-attempt-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.daily-attempt-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--text-primary);
+}
+
+.daily-attempt-time {
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-gold-deep);
+}
+
+.daily-attempt-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.daily-attempt-meta > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.daily-view-attempt-btn {
+  flex-shrink: 0;
+  min-height: 34px;
+  padding: 0 10px;
+}
+
+.daily-completed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.daily-action-half {
+  flex: 1 1 130px;
+  height: 44px;
+  justify-content: center;
+  font-size: 13.5px;
+}
+
+.daily-action-main {
+  flex: 1 1 170px;
+  height: 44px;
+  justify-content: center;
+  font-size: 13.5px;
+}
+
+.daily-action-side {
+  flex: 0 0 auto;
+  height: 44px;
+  padding: 0 14px;
+  justify-content: center;
+}
+
+/* Mobile landscape also disables nested leaderboard scroll traps */
+@media (max-height: 500px) and (orientation: landscape) {
+  .daily-layout-grid {
+    flex: 0 0 auto;
+    min-height: auto;
+  }
+
+  .daily-leaderboard-card {
+    overflow: visible;
+  }
+
+  .daily-table-wrap,
+  #results-daily-top10,
+  #screen-leaderboard .leaderboard-table-wrap {
+    overflow: visible;
+    max-height: none;
+    flex: 0 0 auto;
+    overscroll-behavior: auto;
+  }
+}
+
+/* 3D Daily Maze Review Mode: Clean Uncluttered Viewport */
+body[data-daily-review='true'] #hud-top-bar,
+body[data-daily-review='true'] #hud-bottom-dock,
+body[data-daily-review='true'] #hud-run-dock,
+body[data-daily-review='true'] #spectator-bar,
+body[data-daily-review='true'] #mobile-synergy-pill,
+body[data-daily-review='true'] #planning-banner,
+body[data-daily-review='true'] #round-brief-banner,
+body[data-daily-review='true'] #peek-identity-pill {
+  display: none !important;
+}
+
+.daily-review-banner {
+  position: fixed;
+  top: calc(var(--safe-top) + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 38;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  max-width: calc(100vw - var(--safe-left) - var(--safe-right) - 20px);
+  font-size: 12.5px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.daily-review-title {
+  font-weight: 800;
+  color: var(--accent-gold-deep);
+}
+
+.daily-review-stats {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.daily-review-bar {
+  position: fixed;
+  bottom: calc(var(--safe-bottom) + 14px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 38;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 18px;
+  max-width: calc(100vw - var(--safe-left) - var(--safe-right) - 20px);
+}
+
+.daily-review-attempts {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--surface-border);
+}
+
+.daily-review-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.daily-review-tab strong {
+  font-variant-numeric: tabular-nums;
+  color: inherit;
+}
+
+.daily-review-tab.active {
+  background: var(--surface-elevated);
+  border-color: var(--border-tint-gold);
+  color: var(--accent-gold-deep);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
+}
+
+.daily-review-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.daily-review-replay-btn,
+.daily-review-close-btn,
+.daily-review-retry-btn {
+  height: 38px;
+  min-height: 38px;
+  padding: 0 12px;
+}
+
+.daily-review-replay-btn.active {
+  background: var(--surface-tint-gold);
+  border-color: var(--border-tint-gold);
+  color: var(--accent-gold-deep);
+}
+
+.daily-review-speed-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 10px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--surface-border);
+}
+
+.review-speed-btn {
+  min-width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.review-speed-btn.active {
+  background: var(--surface-elevated);
+  color: var(--accent-gold-deep);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.1);
+}
+
+@media (max-width: 640px) {
+  .daily-review-banner {
+    padding: 6px 11px;
+    gap: 6px;
+    font-size: 11.5px;
+  }
+
+  .daily-review-bar {
+    width: calc(100vw - var(--safe-left) - var(--safe-right) - 16px);
+    padding: 8px 10px;
+    gap: 6px;
+  }
+
+  .daily-review-attempts {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .daily-review-tab {
+    flex: 1;
+    justify-content: center;
+  }
+
+  .daily-review-controls {
+    width: 100%;
+  }
+
+  .daily-review-replay-btn,
+  .daily-review-close-btn,
+  .daily-review-retry-btn {
+    height: 40px;
+    min-height: 40px;
   }
 }
 

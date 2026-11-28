@@ -491,6 +491,21 @@ export interface LeaderboardPayload {
   updatedAt: number;
 }
 
+export interface DailyMazeAttempt {
+  id: string;
+  attemptNumber: number;
+  survivalTimeSeconds: number;
+  parTimeSeconds: number;
+  beatPar: boolean;
+  clapsTaken: number;
+  overchargedSpires: number;
+  linkedKeeps: number;
+  pathDistance: number;
+  wallsUsed: number;
+  towers: GridPoint[];
+  timestamp: number;
+}
+
 export interface DailyMazeEntry {
   id: string;
   clientId: string;
@@ -504,6 +519,8 @@ export interface DailyMazeEntry {
   linkedKeeps: number;
   pathDistance: number;
   wallsUsed: number;
+  attemptsUsed?: number;
+  bestAttemptNumber?: number;
   timestamp: number;
   rank?: number;
 }
@@ -511,12 +528,15 @@ export interface DailyMazeEntry {
 export interface DailyMazePuzzleMeta {
   dateKey: string;
   puzzleNumber: number;
+  mapId?: number;
+  seed?: number;
   title: string;
   subtitle: string;
   hint: string;
   runnerType: RunnerArchetype;
   parTimeSeconds: number;
   buildTimeSeconds: number;
+  maxAttempts?: number;
   wallCount: number;
   spireCount: number;
   keepCount: number;
@@ -538,8 +558,23 @@ export interface DailyMazePayload {
   top10: DailyMazeEntry[];
   totalParticipants: number;
   completedToday: boolean;
+  attemptsUsed: number;
+  maxAttempts: number;
+  attemptsRemaining: number;
+  bestAttemptNumber: number | null;
   myStanding: DailyPlayerStanding | null;
+  myAttempts: DailyMazeAttempt[];
+  roundConfig?: RoundConfig;
   updatedAt: number;
+}
+
+export interface DailyAttemptOutcome {
+  attemptNumber: number;
+  attemptsUsed: number;
+  attemptsRemaining: number;
+  isNewBest: boolean;
+  bestTimeSeconds: number;
+  bestAttemptNumber: number;
 }
 
 export interface ChatMessage {
@@ -556,6 +591,9 @@ export interface RoomState {
   mode: RoomMode;
   dailyDateKey?: string;
   dailyPuzzleNumber?: number;
+  dailyAttemptNumber?: number;
+  dailyMaxAttempts?: number;
+  dailyLastAttemptOutcome?: DailyAttemptOutcome;
   phase: GamePhase;
   settings: RoomSettings;
   currentRoundIndex: number;

@@ -842,6 +842,65 @@
       <span id="peek-identity-text">Viewing Maze</span>
     </div>
 
+    <!-- Daily Maze Saved Attempt 3D Review Mode Header Pill & Bottom Toolbar -->
+    <div
+      id="daily-review-banner"
+      class="daily-review-banner surface-pill hidden"
+      role="status"
+      aria-live="polite"
+    >
+      <span class="icon-slot" data-icon="eye" data-icon-size="14"></span>
+      <span id="daily-review-title" class="daily-review-title">Daily Maze · Attempt 1</span>
+      <span class="pill-divider"></span>
+      <span id="daily-review-stats" class="daily-review-stats">0.00s</span>
+    </div>
+
+    <div
+      id="daily-review-bar"
+      class="daily-review-bar surface-panel hidden"
+      role="toolbar"
+      aria-label="Daily Maze Review Controls"
+    >
+      <div id="daily-review-attempts" class="daily-review-attempts"></div>
+      <div class="daily-review-controls">
+        <button
+          type="button"
+          id="btn-daily-review-replay"
+          class="mini-action-btn daily-review-replay-btn"
+          title="Watch your runner replay through this saved maze"
+        >
+          <span class="icon-slot" data-icon="play" data-icon-size="14"></span>
+          <span id="daily-review-replay-label">Replay Run</span>
+        </button>
+        <div
+          id="daily-review-speed-group"
+          class="daily-review-speed-group"
+          role="group"
+          aria-label="Replay Speed"
+        >
+          <button type="button" class="review-speed-btn active" data-review-speed="1">1×</button>
+          <button type="button" class="review-speed-btn" data-review-speed="2">2×</button>
+          <button type="button" class="review-speed-btn" data-review-speed="4">4×</button>
+        </div>
+        <button
+          type="button"
+          id="btn-daily-review-retry"
+          class="dock-ready-btn daily-review-retry-btn hidden"
+        >
+          <span class="icon-slot" data-icon="play" data-icon-size="14"></span>
+          <span>Start Attempt 2</span>
+        </button>
+        <button
+          type="button"
+          id="btn-daily-review-close"
+          class="hub-secondary-btn daily-review-close-btn"
+        >
+          <span class="icon-slot" data-icon="arrowLeft" data-icon-size="14"></span>
+          <span id="daily-review-close-label">Daily Board</span>
+        </button>
+      </div>
+    </div>
+
     <!-- Round Results & Final Standings Modal -->
     <div
       id="results-modal"
@@ -914,7 +973,7 @@
           <button
             type="button"
             id="btn-results-share-daily"
-            class="dock-ready-btn hidden"
+            class="hub-secondary-btn hidden"
           >
             <span
               class="icon-slot"
@@ -922,6 +981,18 @@
               data-icon-size="15"
             ></span>
             <span>Share Result</span>
+          </button>
+          <button
+            type="button"
+            id="btn-results-daily-retry"
+            class="dock-ready-btn hidden"
+          >
+            <span
+              class="icon-slot"
+              data-icon="play"
+              data-icon-size="15"
+            ></span>
+            <span>Start Attempt 2</span>
           </button>
           <button type="button" id="btn-next-round" class="dock-ready-btn">
             <span id="next-round-label">Next Round</span>
@@ -1103,7 +1174,7 @@
                     Daily Challenge
                   </span>
                 </span>
-                <span>Global puzzle · 120s · 1 try</span>
+                <span>Global puzzle · 120s · 2 tries</span>
               </span>
               <span
                 class="icon-slot home-option-arrow"
@@ -2256,7 +2327,7 @@
                 <span id="daily-screen-date" class="meta-pill">Today</span>
               </div>
               <p>
-                Everyone plays the exact same maze. One try per day. 120 seconds to build.
+                Everyone plays the exact same maze. 2 attempts per day — best score counts.
               </p>
             </div>
             <div id="daily-reset-countdown" class="daily-countdown-pill">
@@ -2281,7 +2352,7 @@
                   data-icon-size="15"
                 ></span>
                 <span>
-                  <strong>5s</strong> route planning → <strong>120s</strong> build timer → <strong>1 official attempt</strong> per day.
+                  <strong>5s</strong> route planning → <strong>120s</strong> build timer → <strong>2 attempts/day</strong> (best score logged).
                 </span>
               </div>
 
@@ -2632,7 +2703,7 @@
                     <h4>Daily Maze &amp; Online Lobbies</h4>
                   </div>
                   <p>
-                    Try the <strong>Daily Maze</strong> for one shared global puzzle every day (120s build, 1 attempt/day), or open a <strong>Play Online</strong> lobby where everyone presses Ready Up before the host starts!
+                    Try the <strong>Daily Maze</strong> for one shared global puzzle every day (120s build, 2 attempts/day — best score counts), or open a <strong>Play Online</strong> lobby where everyone presses Ready Up before the host starts!
                   </p>
                 </div>
               </div>

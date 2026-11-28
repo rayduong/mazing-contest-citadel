@@ -4,6 +4,7 @@ import {
 } from '../shared/pathfinding.js';
 import {
   computeEffectivePar,
+  DAILY_MAX_ATTEMPTS,
   DEFAULT_MATCH_ROUNDS,
   generateRandomRoundLayout,
   getMapById,
@@ -23,6 +24,7 @@ import {
   ActiveBuildTool,
   ALL_RUNNER_ARCHETYPES,
   ClientToServerMessage,
+  DailyMazeAttempt,
   DailyMazePayload,
   getEffectiveSpireStats,
   GridPoint,
@@ -34,9 +36,11 @@ import {
   MAX_CUSTOM_ROUNDS,
   MIN_CUSTOM_BUILD_SECONDS,
   MIN_CUSTOM_ROUNDS,
+  PlacedTower,
   PlayerState,
   RoomSettings,
   RoomState,
+  RoundConfig,
   RUNNER_ARCHETYPES,
   RunnerArchetype,
   RunnerSimState,
@@ -110,7 +114,72 @@ type MenuScreen =
 const NAME_STORAGE_KEY = 'mc2026_player_name';
 const TAB_SESSION_STORAGE_KEY = 'mc2026_tab_session_id';
 const DAILY_CLIENT_ID_STORAGE_KEY = 'mc2026_daily_client_id';
+const DAILY_SAVED_MAZES_KEY_PREFIX = 'mc2026_daily_saved_mazes_';
 const TIPS_STORAGE_KEY = 'mc2026_show_tips';
+
+interface LocalSavedDailyMazes {
+  dateKey: string;
+  roundConfig: RoundConfig;
+  attempts: DailyMazeAttempt[];
+  updatedAt: number;
+}
+
+function saveDailyMazesToLocalCache(
+  dateKey: string,
+  roundConfig: RoundConfig | undefined,
+  attempts: DailyMazeAttempt[]
+) {
+  if (!dateKey || !roundConfig || !Array.isArray(attempts) || attempts.length === 0) {
+    return;
+  }
+  try {
+    const key = `${DAILY_SAVED_MAZES_KEY_PREFIX}${dateKey}`;
+    const payload: LocalSavedDailyMazes = {
+      dateKey,
+      roundConfig,
+      attempts,
+      updatedAt: Date.now(),
+    };
+    localStorage.setItem(key, JSON.stringify(payload));
+    // Prune older date keys so localStorage stays lean
+    const staleKeys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(DAILY_SAVED_MAZES_KEY_PREFIX) && k !== key) {
+        staleKeys.push(k);
+      }
+    }
+    staleKeys.sort();
+    while (staleKeys.length > 2) {
+      const oldest = staleKeys.shift();
+      if (oldest) localStorage.removeItem(oldest);
+    }
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function loadDailyMazesFromLocalCache(
+  dateKey: string
+): LocalSavedDailyMazes | null {
+  if (!dateKey) return null;
+  try {
+    const raw = localStorage.getItem(`${DAILY_SAVED_MAZES_KEY_PREFIX}${dateKey}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as LocalSavedDailyMazes;
+    if (
+      parsed &&
+      parsed.dateKey === dateKey &&
+      parsed.roundConfig &&
+      Array.isArray(parsed.attempts)
+    ) {
+      return parsed;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
 
 function readOrCreateDailyClientId(): string {
   const generated = `daily_${Date.now().toString(36)}_${Math.random()
@@ -396,6 +465,17 @@ class MazingContestClient {
   private tutorialRunFinishTimer: number | null = null;
   private tutorialRunCompletionShown = false;
 
+  private dailyReviewActive = false;
+  private dailyReviewReturnTo: 'daily' | 'results' = 'daily';
+  private dailyReviewState: RoomState | null = null;
+  private dailyReviewRoundConfig: RoundConfig | null = null;
+  private dailyReviewAttempts: DailyMazeAttempt[] = [];
+  private dailyReviewSelectedAttempt = 1;
+  private dailyReviewReplaySim: MazeRunnerSimulator | null = null;
+  private dailyReviewReplayAccum = 0;
+  private dailyReviewReplayActive = false;
+  private dailyReviewReplaySpeed: 1 | 2 | 4 = 1;
+
   constructor() {
     this.hydrateSingleSourceGuide();
     hydrateStaticIcons();
@@ -445,6 +525,7 @@ class MazingContestClient {
       lastTime = now;
 
       this.stepRunSimulation(dt);
+      this.stepDailyReviewReplay(dt);
       this.renderer3d.renderFrame(dt);
     };
     requestAnimationFrame(animate);
@@ -551,7 +632,17 @@ class MazingContestClient {
 
       const topBar = document.getElementById('hud-top-bar');
       let topPx = 56;
-      if (topBar) {
+      if (this.dailyReviewActive) {
+        const reviewBanner = document.getElementById('daily-review-banner');
+        if (reviewBanner && !reviewBanner.classList.contains('hidden')) {
+          const rRect = reviewBanner.getBoundingClientRect();
+          if (rRect.height > 0) {
+            topPx = Math.max(36, Math.round(rRect.bottom + 8));
+          }
+        } else {
+          topPx = 36;
+        }
+      } else if (topBar) {
         const rect = topBar.getBoundingClientRect();
         if (rect.height > 0) {
           topPx = Math.max(36, Math.round(rect.bottom));
@@ -581,6 +672,7 @@ class MazingContestClient {
         document.getElementById('hud-bottom-dock'),
         document.getElementById('spectator-bar'),
         document.getElementById('hud-run-dock'),
+        document.getElementById('daily-review-bar'),
       ];
       if (!isTouchBuild) {
         bottomCandidates.push(trayEl);
@@ -815,9 +907,8 @@ class MazingContestClient {
         this.renderLeaderboard();
       }
       if (dailyRes.ok) {
-        this.dailyData = await dailyRes.json();
-        this.updateHomeDailyBadge();
-        this.renderDailyScreen();
+        const dailyPayload = (await dailyRes.json()) as DailyMazePayload;
+        this.applyDailyPayload(dailyPayload);
       }
     } catch {
       // WebSocket also supplies LOBBY_LIST, LEADERBOARD_DATA & DAILY_LEADERBOARD_DATA
@@ -877,6 +968,9 @@ class MazingContestClient {
 
       if (msg.type === 'WELCOME') {
         this.cleanupTutorialVisuals();
+        if (this.dailyReviewActive) {
+          this.exitDailyMazeReview('none');
+        }
         this.wsSuperseded = false;
         this.updateWsStatusPill(null);
         this.localPlayerId = msg.playerId;
@@ -944,15 +1038,7 @@ class MazingContestClient {
         this.leaderboard = msg.leaderboard;
         this.renderLeaderboard();
       } else if (msg.type === 'DAILY_LEADERBOARD_DATA') {
-        this.dailyData = msg.daily;
-        this.updateHomeDailyBadge();
-        this.renderDailyScreen();
-        if (
-          this.roomState?.mode === 'DAILY' &&
-          this.roomState.phase === 'GAME_OVER'
-        ) {
-          this.renderRoundResultsModal(this.roomState);
-        }
+        this.applyDailyPayload(msg.daily);
       } else if (msg.type === 'CHAT_MESSAGE') {
         if (this.roomState) {
           this.roomState.chat.push(msg.message);
@@ -1144,7 +1230,9 @@ class MazingContestClient {
     numEl.textContent = String(secs);
     const roundPrefix =
       this.roomState.mode === 'DAILY'
-        ? round.title
+        ? `${round.title} · Attempt ${this.roomState.dailyAttemptNumber || 1}/${
+            this.roomState.dailyMaxAttempts || DAILY_MAX_ATTEMPTS
+          }`
         : `Round ${round.roundNumber} · ${round.title}`;
     lineEl.textContent = `${roundPrefix} · Building unlocks in ${secs}s`;
     if (hintEl) {
@@ -2373,7 +2461,10 @@ class MazingContestClient {
     );
 
     this.renderer3d.onHoverStatusChange = (info: HoverStatusInfo) => {
-      if (this.renderer3d.modalOpen || !this.roomState) {
+      const activeState = this.dailyReviewActive
+        ? this.dailyReviewState
+        : this.roomState;
+      if (this.renderer3d.modalOpen || !activeState) {
         this.hideCursorPill();
         this.hideTouchPrecisionTray();
         return;
@@ -2425,7 +2516,7 @@ class MazingContestClient {
 
       // 2. Mobile Touch Two-Stage Precision Preview (Stationary Tray + Non-Blocking Micro-Tag)
       if (info.isTouchPreview) {
-        if (this.roomState.phase !== 'BUILD' || !info.cell) {
+        if (activeState.phase !== 'BUILD' || !info.cell) {
           this.hideTouchPrecisionTray();
           this.hideCursorPill();
           return;
@@ -2543,7 +2634,7 @@ class MazingContestClient {
       if (
         !info.cell ||
         info.offscreen ||
-        this.roomState.phase !== 'BUILD'
+        activeState.phase !== 'BUILD'
       ) {
         this.hideCursorPill();
         return;
@@ -2745,6 +2836,9 @@ class MazingContestClient {
     f: InspectedWorldFeature,
     isTouchInspect = false
   ): string {
+    const activeState = this.dailyReviewActive
+      ? this.dailyReviewState
+      : this.roomState;
     const closeBtn = isTouchInspect
       ? `<button type="button" class="inspect-dismiss-btn" data-dismiss-inspect="true" aria-label="Dismiss">${icon(
           'close',
@@ -2755,7 +2849,7 @@ class MazingContestClient {
     if (f.kind === 'SPIRE') {
       const spec = TOWER_SPECS[f.spireType];
       const pips = this.renderOverchargeDiamonds(f.overchargeTier);
-      const runnerType = this.roomState?.roundConfig.runnerType || 'SCOUT';
+      const runnerType = activeState?.roundConfig.runnerType || 'SCOUT';
       const eff = getEffectiveSpireStats(
         f.spireType,
         f.overchargeTier,
@@ -2786,7 +2880,7 @@ class MazingContestClient {
         )}s · ${eff.effectiveRange.toFixed(1)}m`;
       }
 
-      const isRun = this.roomState?.phase === 'RUN';
+      const isRun = activeState?.phase === 'RUN';
       const armorNote = eff.armoredReduced
         ? ' · Armor resists until 1◆'
         : '';
@@ -2842,7 +2936,7 @@ class MazingContestClient {
       const statusPart = f.statusLabel
         ? `<span class="inspect-meta">· ${escapeHtml(f.statusLabel)}</span>`
         : '';
-      const isRunPhase = this.roomState?.phase === 'RUN';
+      const isRunPhase = activeState?.phase === 'RUN';
       const subText = isRunPhase
         ? `Speed ${f.currentSpeed.toFixed(2)} m/s (base ${f.baseSpeed.toFixed(
             2
@@ -3036,6 +3130,9 @@ class MazingContestClient {
       this.roomCode = null;
       this.syncUrlRoomCode(null);
       return;
+    }
+    if (this.dailyReviewActive) {
+      this.exitDailyMazeReview('none');
     }
     this.roomState = null;
     this.localPlayerId = null;
@@ -3748,6 +3845,9 @@ class MazingContestClient {
     mobilePlayPane?: 'rooms' | 'setup',
     returnToMatch = false
   ) {
+    if (this.dailyReviewActive) {
+      this.exitDailyMazeReview('none');
+    }
     this.activeMenuScreen = screen;
     this.returnToMatchOnBack = Boolean(
       returnToMatch && this.roomState && this.roomState.phase !== 'LOBBY'
@@ -3894,7 +3994,9 @@ class MazingContestClient {
       this.roomState.mode === 'TUTORIAL'
         ? 'Guided Tutorial'
         : this.roomState.mode === 'DAILY'
-        ? `Daily Maze #${this.roomState.dailyPuzzleNumber || 1}`
+        ? `Daily Maze #${this.roomState.dailyPuzzleNumber || 1} (${
+            this.roomState.dailyAttemptNumber || 1
+          }/${this.roomState.dailyMaxAttempts || DAILY_MAX_ATTEMPTS})`
         : this.roomState.mode === 'SOLO'
         ? 'Solo Match'
         : `Room ${this.roomState.roomCode}`;
@@ -3935,6 +4037,523 @@ class MazingContestClient {
     }
   }
 
+  private applyDailyPayload(data: DailyMazePayload) {
+    this.dailyData = data;
+    if (
+      data.dateKey &&
+      data.roundConfig &&
+      Array.isArray(data.myAttempts) &&
+      data.myAttempts.length > 0
+    ) {
+      saveDailyMazesToLocalCache(data.dateKey, data.roundConfig, data.myAttempts);
+    }
+    this.updateHomeDailyBadge();
+    this.renderDailyScreen();
+    if (this.dailyReviewActive) {
+      const merged = this.getSavedDailyMazesForToday();
+      if (merged) {
+        this.dailyReviewRoundConfig = merged.roundConfig;
+        this.dailyReviewAttempts = merged.attempts;
+        this.updateDailyReviewToolbarUI();
+      }
+    }
+    if (
+      this.roomState?.mode === 'DAILY' &&
+      this.roomState.phase === 'GAME_OVER'
+    ) {
+      this.renderRoundResultsModal(this.roomState);
+    }
+  }
+
+  private getSavedDailyMazesForToday(): {
+    dateKey: string;
+    puzzleNumber: number;
+    roundConfig: RoundConfig;
+    attempts: DailyMazeAttempt[];
+    bestAttemptNumber: number;
+    attemptsRemaining: number;
+  } | null {
+    const d = this.dailyData;
+    const dateKey =
+      d?.dateKey ||
+      (this.roomState?.mode === 'DAILY' ? this.roomState.dailyDateKey : '') ||
+      '';
+    if (!dateKey) return null;
+
+    const cached = loadDailyMazesFromLocalCache(dateKey);
+    const serverAttempts = Array.isArray(d?.myAttempts) ? d.myAttempts : [];
+    const mergedByNum = new Map<number, DailyMazeAttempt>();
+
+    if (cached) {
+      for (const a of cached.attempts) {
+        mergedByNum.set(a.attemptNumber, a);
+      }
+    }
+    for (const a of serverAttempts) {
+      const prev = mergedByNum.get(a.attemptNumber);
+      // Prefer server record, but preserve locally cached towers if a legacy row had empty towers
+      const towers =
+        Array.isArray(a.towers) && a.towers.length > 0
+          ? a.towers
+          : prev?.towers || a.towers || [];
+      mergedByNum.set(a.attemptNumber, { ...a, towers });
+    }
+
+    // Also include the just-finished room attempt if WS DAILY_LEADERBOARD_DATA hasn't arrived yet
+    if (
+      this.roomState?.mode === 'DAILY' &&
+      this.roomState.phase === 'GAME_OVER' &&
+      (!this.roomState.dailyDateKey || this.roomState.dailyDateKey === dateKey)
+    ) {
+      const me = this.getLocalPlayer();
+      const attemptNum =
+        this.roomState.dailyLastAttemptOutcome?.attemptNumber ||
+        this.roomState.dailyAttemptNumber ||
+        Math.max(1, mergedByNum.size + 1);
+      if (me && !mergedByNum.has(attemptNum)) {
+        const runTime = Number((me.lastRoundTime ?? 0).toFixed(2));
+        const parTime = this.roomState.roundConfig.parTimeSeconds;
+        mergedByNum.set(attemptNum, {
+          id: `local_${dateKey}_a${attemptNum}`,
+          attemptNumber: attemptNum,
+          survivalTimeSeconds: runTime,
+          parTimeSeconds: parTime,
+          beatPar: runTime >= parTime,
+          clapsTaken: me.lastRoundClaps || 0,
+          overchargedSpires: me.lastRoundOvercharge || 0,
+          linkedKeeps: me.lastRoundKeeps || 0,
+          pathDistance: Number((me.pathDistance || 0).toFixed(1)),
+          wallsUsed: me.towers.length,
+          towers: me.towers.map((t) => ({ x: t.x, y: t.y })),
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    const attempts = [...mergedByNum.values()].sort(
+      (a, b) => a.attemptNumber - b.attemptNumber
+    );
+    const roundConfig =
+      d?.roundConfig ||
+      (this.roomState?.mode === 'DAILY' ? this.roomState.roundConfig : null) ||
+      cached?.roundConfig ||
+      null;
+
+    if (!roundConfig || attempts.length === 0) return null;
+
+    const maxAttempts = d?.maxAttempts || DAILY_MAX_ATTEMPTS;
+    const attemptsUsed = Math.max(d?.attemptsUsed || 0, attempts.length);
+    const bestAttemptNumber =
+      d?.bestAttemptNumber ||
+      this.roomState?.dailyLastAttemptOutcome?.bestAttemptNumber ||
+      attempts.reduce((best, cur) =>
+        cur.survivalTimeSeconds > best.survivalTimeSeconds ? cur : best
+      ).attemptNumber;
+
+    return {
+      dateKey,
+      puzzleNumber: d?.puzzleNumber || this.roomState?.dailyPuzzleNumber || 1,
+      roundConfig,
+      attempts,
+      bestAttemptNumber,
+      attemptsRemaining: Math.max(0, maxAttempts - attemptsUsed),
+    };
+  }
+
+  private startDailyAttempt() {
+    if (!this.ensureConnectedForAction()) return;
+    soundEngine.playUiClick();
+    this.cleanupTutorialVisuals();
+    if (this.dailyReviewActive) {
+      this.exitDailyMazeReview('none');
+    }
+    this.pendingJoinToast = null;
+    this.send({
+      type: 'START_DAILY',
+      playerName: this.playerName,
+      sessionId: this.sessionId,
+      dailyClientId: this.dailyClientId,
+    });
+  }
+
+  private openDailyMazeReview(
+    attemptNumber?: number,
+    returnTo: 'daily' | 'results' = 'daily'
+  ) {
+    const saved = this.getSavedDailyMazesForToday();
+    if (!saved) {
+      this.showToast('Play a Daily Maze attempt first to view your saved maze.');
+      return;
+    }
+
+    this.dailyReviewActive = true;
+    this.dailyReviewReturnTo = returnTo;
+    this.dailyReviewRoundConfig = saved.roundConfig;
+    this.dailyReviewAttempts = saved.attempts;
+    const chosen =
+      saved.attempts.find((a) => a.attemptNumber === attemptNumber) ||
+      saved.attempts.find((a) => a.attemptNumber === saved.bestAttemptNumber) ||
+      saved.attempts[0];
+    this.dailyReviewSelectedAttempt = chosen.attemptNumber;
+
+    document.body.dataset.dailyReview = 'true';
+    document.body.dataset.inMenu = 'false';
+
+    document.getElementById('home-hub-modal')?.classList.add('hidden');
+    const resultsModal = document.getElementById('results-modal');
+    if (resultsModal) {
+      resultsModal.classList.add('hidden');
+      resultsModal.classList.remove('peek-minimized');
+    }
+    this.dismissAllTransientOverlays();
+    this.renderer3d.cancelTouchGhost();
+    this.hideTouchPrecisionTray();
+    this.hideCursorPill();
+
+    document.getElementById('daily-review-banner')?.classList.remove('hidden');
+    document.getElementById('daily-review-bar')?.classList.remove('hidden');
+
+    this.renderDailyReviewAttempt(this.dailyReviewSelectedAttempt, true);
+    this.syncModalOpenState();
+    this.scheduleHudSafeInsetsSync();
+  }
+
+  private renderDailyReviewAttempt(attemptNumber: number, resetCamera = false) {
+    if (!this.dailyReviewActive || !this.dailyReviewRoundConfig) return;
+    const attempt =
+      this.dailyReviewAttempts.find((a) => a.attemptNumber === attemptNumber) ||
+      this.dailyReviewAttempts[0];
+    if (!attempt) return;
+
+    this.dailyReviewSelectedAttempt = attempt.attemptNumber;
+    this.dailyReviewReplayActive = false;
+    this.dailyReviewReplaySim = null;
+    this.dailyReviewReplayAccum = 0;
+
+    const roundConfig = this.dailyReviewRoundConfig;
+    const placedTowers: PlacedTower[] = (attempt.towers || []).map((pt, idx) => ({
+      id: `rev_a${attempt.attemptNumber}_${idx}`,
+      type: 'BLOCK',
+      x: pt.x,
+      y: pt.y,
+      createdAt: attempt.timestamp || 0,
+    }));
+
+    const wallCost = TOWER_SPECS.BLOCK.goldCost;
+    const remainingGold = Math.max(
+      0,
+      roundConfig.startingGold - placedTowers.length * wallCost
+    );
+    const puzzleNum =
+      this.dailyData?.puzzleNumber || this.roomState?.dailyPuzzleNumber || 1;
+    const dateKey =
+      this.dailyData?.dateKey || this.roomState?.dailyDateKey || '';
+
+    const reviewState: RoomState = {
+      roomCode: 'REVIEW',
+      mode: 'DAILY',
+      dailyDateKey: dateKey,
+      dailyPuzzleNumber: puzzleNum,
+      dailyAttemptNumber: attempt.attemptNumber,
+      dailyMaxAttempts: this.dailyData?.maxAttempts || DAILY_MAX_ATTEMPTS,
+      phase: 'GAME_OVER',
+      settings: {
+        roomName: `Daily Maze #${puzzleNum}`,
+        isPublic: false,
+        totalRounds: 1,
+        buildTimeSeconds: roundConfig.buildTimeSeconds || 120,
+        goldMultiplier: 1,
+        botCount: 0,
+        botDifficulty: 'ARCHITECT',
+        fogOfWar: false,
+      },
+      currentRoundIndex: 0,
+      roundsCompleted: 1,
+      roundConfig,
+      phaseTimeRemaining: 0,
+      simSpeedMultiplier: this.dailyReviewReplaySpeed,
+      players: [
+        {
+          id: 'daily_review_local',
+          name: this.playerName,
+          color: this.dailyData?.myStanding?.entry.playerColor || '#38bdf8',
+          isBot: false,
+          isHost: true,
+          ready: true,
+          gold: remainingGold,
+          towers: placedTowers,
+          pathDistance: attempt.pathDistance,
+          totalScore: 0,
+          lastRoundTime: attempt.survivalTimeSeconds,
+          lastRoundPoints: 0,
+          lastRoundClaps: attempt.clapsTaken,
+          lastRoundOvercharge: attempt.overchargedSpires,
+          lastRoundKeeps: attempt.linkedKeeps,
+          bestMazeTime: attempt.survivalTimeSeconds,
+          roundHistory: [],
+        },
+      ],
+      chat: [],
+    };
+
+    this.dailyReviewState = reviewState;
+    this.renderer3d.syncRoomState(reviewState, 'daily_review_local');
+    if (resetCamera) {
+      this.renderer3d.resetToMyIsland();
+    }
+    this.updateDailyReviewToolbarUI();
+  }
+
+  private updateDailyReviewToolbarUI(liveElapsedSec?: number) {
+    if (!this.dailyReviewActive) return;
+    const saved = this.getSavedDailyMazesForToday();
+    const attempts = saved?.attempts || this.dailyReviewAttempts;
+    const bestAttemptNum =
+      saved?.bestAttemptNumber ||
+      this.dailyData?.bestAttemptNumber ||
+      attempts[0]?.attemptNumber ||
+      1;
+    const attemptsRemaining = saved?.attemptsRemaining ?? 0;
+    const current =
+      attempts.find((a) => a.attemptNumber === this.dailyReviewSelectedAttempt) ||
+      attempts[0];
+    if (!current) return;
+
+    const titleEl = document.getElementById('daily-review-title');
+    const statsEl = document.getElementById('daily-review-stats');
+    const attemptsEl = document.getElementById('daily-review-attempts');
+    const replayBtn = document.getElementById('btn-daily-review-replay');
+    const replayLabel = document.getElementById('daily-review-replay-label');
+    const retryBtn = document.getElementById('btn-daily-review-retry');
+    const closeLabel = document.getElementById('daily-review-close-label');
+
+    const puzzleNum =
+      saved?.puzzleNumber ||
+      this.dailyData?.puzzleNumber ||
+      this.roomState?.dailyPuzzleNumber ||
+      1;
+    const isBest = attempts.length > 1 && current.attemptNumber === bestAttemptNum;
+
+    if (titleEl) {
+      titleEl.textContent = `Daily #${puzzleNum} · Attempt ${current.attemptNumber}${
+        isBest ? ' ★ Best' : ''
+      }`;
+    }
+    if (statsEl) {
+      if (typeof liveElapsedSec === 'number') {
+        statsEl.textContent = `Replaying ${liveElapsedSec.toFixed(2)}s / ${current.survivalTimeSeconds.toFixed(
+          2
+        )}s`;
+      } else {
+        const legacyNote =
+          current.wallsUsed > 0 && current.towers.length === 0
+            ? ' · (Legacy layout)'
+            : '';
+        statsEl.textContent = `${current.survivalTimeSeconds.toFixed(
+          2
+        )}s · ${current.clapsTaken} Hits · ${current.overchargedSpires}◆ · ${Math.round(
+          current.pathDistance
+        )}m${legacyNote}`;
+      }
+    }
+
+    if (attemptsEl) {
+      attemptsEl.innerHTML = attempts
+        .map((a) => {
+          const active = a.attemptNumber === current.attemptNumber;
+          const star =
+            attempts.length > 1 && a.attemptNumber === bestAttemptNum
+              ? ' ★'
+              : '';
+          return `
+            <button
+              type="button"
+              class="daily-review-tab${active ? ' active' : ''}"
+              data-review-tab="${a.attemptNumber}"
+            >
+              <span>Attempt ${a.attemptNumber}${star}</span>
+              <strong>${a.survivalTimeSeconds.toFixed(2)}s</strong>
+            </button>
+          `;
+        })
+        .join('');
+      attemptsEl
+        .querySelectorAll<HTMLButtonElement>('[data-review-tab]')
+        .forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const num = Number(btn.dataset.reviewTab);
+            if (!Number.isFinite(num) || num === this.dailyReviewSelectedAttempt) {
+              return;
+            }
+            soundEngine.playUiClick();
+            this.renderDailyReviewAttempt(num, false);
+          });
+        });
+    }
+
+    if (replayBtn && replayLabel) {
+      replayBtn.classList.toggle('active', this.dailyReviewReplayActive);
+      replayLabel.textContent = this.dailyReviewReplayActive
+        ? 'Stop Replay'
+        : 'Replay Run';
+    }
+
+    document
+      .querySelectorAll<HTMLButtonElement>('[data-review-speed]')
+      .forEach((btn) => {
+        btn.classList.toggle(
+          'active',
+          Number(btn.dataset.reviewSpeed) === this.dailyReviewReplaySpeed
+        );
+      });
+
+    if (retryBtn) {
+      retryBtn.classList.toggle('hidden', attemptsRemaining <= 0);
+    }
+    if (closeLabel) {
+      closeLabel.textContent =
+        this.dailyReviewReturnTo === 'results'
+          ? 'Back to Results'
+          : 'Daily Board';
+    }
+  }
+
+  private startOrStopDailyReviewReplay() {
+    if (!this.dailyReviewActive || !this.dailyReviewState) return;
+    if (this.dailyReviewReplayActive) {
+      this.renderDailyReviewAttempt(this.dailyReviewSelectedAttempt, false);
+      return;
+    }
+
+    const player = this.dailyReviewState.players[0];
+    if (!player) return;
+
+    this.dailyReviewState = {
+      ...this.dailyReviewState,
+      phase: 'RUN',
+      simSpeedMultiplier: this.dailyReviewReplaySpeed,
+    };
+    this.renderer3d.syncRoomState(this.dailyReviewState, 'daily_review_local');
+
+    const sim = new MazeRunnerSimulator(
+      'daily_review_local',
+      this.dailyReviewState.roundConfig,
+      player.towers
+    );
+    this.dailyReviewReplaySim = sim;
+    this.dailyReviewReplayAccum = 0;
+    this.dailyReviewReplayActive = true;
+    soundEngine.playRunStart();
+
+    const stateMap = new Map<string, RunnerSimState>();
+    stateMap.set('daily_review_local', sim.state);
+    this.renderer3d.updateRunners(stateMap, []);
+    this.updateDailyReviewToolbarUI(0);
+  }
+
+  private stepDailyReviewReplay(dt: number) {
+    if (
+      !this.dailyReviewActive ||
+      !this.dailyReviewReplayActive ||
+      !this.dailyReviewReplaySim
+    ) {
+      return;
+    }
+
+    this.dailyReviewReplayAccum += dt * this.dailyReviewReplaySpeed;
+    const events: SimEvent[] = [];
+    while (this.dailyReviewReplayAccum >= SIM_DT) {
+      this.dailyReviewReplayAccum -= SIM_DT;
+      if (!this.dailyReviewReplaySim.state.finished) {
+        const evs = this.dailyReviewReplaySim.step(SIM_DT);
+        events.push(...evs);
+      }
+    }
+
+    for (const ev of events) {
+      if (ev.type === 'CLAP') {
+        if (ev.armoredResisted) {
+          soundEngine.playArmorDeflect(0.85);
+        } else {
+          soundEngine.playSpirePulse(
+            ev.spireType || 'THUNDERCLAP',
+            ev.overchargeTier || 0,
+            0.85
+          );
+        }
+      } else if (ev.type === 'WAYGATE') {
+        soundEngine.playChronoWarp(0.85);
+      } else if (ev.type === 'CHECKPOINT') {
+        soundEngine.playCheckpoint(0.85);
+      } else if (ev.type === 'FINISH') {
+        soundEngine.playFinish();
+      }
+    }
+
+    const stateMap = new Map<string, RunnerSimState>();
+    stateMap.set('daily_review_local', this.dailyReviewReplaySim.state);
+    this.renderer3d.updateRunners(stateMap, events);
+
+    const sim = this.dailyReviewReplaySim;
+    const elapsed = sim.state.finished
+      ? sim.state.finishTimeSeconds
+      : sim.elapsedSeconds;
+
+    if (sim.state.finished) {
+      this.dailyReviewReplayActive = false;
+      this.updateDailyReviewToolbarUI();
+    } else {
+      const statsEl = document.getElementById('daily-review-stats');
+      const current = this.dailyReviewAttempts.find(
+        (a) => a.attemptNumber === this.dailyReviewSelectedAttempt
+      );
+      if (statsEl && current) {
+        statsEl.textContent = `Replaying ${elapsed.toFixed(
+          2
+        )}s / ${current.survivalTimeSeconds.toFixed(2)}s`;
+      }
+    }
+  }
+
+  private exitDailyMazeReview(openTarget?: 'daily' | 'results' | 'none') {
+    if (!this.dailyReviewActive) return;
+    const target = openTarget ?? this.dailyReviewReturnTo;
+    this.dailyReviewActive = false;
+    this.dailyReviewReplayActive = false;
+    this.dailyReviewReplaySim = null;
+    this.dailyReviewReplayAccum = 0;
+    this.dailyReviewState = null;
+
+    delete document.body.dataset.dailyReview;
+    document.getElementById('daily-review-banner')?.classList.add('hidden');
+    document.getElementById('daily-review-bar')?.classList.add('hidden');
+    this.hideCursorPill();
+
+    if (
+      target === 'results' &&
+      this.roomState?.mode === 'DAILY' &&
+      this.roomState.phase === 'GAME_OVER'
+    ) {
+      this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+      const resultsModal = document.getElementById('results-modal');
+      if (resultsModal) {
+        resultsModal.classList.remove('peek-minimized');
+        resultsModal.classList.remove('hidden');
+      }
+      this.renderRoundResultsModal(this.roomState);
+    } else if (target === 'daily') {
+      if (this.roomState) {
+        this.renderer3d.syncRoomState(this.roomState, this.localPlayerId);
+      } else {
+        this.renderMenuBackdropIsland();
+      }
+      this.openMenuScreen('daily');
+    }
+
+    this.syncModalOpenState();
+    this.scheduleHudSafeInsetsSync();
+  }
+
   private updateHomeDailyBadge() {
     const badge = document.getElementById('home-daily-badge');
     if (!badge) return;
@@ -3943,11 +4562,22 @@ class MazingContestClient {
       badge.classList.remove('completed');
       return;
     }
-    if (this.dailyData.completedToday && this.dailyData.myStanding) {
+    const maxAttempts = this.dailyData.maxAttempts || DAILY_MAX_ATTEMPTS;
+    const attemptsUsed =
+      typeof this.dailyData.attemptsUsed === 'number'
+        ? this.dailyData.attemptsUsed
+        : this.dailyData.completedToday
+        ? maxAttempts
+        : 0;
+
+    if (attemptsUsed >= maxAttempts && this.dailyData.myStanding) {
       badge.textContent = `✓ #${this.dailyData.myStanding.rank} / ${this.dailyData.totalParticipants}`;
       badge.classList.add('completed');
+    } else if (attemptsUsed > 0 && this.dailyData.myStanding) {
+      badge.textContent = `${attemptsUsed}/${maxAttempts} Used · #${this.dailyData.myStanding.rank}`;
+      badge.classList.remove('completed');
     } else {
-      badge.textContent = `Daily #${this.dailyData.puzzleNumber}`;
+      badge.textContent = `Daily #${this.dailyData.puzzleNumber} · ${maxAttempts} Tries`;
       badge.classList.remove('completed');
     }
   }
@@ -4060,9 +4690,8 @@ class MazingContestClient {
         cache: 'no-store',
       });
       if (res.ok) {
-        this.dailyData = await res.json();
-        this.updateHomeDailyBadge();
-        this.renderDailyScreen();
+        const data = (await res.json()) as DailyMazePayload;
+        this.applyDailyPayload(data);
       }
     } catch {
       // ignore transient network errors
@@ -4091,6 +4720,22 @@ class MazingContestClient {
     const d = this.dailyData;
     const p = d.puzzle;
     const arch = RUNNER_ARCHETYPES[p.runnerType || 'SCOUT'];
+    const maxAttempts = d.maxAttempts || DAILY_MAX_ATTEMPTS;
+    const attemptsUsed =
+      typeof d.attemptsUsed === 'number'
+        ? d.attemptsUsed
+        : d.completedToday
+        ? maxAttempts
+        : 0;
+    const attemptsRemaining = Math.max(0, maxAttempts - attemptsUsed);
+    const saved = this.getSavedDailyMazesForToday();
+    const myAttempts = saved?.attempts || d.myAttempts || [];
+    const bestAttemptNum =
+      d.bestAttemptNumber ||
+      saved?.bestAttemptNumber ||
+      myAttempts[0]?.attemptNumber ||
+      1;
+    const canViewSavedMazes = Boolean(saved && saved.attempts.length > 0);
 
     if (titleEl) titleEl.textContent = `Daily Maze #${d.puzzleNumber}`;
     if (dateEl) dateEl.textContent = formatDailyDateLabel(d.dateKey);
@@ -4126,62 +4771,182 @@ class MazingContestClient {
       }`;
     }
 
+    const renderAttemptsListHtml = () => {
+      if (myAttempts.length === 0) return '';
+      return `
+        <div class="daily-attempts-list">
+          ${myAttempts
+            .map((a) => {
+              const isBest =
+                myAttempts.length > 1 && a.attemptNumber === bestAttemptNum;
+              const loggedBadge = isBest
+                ? `<span class="par-pill daily-best-badge">${icon(
+                    'starFilled',
+                    10
+                  )}<span>Best · Logged</span></span>`
+                : myAttempts.length === 1
+                ? `<span class="meta-pill daily-logged-pill">Logged</span>`
+                : '';
+              const parBadge = a.beatPar
+                ? `<span class="par-pill">${icon('starFilled', 10)}<span>Par</span></span>`
+                : '';
+              return `
+                <div class="daily-attempt-row${isBest ? ' is-best' : ''}">
+                  <div class="daily-attempt-info">
+                    <div class="daily-attempt-top">
+                      <strong>Attempt ${a.attemptNumber}</strong>
+                      <span class="daily-attempt-time">${a.survivalTimeSeconds.toFixed(
+                        2
+                      )}s</span>
+                      ${loggedBadge}
+                      ${parBadge}
+                    </div>
+                    <div class="daily-attempt-meta">
+                      <span>${icon('bolt', 11)} ${a.clapsTaken}</span>
+                      <span>·</span>
+                      <span>${icon('diamondFilled', 10)} ${
+                a.overchargedSpires
+              }</span>
+                      <span>·</span>
+                      <span>${Math.round(a.pathDistance)}m</span>
+                      <span>·</span>
+                      <span>${a.wallsUsed} Walls</span>
+                    </div>
+                  </div>
+                  ${
+                    canViewSavedMazes
+                      ? `<button
+                          type="button"
+                          class="mini-action-btn daily-view-attempt-btn"
+                          data-review-attempt="${a.attemptNumber}"
+                          title="Inspect &amp; replay Attempt ${a.attemptNumber} in 3D"
+                        >
+                          ${icon('eye', 13)}<span>View</span>
+                        </button>`
+                      : ''
+                  }
+                </div>
+              `;
+            })
+            .join('')}
+        </div>
+      `;
+    };
+
     if (ctaArea) {
       const playerStrip = document.getElementById('daily-player-strip');
       if (playerStrip) {
-        playerStrip.classList.toggle('hidden', Boolean(d.completedToday));
+        playerStrip.classList.toggle('hidden', attemptsRemaining === 0);
       }
       this.syncAllNameInputs();
 
-      if (d.completedToday && d.myStanding) {
+      if (attemptsRemaining === 0 && d.myStanding) {
         const s = d.myStanding;
         const rankLabel = formatDailyRankLabel(s.rank, s.totalParticipants);
         ctaArea.innerHTML = `
           <div class="daily-completed-box">
             <div class="daily-completed-head">
-              <span class="meta-pill daily-done-pill">${icon('check', 13)} Completed Today</span>
-              <strong>${s.entry.survivalTimeSeconds.toFixed(2)}s</strong>
+              <span class="meta-pill daily-done-pill">${icon(
+                'check',
+                13
+              )} ${attemptsUsed}/${maxAttempts} Complete</span>
+              <strong>Best: ${s.entry.survivalTimeSeconds.toFixed(2)}s</strong>
               ${
                 s.entry.beatPar
-                  ? `<span class="par-pill">${icon('starFilled', 11)} Beat Par</span>`
+                  ? `<span class="par-pill">${icon(
+                      'starFilled',
+                      11
+                    )} Beat Par</span>`
                   : ''
               }
             </div>
             <p class="daily-completed-sub">
-              You placed <strong>${escapeHtml(rankLabel)}</strong>. A new maze unlocks at midnight UTC!
+              Your best run placed <strong>${escapeHtml(
+                rankLabel
+              )}</strong>. You can re-view your mazes anytime before midnight UTC!
             </p>
-            <button type="button" id="btn-daily-share" class="dock-ready-btn daily-play-cta">
-              ${icon('share', 15)}<span>Share Result</span>
-            </button>
+            ${renderAttemptsListHtml()}
+            <div class="daily-completed-actions">
+              ${
+                canViewSavedMazes
+                  ? `<button type="button" id="btn-daily-view-mazes" class="hub-secondary-btn daily-action-half">
+                      ${icon('eye', 15)}<span>View My Mazes</span>
+                    </button>`
+                  : ''
+              }
+              <button type="button" id="btn-daily-share" class="dock-ready-btn daily-action-half">
+                ${icon('share', 15)}<span>Share Result</span>
+              </button>
+            </div>
           </div>
         `;
-        document
-          .getElementById('btn-daily-share')
-          ?.addEventListener('click', (ev) => {
-            soundEngine.playUiClick();
-            this.shareDailyResult(ev.currentTarget as HTMLButtonElement | null);
-          });
+      } else if (attemptsUsed > 0 && d.myStanding) {
+        const s = d.myStanding;
+        const rankLabel = formatDailyRankLabel(s.rank, s.totalParticipants);
+        ctaArea.innerHTML = `
+          <div class="daily-progress-box">
+            <div class="daily-completed-head">
+              <span class="meta-pill daily-remaining-pill">${icon(
+                'clock',
+                12
+              )} ${attemptsRemaining} Attempt Left</span>
+              <strong>Best: ${s.entry.survivalTimeSeconds.toFixed(2)}s</strong>
+            </div>
+            <p class="daily-completed-sub">
+              Currently <strong>${escapeHtml(
+                rankLabel
+              )}</strong>. Play Attempt ${attemptsUsed + 1} of ${maxAttempts} — only your best score counts!
+            </p>
+            ${renderAttemptsListHtml()}
+            <div class="daily-completed-actions">
+              <button type="button" id="btn-start-daily" class="dock-ready-btn daily-action-main">
+                ${icon('play', 15)}<span>Start Attempt ${
+          attemptsUsed + 1
+        } of ${maxAttempts}</span>
+              </button>
+              <button type="button" id="btn-daily-share" class="hub-secondary-btn daily-action-side" title="Share your current best">
+                ${icon('share', 14)}<span>Share</span>
+              </button>
+            </div>
+          </div>
+        `;
       } else {
         ctaArea.innerHTML = `
           <button type="button" id="btn-start-daily" class="dock-ready-btn daily-play-cta">
-            ${icon('play', 15)}<span>Play Today's Maze</span>
+            ${icon('play', 15)}<span>Play Attempt 1 of ${maxAttempts}</span>
           </button>
         `;
-        document
-          .getElementById('btn-start-daily')
-          ?.addEventListener('click', () => {
-            if (!this.ensureConnectedForAction()) return;
-            soundEngine.playUiClick();
-            this.cleanupTutorialVisuals();
-            this.pendingJoinToast = null;
-            this.send({
-              type: 'START_DAILY',
-              playerName: this.playerName,
-              sessionId: this.sessionId,
-              dailyClientId: this.dailyClientId,
-            });
-          });
       }
+
+      document
+        .getElementById('btn-start-daily')
+        ?.addEventListener('click', () => {
+          this.startDailyAttempt();
+        });
+      document
+        .getElementById('btn-daily-share')
+        ?.addEventListener('click', (ev) => {
+          soundEngine.playUiClick();
+          this.shareDailyResult(ev.currentTarget as HTMLButtonElement | null);
+        });
+      document
+        .getElementById('btn-daily-view-mazes')
+        ?.addEventListener('click', () => {
+          soundEngine.playUiClick();
+          this.openDailyMazeReview(bestAttemptNum, 'daily');
+        });
+      ctaArea
+        .querySelectorAll<HTMLButtonElement>('[data-review-attempt]')
+        .forEach((btn) => {
+          btn.addEventListener('click', () => {
+            soundEngine.playUiClick();
+            const attNum = Number(btn.dataset.reviewAttempt);
+            this.openDailyMazeReview(
+              Number.isFinite(attNum) ? attNum : bestAttemptNum,
+              'daily'
+            );
+          });
+        });
     }
 
     if (tableWrap) {
@@ -4199,9 +4964,13 @@ class MazingContestClient {
         );
         standingBar.innerHTML = `
           <div class="standing-left">
-            <span class="you-badge">Your Position</span>
+            <span class="you-badge">Your Best (${attemptsUsed}/${maxAttempts})</span>
             <strong>${escapeHtml(shortRank)}</strong>
-            ${inTop10 && s.totalParticipants > 1 ? `<span class="meta-pill">Top 10!</span>` : ''}
+            ${
+              inTop10 && s.totalParticipants > 1
+                ? `<span class="meta-pill">Top 10!</span>`
+                : ''
+            }
           </div>
           <div class="standing-right">
             <strong>${s.entry.survivalTimeSeconds.toFixed(2)}s</strong>
@@ -4216,7 +4985,7 @@ class MazingContestClient {
         standingBar.innerHTML = `
           <div class="standing-left">
             <span class="meta-pill">Your Position</span>
-            <span>Not ranked yet today — play your daily attempt to claim your spot!</span>
+            <span>Not ranked yet today — you have ${maxAttempts} attempts (best score counts)!</span>
           </div>
         `;
       }
@@ -4233,8 +5002,12 @@ class MazingContestClient {
       e.survivalTimeSeconds,
       e.parTimeSeconds
     );
+    const maxAttempts = d.maxAttempts || DAILY_MAX_ATTEMPTS;
+    const attemptsUsed = d.attemptsUsed || e.attemptsUsed || 1;
+    const bestSuffix =
+      attemptsUsed > 1 ? ` (Best of ${attemptsUsed}/${maxAttempts})` : '';
     const shareText = [
-      `🏰 Mazing Contest · Daily Maze #${d.puzzleNumber} (${d.dateKey})`,
+      `🏰 Mazing Contest · Daily Maze #${d.puzzleNumber} (${d.dateKey})${bestSuffix}`,
       parBar,
       `⏱️ ${e.survivalTimeSeconds.toFixed(2)}s · 🏆 ${rankStr}`,
       `⚡ ${e.clapsTaken} Spire Hits · ◆ ${e.overchargedSpires} Overcharge · 🧱 ${e.wallsUsed} Walls`,
@@ -4610,6 +5383,47 @@ class MazingContestClient {
       });
 
     document
+      .getElementById('btn-results-daily-retry')
+      ?.addEventListener('click', () => {
+        this.startDailyAttempt();
+      });
+
+    document
+      .getElementById('btn-daily-review-replay')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.startOrStopDailyReviewReplay();
+      });
+
+    document
+      .querySelectorAll<HTMLButtonElement>('[data-review-speed]')
+      .forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const speed = Number(btn.dataset.reviewSpeed) as 1 | 2 | 4;
+          if (![1, 2, 4].includes(speed)) return;
+          soundEngine.playUiClick();
+          this.dailyReviewReplaySpeed = speed;
+          if (this.dailyReviewState) {
+            this.dailyReviewState.simSpeedMultiplier = speed;
+          }
+          this.updateDailyReviewToolbarUI();
+        });
+      });
+
+    document
+      .getElementById('btn-daily-review-retry')
+      ?.addEventListener('click', () => {
+        this.startDailyAttempt();
+      });
+
+    document
+      .getElementById('btn-daily-review-close')
+      ?.addEventListener('click', () => {
+        soundEngine.playUiClick();
+        this.exitDailyMazeReview();
+      });
+
+    document
       .getElementById('btn-results-home')
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
@@ -4676,10 +5490,13 @@ class MazingContestClient {
       }
       const isDailyActive =
         this.roomState.mode === 'DAILY' && this.roomState.phase !== 'GAME_OVER';
+      const dailyAttLabel = `End Attempt ${this.roomState.dailyAttemptNumber || 1}/${
+        this.roomState.dailyMaxAttempts || DAILY_MAX_ATTEMPTS
+      }?`;
       this.armDestructiveButton(
         leaveHomeBtn,
         isDailyActive || this.roomState.phase === 'BUILD',
-        isDailyActive ? 'End Daily Try?' : 'Confirm Leave',
+        isDailyActive ? dailyAttLabel : 'Confirm Leave',
         'logout',
         () => {
           soundEngine.playUiClick();
@@ -6229,6 +7046,10 @@ class MazingContestClient {
           this.syncModalOpenState();
           return;
         }
+        if (this.dailyReviewActive) {
+          this.exitDailyMazeReview();
+          return;
+        }
         const lobbyDrawerEl = document.getElementById('lobby-drawer');
         if (lobbyDrawerEl && !lobbyDrawerEl.classList.contains('hidden')) {
           this.dismissAllTransientOverlays();
@@ -6645,6 +7466,17 @@ class MazingContestClient {
       .getElementById('btn-peek-mazes')
       ?.addEventListener('click', () => {
         soundEngine.playUiClick();
+        if (
+          this.roomState?.mode === 'DAILY' &&
+          this.roomState.phase === 'GAME_OVER'
+        ) {
+          const attNum =
+            this.roomState.dailyLastAttemptOutcome?.attemptNumber ||
+            this.roomState.dailyAttemptNumber ||
+            1;
+          this.openDailyMazeReview(attNum, 'results');
+          return;
+        }
         const resultsModal = document.getElementById('results-modal');
         if (!resultsModal) return;
         const isPeeking = resultsModal.classList.toggle('peek-minimized');
@@ -7010,7 +7842,9 @@ class MazingContestClient {
     document.getElementById('round-code-label')!.textContent = isTutorial
       ? 'TUTORIAL'
       : isDaily
-      ? `DAILY #${this.roomState.dailyPuzzleNumber || 1}`
+      ? `DAILY #${this.roomState.dailyPuzzleNumber || 1} · ${
+          this.roomState.dailyAttemptNumber || 1
+        }/${this.roomState.dailyMaxAttempts || DAILY_MAX_ATTEMPTS}`
       : `R${round.roundNumber}/${roundsCompact}`;
     document.getElementById('round-subtitle')!.textContent = isTutorial
       ? 'Guided Training'
@@ -7599,6 +8433,7 @@ class MazingContestClient {
     const coachingTipEl = document.getElementById('results-coaching-tip');
     const lbBtn = document.getElementById('btn-results-leaderboard');
     const shareDailyBtn = document.getElementById('btn-results-share-daily');
+    const retryDailyBtn = document.getElementById('btn-results-daily-retry');
     const homeDailyBtn = document.getElementById('btn-results-home');
     const nextRoundBtn = document.getElementById('btn-next-round');
     const resultsModal = document.getElementById('results-modal');
@@ -7607,19 +8442,69 @@ class MazingContestClient {
     if (isDaily) {
       const me = this.getLocalPlayer();
       const myTime = me?.lastRoundTime ?? 0;
-      const beatPar = myTime >= parTarget;
-      const parPct = Math.min(
-        100,
-        Math.round((myTime / Math.max(1, parTarget)) * 100)
-      );
       const d = this.dailyData;
       const standing = d?.myStanding;
+      const outcome = state.dailyLastAttemptOutcome;
+      const maxAttempts =
+        state.dailyMaxAttempts || d?.maxAttempts || DAILY_MAX_ATTEMPTS;
+      const attemptNum =
+        outcome?.attemptNumber ||
+        state.dailyAttemptNumber ||
+        Math.max(1, d?.attemptsUsed || 1);
+      const attemptsUsed = Math.max(
+        outcome?.attemptsUsed || 0,
+        d?.attemptsUsed || 0,
+        attemptNum
+      );
+      const attemptsRemaining = Math.max(0, maxAttempts - attemptsUsed);
+      const bestTime =
+        outcome?.bestTimeSeconds ??
+        standing?.entry.survivalTimeSeconds ??
+        myTime;
+      const bestAttemptNum =
+        outcome?.bestAttemptNumber || d?.bestAttemptNumber || attemptNum;
+      const beatPar = bestTime >= parTarget;
+      const parPct = Math.min(
+        100,
+        Math.round((bestTime / Math.max(1, parTarget)) * 100)
+      );
 
-      titleEl.textContent = `Daily Maze #${state.dailyPuzzleNumber || 1} Complete`;
-      progressEl.textContent = d ? formatDailyDateLabel(d.dateKey) : 'Daily Maze';
-      subEl.textContent = beatPar
-        ? `You survived ${myTime.toFixed(2)}s and beat today's Par (${parLabel})!`
-        : `You survived ${myTime.toFixed(2)}s · Today's Par was ${parLabel}.`;
+      titleEl.textContent =
+        attemptsRemaining > 0
+          ? `Daily Maze #${state.dailyPuzzleNumber || 1} · Attempt ${attemptNum}/${maxAttempts}`
+          : `Daily Maze #${state.dailyPuzzleNumber || 1} Complete`;
+      progressEl.textContent = d
+        ? `${formatDailyDateLabel(d.dateKey)} · ${attemptsUsed}/${maxAttempts}`
+        : `Attempt ${attemptsUsed}/${maxAttempts}`;
+
+      if (attemptsRemaining > 0) {
+        subEl.textContent =
+          myTime >= parTarget
+            ? `Attempt ${attemptNum}: ${myTime.toFixed(
+                2
+              )}s (Beat Par ${parLabel})! You have ${attemptsRemaining} attempt left — best score counts.`
+            : `Attempt ${attemptNum}: ${myTime.toFixed(
+                2
+              )}s (Par ${parLabel}). You have ${attemptsRemaining} attempt left — best score counts!`;
+      } else if (outcome && attemptsUsed > 1) {
+        subEl.textContent = outcome.isNewBest
+          ? `New personal best! Attempt ${attemptNum} (${myTime.toFixed(
+              2
+            )}s) is logged on today's leaderboard.`
+          : `Attempt ${attemptNum} finished at ${myTime.toFixed(
+              2
+            )}s · Your Attempt ${bestAttemptNum} best (${bestTime.toFixed(
+              2
+            )}s) stays on the leaderboard.`;
+      } else {
+        subEl.textContent = beatPar
+          ? `Best time ${bestTime.toFixed(
+              2
+            )}s — beat today's Par (${parLabel})!`
+          : `Best time ${bestTime.toFixed(
+              2
+            )}s · Today's Par was ${parLabel}.`;
+      }
 
       podiumEl.classList.add('hidden');
       recordCallout.classList.add('hidden');
@@ -7629,10 +8514,39 @@ class MazingContestClient {
       nextRoundBtn?.classList.add('hidden');
       shareDailyBtn?.classList.remove('hidden');
       homeDailyBtn?.classList.remove('hidden');
+      if (retryDailyBtn) {
+        retryDailyBtn.classList.toggle('hidden', attemptsRemaining <= 0);
+        const spanEl = retryDailyBtn.querySelector('span:last-child');
+        if (spanEl) {
+          spanEl.textContent = `Start Attempt ${attemptsUsed + 1}`;
+        }
+      }
+      if (shareDailyBtn) {
+        shareDailyBtn.classList.toggle('dock-ready-btn', attemptsRemaining <= 0);
+        shareDailyBtn.classList.toggle(
+          'hub-secondary-btn',
+          attemptsRemaining > 0
+        );
+      }
 
       const winnerPeekBtn = document.getElementById('btn-peek-winner');
       winnerPeekBtn?.classList.add('hidden');
       this.syncPeekMazesButton(isPeeking);
+      const peekBtnEl = document.getElementById('btn-peek-mazes');
+      if (peekBtnEl && !isPeeking) {
+        const savedInfo = this.getSavedDailyMazesForToday();
+        const multi = (savedInfo?.attempts.length || attemptsUsed) > 1;
+        const isCompact = window.innerWidth <= 480;
+        peekBtnEl.innerHTML = `${icon('eye', 15)}<span>${
+          multi
+            ? isCompact
+              ? 'My Mazes'
+              : 'View My Mazes'
+            : isCompact
+            ? 'My Maze'
+            : 'View My Maze'
+        }</span>`;
+      }
 
       if (dailyPanel) {
         dailyPanel.classList.remove('hidden');
@@ -7640,11 +8554,73 @@ class MazingContestClient {
           ? formatDailyRankLabel(standing.rank, standing.totalParticipants, true)
           : 'Recording…';
         const msLeft = d ? Math.max(0, d.resetsAtUtcMs - Date.now()) : 0;
+        const savedInfo = this.getSavedDailyMazesForToday();
+        const savedAttempts = savedInfo?.attempts || [];
+
+        const attemptsStripHtml =
+          savedAttempts.length > 0
+            ? `
+              <div class="daily-results-attempts-block">
+                <div class="daily-result-lb-head-row">
+                  <span class="daily-result-lb-head">Your Attempts Today (${attemptsUsed}/${maxAttempts} · Best Logged)</span>
+                </div>
+                <div class="daily-attempts-list results-attempts-grid">
+                  ${savedAttempts
+                    .map((a) => {
+                      const isBest =
+                        savedAttempts.length > 1 &&
+                        a.attemptNumber === bestAttemptNum;
+                      return `
+                        <div class="daily-attempt-row${isBest ? ' is-best' : ''}">
+                          <div class="daily-attempt-info">
+                            <div class="daily-attempt-top">
+                              <strong>Attempt ${a.attemptNumber}</strong>
+                              <span class="daily-attempt-time">${a.survivalTimeSeconds.toFixed(
+                                2
+                              )}s</span>
+                              ${
+                                isBest
+                                  ? `<span class="par-pill daily-best-badge">${icon(
+                                      'starFilled',
+                                      10
+                                    )}<span>Best</span></span>`
+                                  : ''
+                              }
+                            </div>
+                            <div class="daily-attempt-meta">
+                              <span>${icon('bolt', 11)} ${a.clapsTaken}</span>
+                              <span>·</span>
+                              <span>${icon('diamondFilled', 10)} ${
+                        a.overchargedSpires
+                      }</span>
+                              <span>·</span>
+                              <span>${Math.round(a.pathDistance)}m</span>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            class="mini-action-btn daily-view-attempt-btn"
+                            data-results-review-attempt="${a.attemptNumber}"
+                            title="Inspect &amp; replay Attempt ${a.attemptNumber} in 3D"
+                          >
+                            ${icon('eye', 13)}<span>View</span>
+                          </button>
+                        </div>
+                      `;
+                    })
+                    .join('')}
+                </div>
+              </div>
+            `
+            : '';
+
         dailyPanel.innerHTML = `
           <div class="daily-result-hero">
             <div class="daily-result-stat hero-time-stat${beatPar ? ' beat-par' : ''}">
-              <span class="daily-stat-label">Your Time</span>
-              <strong>${myTime.toFixed(2)}s</strong>
+              <span class="daily-stat-label">${
+                attemptsUsed > 1 ? 'Best Time (Logged)' : `Attempt ${attemptNum} Time`
+              }</span>
+              <strong>${bestTime.toFixed(2)}s</strong>
             </div>
             <div class="daily-result-stat">
               <span class="daily-stat-label">Today's Rank</span>
@@ -7655,6 +8631,7 @@ class MazingContestClient {
               <strong>${me?.lastRoundClaps || 0} / ${me?.lastRoundOvercharge || 0}</strong>
             </div>
           </div>
+          ${attemptsStripHtml}
           <div class="daily-par-progress-card">
             <div class="daily-par-progress-head">
               <span>${beatPar ? '★ Par Cleared!' : `${parPct}% of Today's Par (${parLabel})`}</span>
@@ -7689,6 +8666,18 @@ class MazingContestClient {
               : ''
           }
         `;
+        dailyPanel
+          .querySelectorAll<HTMLButtonElement>('[data-results-review-attempt]')
+          .forEach((btn) => {
+            btn.addEventListener('click', () => {
+              soundEngine.playUiClick();
+              const num = Number(btn.dataset.resultsReviewAttempt);
+              this.openDailyMazeReview(
+                Number.isFinite(num) ? num : attemptNum,
+                'results'
+              );
+            });
+          });
         document
           .getElementById('btn-daily-results-practice')
           ?.addEventListener('click', () => {
@@ -7712,6 +8701,7 @@ class MazingContestClient {
     lbBtn?.classList.remove('hidden');
     nextRoundBtn?.classList.remove('hidden');
     shareDailyBtn?.classList.add('hidden');
+    retryDailyBtn?.classList.add('hidden');
     homeDailyBtn?.classList.add('hidden');
 
     // Inject / toggle Winner's Maze quick-focus button inside #results-header-actions
